@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ModuleStatus {
@@ -342,12 +343,53 @@ fn build_report() -> SentinelReport {
     }
 }
 
+fn notify_desktop(title: &str, body: &str) {
+    let _ = Command::new("notify-send")
+        .args(["-a", "Security Sentinel", "-i", "security-high", title, body])
+        .spawn();
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.iter().any(|a| a == "--scrub-downloads") {
         let count = scrub_downloads();
+        if count > 0 {
+            notify_desktop(
+                "OpSec Cleaner 🛡️",
+                &format!("İndirilenler klasöründeki {} resmin EXIF bilgisi temizlendi.", count),
+            );
+        } else {
+            notify_desktop(
+                "OpSec Cleaner 🛡️",
+                "İndirilenler klasöründe temizlenecek yeni resim bulunamadı.",
+            );
+        }
         println!("Cleaned {} image files in Downloads", count);
+        return;
+    }
+
+    if let Some(pos) = args.iter().position(|a| a == "--clean-files") {
+        let files = &args[pos + 1..];
+        let mut cleaned = 0;
+        for f_str in files {
+            let p = Path::new(f_str);
+            if clean_file(p).is_ok() {
+                cleaned += 1;
+            }
+        }
+        if cleaned > 0 {
+            notify_desktop(
+                "OpSec Cleaner 🛡️",
+                &format!("{} dosyanın EXIF ve meta verileri temizlendi.", cleaned),
+            );
+        } else {
+            notify_desktop(
+                "OpSec Cleaner 🛡️",
+                "Seçilen dosyalarda temizlenecek meta veri bulunamadı veya işlem başarısız.",
+            );
+        }
+        println!("Cleaned {} files", cleaned);
         return;
     }
 

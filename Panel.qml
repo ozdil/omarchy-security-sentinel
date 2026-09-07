@@ -35,12 +35,49 @@ Panel {
     actionProc.running = true
   }
 
+  function openFilePicker() {
+    if (!pickFileProc.running) {
+      pickFileProc.running = true
+    }
+  }
+
+  function cleanFiles(fileList) {
+    if (fileList && fileList.length > 0) {
+      var cmd = [root.resolveEnginePath(), "--clean-files"]
+      for (var i = 0; i < fileList.length; i++) {
+        var f = String(fileList[i] || "").trim()
+        if (f.length > 0) {
+          cmd.push(f)
+        }
+      }
+      if (cmd.length > 2) {
+        actionProc.command = cmd
+        actionProc.running = true
+      }
+    }
+  }
+
   IpcHandler {
     target: "ozdil.security-sentinel"
     function open() { root.open() }
     function close() { root.close() }
     function toggle() { root.toggle() }
     function refresh() { root.refresh() }
+  }
+
+  Process {
+    id: pickFileProc
+    command: ["zenity", "--file-selection", "--multiple", "--file-filter=Images | *.jpg *.jpeg *.png *.JPG *.PNG *.webp", "--title=OpSec: Select Images to Scrub EXIF"]
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var raw = String(text || "").trim()
+        if (raw.length > 0) {
+          var files = raw.split("|")
+          root.cleanFiles(files)
+        }
+      }
+    }
   }
 
   Process {
@@ -73,15 +110,14 @@ Panel {
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: {
-      if (!stateProc.running) stateProc.running = true
-    }
+    onTriggered: root.refresh()
   }
 
   Component.onCompleted: refresh()
   Component.onDestruction: {
     if (stateProc.running) stateProc.running = false
     if (actionProc.running) actionProc.running = false
+    if (pickFileProc.running) pickFileProc.running = false
   }
 
   BarIconButton {
@@ -101,8 +137,29 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentWidth: panel.fittedContentWidth(Style.space(420))
     contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight, Style.space(560))
+
+    DropArea {
+      id: dropArea
+      anchors.fill: parent
+      onEntered: function(drag) {
+        if (drag.hasUrls) drag.acceptProposedAction()
+      }
+      onDropped: function(drop) {
+        if (drop.hasUrls) {
+          var files = []
+          for (var i = 0; i < drop.urls.length; i++) {
+            var urlStr = drop.urls[i].toString()
+            var localPath = urlStr.replace(/^file:\/\//, "")
+            files.push(decodeURIComponent(localPath))
+          }
+          if (files.length > 0) {
+            root.cleanFiles(files)
+          }
+        }
+      }
+    }
 
     ScrollView {
       id: scrollArea
@@ -162,6 +219,31 @@ Panel {
           }
         }
 
+        // ---------- Drop Banner ----------
+        Rectangle {
+          visible: dropArea.containsDrag
+          width: parent.width
+          height: Style.space(38)
+          radius: Style.space(4)
+          color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+          border.color: Color.accent
+          border.width: 1
+
+          RowLayout {
+            anchors.centerIn: parent
+            spacing: Style.space(8)
+
+            Text {
+              textFormat: Text.PlainText
+              text: "📥 Drop images here to strip EXIF & metadata"
+              color: Color.accent
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              font.bold: true
+            }
+          }
+        }
+
         // ---------- Subsystems Section ----------
         PanelSeparator {
           foreground: root.bar ? root.bar.foreground : Color.foreground
@@ -184,12 +266,20 @@ Panel {
             Repeater {
               model: root.modules
               delegate: Rectangle {
+                id: rowDelegate
                 width: parent.width
                 height: Style.space(34)
                 radius: Style.space(4)
-                color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
 
                 readonly property var modData: modelData
+                readonly property bool isOpSec: modData && modData.name === "OpSec Metadata Scrubber"
+                readonly property bool isHovered: isOpSec && opSecMouse.containsMouse
+
+                color: isHovered
+                       ? Qt.darker(Color.accent, 2.8)
+                       : Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+                border.color: isHovered ? Color.accent : "transparent"
+                border.width: isHovered ? 1 : 0
 
                 RowLayout {
                   anchors.fill: parent
@@ -201,21 +291,31 @@ Panel {
                     Layout.fillWidth: true
                     textFormat: Text.PlainText
                     text: modData ? String(modData.name) : "--"
-                    color: root.bar ? root.bar.foreground : Color.foreground
+                    color: isHovered ? Color.accent : (root.bar ? root.bar.foreground : Color.foreground)
                     font.family: root.bar ? root.bar.fontFamily : Style.font.family
                     font.pixelSize: Style.font.bodySmall
+                    font.bold: isHovered
                     elide: Text.ElideRight
                   }
 
                   Text {
                     textFormat: Text.PlainText
-                    text: modData ? String(modData.summary) : "--"
-                    color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                    text: isHovered ? "Click to pick file " : (modData ? String(modData.summary) : "--")
+                    color: isHovered ? Color.accent : Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
                     font.family: root.bar ? root.bar.fontFamily : Style.font.family
                     font.pixelSize: Style.font.caption
                     horizontalAlignment: Text.AlignRight
                     elide: Text.ElideRight
                   }
+                }
+
+                MouseArea {
+                  id: opSecMouse
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  enabled: rowDelegate.isOpSec
+                  cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                  onClicked: root.openFilePicker()
                 }
               }
             }
@@ -240,6 +340,12 @@ Panel {
           RowLayout {
             width: parent.width
             spacing: Style.space(8)
+
+            Button {
+              Layout.fillWidth: true
+              text: "Scrub File..."
+              onClicked: root.openFilePicker()
+            }
 
             Button {
               Layout.fillWidth: true
