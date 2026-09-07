@@ -17,7 +17,6 @@ Panel {
 
   property string overallStatus: "ALL SYSTEMS SECURE"
   property string threatLevel: "ZERO"
-  property string threatColor: "#22c55e"
   property int activeCount: 8
   property var modules: []
 
@@ -55,7 +54,6 @@ Panel {
           var d = JSON.parse(clean)
           root.overallStatus = String(d.overall_status || "ALL SYSTEMS SECURE")
           root.threatLevel = String(d.threat_level || "ZERO")
-          root.threatColor = String(d.threat_color || "#22c55e")
           root.activeCount = Number(d.active_modules) || 8
           root.modules = d.modules || []
         } catch(e) {}
@@ -75,7 +73,9 @@ Panel {
     running: true
     repeat: true
     triggeredOnStart: true
-    onTriggered: root.refresh()
+    onTriggered: {
+      if (!stateProc.running) stateProc.running = true
+    }
   }
 
   Component.onCompleted: refresh()
@@ -91,8 +91,7 @@ Panel {
     text: ""
     tooltipText: "Security Sentinel Hub"
     onPressed: function(b) {
-      if (root.opened) root.close()
-      else root.open()
+      root.toggle()
     }
   }
 
@@ -102,166 +101,156 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
-    contentWidth: panel.fittedContentWidth(Style.space(520))
-    contentHeight: panel.fittedContentHeight(contentCol.implicitHeight)
+    contentWidth: panel.fittedContentWidth(Style.space(380))
+    contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight, Style.space(560))
 
-    Column {
-      id: contentCol
-      anchors.left: parent.left
-      anchors.right: parent.right
-      anchors.top: parent.top
-      spacing: Style.space(12)
+    ScrollView {
+      id: scrollArea
+      anchors.fill: parent
+      clip: true
+      ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
+      ScrollBar.vertical.policy: panelColumn.implicitHeight > height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
 
-      // ---------- Header ----------
-      Item {
-        width: parent.width
-        implicitHeight: Math.max(heroLabels.implicitHeight, heroActions.implicitHeight)
+      Column {
+        id: panelColumn
+        width: scrollArea.availableWidth
+        spacing: Style.space(14)
 
-        Column {
-          id: heroLabels
-          anchors.left: parent.left
-          anchors.right: heroActions.left
-          anchors.rightMargin: Style.space(10)
-          anchors.verticalCenter: parent.verticalCenter
-          spacing: Style.space(2)
+        // ---------- Hero: Shield icon · title/status ----------
+        Item {
+          width: parent.width
+          implicitHeight: Math.max(heroIcon.implicitHeight, heroLabels.implicitHeight)
 
-          RowLayout {
-            spacing: Style.space(8)
+          Text {
+            id: heroIcon
+            textFormat: Text.PlainText
+            text: ""
+            color: root.bar ? root.bar.foreground : Color.foreground
+            font.family: root.bar ? root.bar.fontFamily : Style.font.family
+            font.pixelSize: Style.font.display
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+          }
+
+          Column {
+            id: heroLabels
+            anchors.left: heroIcon.right
+            anchors.leftMargin: Style.space(14)
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(2)
+
             Text {
-              textFormat: Text.PlainText
-              text: "SECURITY SENTINEL"
+              text: "Security Sentinel"
               color: root.bar ? root.bar.foreground : Color.foreground
               font.family: root.bar ? root.bar.fontFamily : Style.font.family
               font.pixelSize: Style.font.title
               font.bold: true
+              elide: Text.ElideRight
+              width: parent.width
             }
 
-            Rectangle {
-              height: Style.space(18)
-              width: badgeText.implicitWidth + Style.space(12)
-              radius: Style.space(4)
-              color: Qt.alpha(root.threatColor, 0.15)
-              border.color: root.threatColor
-              border.width: 1
-
-              Text {
-                id: badgeText
-                anchors.centerIn: parent
-                textFormat: Text.PlainText
-                text: root.threatLevel + " THREAT"
-                color: root.threatColor
-                font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                font.pixelSize: Style.font.caption
-                font.bold: true
-              }
+            Text {
+              textFormat: Text.PlainText
+              text: root.overallStatus.toUpperCase()
+              color: root.threatLevel === "ZERO" ? Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4) : Color.urgent
+              font.family: root.bar ? root.bar.fontFamily : Style.font.family
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.letterSpacing: 1.2
             }
-          }
-
-          Text {
-            textFormat: Text.PlainText
-            text: "UNIFIED CYBER DEFENSE & PRIVACY HUB (" + root.activeCount + " SUBSYSTEMS)"
-            color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-            font.family: root.bar ? root.bar.fontFamily : Style.font.family
-            font.pixelSize: Style.font.caption
-            font.bold: true
-            font.letterSpacing: 1.2
           }
         }
 
-        RowLayout {
-          id: heroActions
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
+        // ---------- Subsystems Section ----------
+        PanelSeparator {
+          foreground: root.bar ? root.bar.foreground : Color.foreground
+        }
+
+        Column {
+          width: parent.width
           spacing: Style.space(6)
 
-          Button {
-            text: "Scrub Downloads"
-            onClicked: root.scrubDownloads()
+          PanelSectionHeader {
+            text: "SUBSYSTEMS"
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
           }
 
-          Button {
-            text: "Audit Now"
-            onClicked: root.refresh()
+          Column {
+            width: parent.width
+            spacing: Style.space(4)
+
+            Repeater {
+              model: root.modules
+              delegate: Rectangle {
+                width: parent.width
+                height: Style.space(34)
+                radius: Style.space(4)
+                color: Style.selectedFillFor(root.bar ? root.bar.foreground : Color.foreground, Color.accent)
+
+                readonly property var modData: modelData
+
+                RowLayout {
+                  anchors.fill: parent
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(10)
+                  spacing: Style.space(8)
+
+                  Text {
+                    Layout.fillWidth: true
+                    textFormat: Text.PlainText
+                    text: modData ? String(modData.name) : "--"
+                    color: root.bar ? root.bar.foreground : Color.foreground
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.bodySmall
+                    elide: Text.ElideRight
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: modData ? String(modData.summary) : "--"
+                    color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
+                    font.family: root.bar ? root.bar.fontFamily : Style.font.family
+                    font.pixelSize: Style.font.caption
+                    horizontalAlignment: Text.AlignRight
+                    elide: Text.ElideRight
+                  }
+                }
+              }
+            }
           }
         }
-      }
 
-      PanelSeparator {
-        foreground: root.bar ? root.bar.foreground : Color.foreground
-      }
+        // ---------- Actions Section ----------
+        PanelSeparator {
+          foreground: root.bar ? root.bar.foreground : Color.foreground
+        }
 
-      // ---------- Modules List ----------
-      Column {
-        width: parent.width
-        spacing: Style.space(8)
+        Column {
+          width: parent.width
+          spacing: Style.space(6)
 
-        Repeater {
-          model: root.modules
-          delegate: Rectangle {
+          PanelSectionHeader {
+            text: "ACTIONS"
+            foreground: root.bar ? root.bar.foreground : Color.foreground
+            fontFamily: root.bar ? root.bar.fontFamily : Style.font.family
+          }
+
+          RowLayout {
             width: parent.width
-            height: Style.space(48)
-            radius: Style.space(6)
-            color: Qt.alpha(root.bar ? root.bar.foreground : Color.foreground, 0.04)
-            border.color: Qt.alpha(root.bar ? root.bar.foreground : Color.foreground, 0.1)
-            border.width: 1
+            spacing: Style.space(8)
 
-            readonly property var modData: modelData
+            Button {
+              Layout.fillWidth: true
+              text: "Scrub Downloads"
+              onClicked: root.scrubDownloads()
+            }
 
-            RowLayout {
-              anchors.fill: parent
-              anchors.leftMargin: Style.space(12)
-              anchors.rightMargin: Style.space(12)
-              spacing: Style.space(10)
-
-              Column {
-                Layout.fillWidth: true
-                spacing: Style.space(2)
-
-                Text {
-                  textFormat: Text.PlainText
-                  text: modData ? String(modData.name) : "--"
-                  color: root.bar ? root.bar.foreground : Color.foreground
-                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                  font.pixelSize: Style.font.body
-                  font.bold: true
-                }
-
-                Text {
-                  textFormat: Text.PlainText
-                  text: modData ? String(modData.detail) : "--"
-                  color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.4)
-                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                  font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
-                }
-              }
-
-              Column {
-                Layout.preferredWidth: Style.space(160)
-                spacing: Style.space(2)
-
-                Text {
-                  textFormat: Text.PlainText
-                  width: parent.width
-                  horizontalAlignment: Text.AlignRight
-                  text: modData ? String(modData.status) : "--"
-                  color: (modData && modData.status === "SECURE" || modData && modData.status === "READY") ? "#22c55e" : "#ef4444"
-                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                  font.pixelSize: Style.font.bodySmall
-                  font.bold: true
-                }
-
-                Text {
-                  textFormat: Text.PlainText
-                  width: parent.width
-                  horizontalAlignment: Text.AlignRight
-                  text: modData ? String(modData.summary) : "--"
-                  color: Qt.darker(root.bar ? root.bar.foreground : Color.foreground, 1.3)
-                  font.family: root.bar ? root.bar.fontFamily : Style.font.family
-                  font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
-                }
-              }
+            Button {
+              Layout.fillWidth: true
+              text: "Audit Now"
+              onClicked: root.refresh()
             }
           }
         }
