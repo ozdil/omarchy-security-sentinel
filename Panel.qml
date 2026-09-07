@@ -353,7 +353,7 @@ Panel {
 
           Text {
             textFormat: Text.PlainText
-            text: "📥 Drop images here to strip EXIF & metadata"
+            text: "  Drop images here to strip EXIF & metadata"
             color: root.accent
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall

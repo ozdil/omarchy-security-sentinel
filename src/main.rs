@@ -655,12 +655,12 @@ fn toggle_ghost_mac() -> bool {
                 if current_cloned.contains("random") {
                     let _ = Command::new("nmcli").args(["connection", "modify", conn, "802-11-wireless.cloned-mac-address", "permanent"]).output();
                     let _ = Command::new("nmcli").args(["connection", "up", conn]).output();
-                    notify_desktop("Ghost MAC 🛡️", "Wi-Fi donanım (orijinal) MAC adresine geri dönüldü.", false);
+                    notify_desktop("Ghost MAC", "Reverted to Wi-Fi hardware (original) MAC address.", false);
                     return false;
                 } else {
                     let _ = Command::new("nmcli").args(["connection", "modify", conn, "802-11-wireless.cloned-mac-address", "random"]).output();
                     let _ = Command::new("nmcli").args(["connection", "up", conn]).output();
-                    notify_desktop("Ghost MAC 🛡️", "Wi-Fi MAC adresi rastgeleleştirildi (Her bağlantıda rastgele MAC atanacak).", false);
+                    notify_desktop("Ghost MAC", "Wi-Fi MAC randomization enabled (random MAC per connection).", false);
                     return true;
                 }
             }
@@ -677,11 +677,11 @@ fn toggle_dns() -> bool {
 
     if current == "Cloudflare" || current == "Google" {
         let _ = Command::new("/usr/bin/omarchy-dns").arg("DHCP").output();
-        notify_desktop("DNS Leak Guard 🛡️", "Standart ISP DNS (DHCP) moduna dönüldü.", false);
+        notify_desktop("DNS Leak Guard", "Switched to standard ISP DNS (DHCP) mode.", false);
         false
     } else {
         let _ = Command::new("/usr/bin/omarchy-dns").arg("Cloudflare").output();
-        notify_desktop("DNS Leak Guard 🛡️", "Cloudflare DNS-over-TLS (DoT 1.1.1.1) şifreli DNS tüneli aktif edildi.", false);
+        notify_desktop("DNS Leak Guard", "Cloudflare DNS-over-TLS (DoT 1.1.1.1) encrypted tunnel enabled.", false);
         true
     }
 }
@@ -701,7 +701,7 @@ fn trust_all_usb() -> usize {
     let count = ids.len();
     let trusted_file = get_state_dir().join("trusted_usb.json");
     let _ = fs::write(&trusted_file, serde_json::to_string(&ids).unwrap_or_default());
-    notify_desktop("BadUSB Defense 🛡️", &format!("Bağlı {} USB cihazı güvenli beyaz listeye eklendi.", count), false);
+    notify_desktop("BadUSB Defense", &format!("Added {} connected USB devices to trusted whitelist.", count), false);
     count
 }
 
@@ -715,7 +715,7 @@ fn reset_canaries() {
         let hash = String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string();
         let _ = fs::write(&hash_path, hash);
     }
-    notify_desktop("Tripwire Canaries 🛡️", "Yeni tuzak bal küpü (canary token) oluşturuldu ve SHA-256 hash'i mühürlendi.", false);
+    notify_desktop("Tripwire Canaries", "New canary honeypot token generated and SHA-256 hash sealed.", false);
 }
 
 fn build_report() -> SentinelReport {
@@ -787,14 +787,14 @@ fn main() {
         let count = scrub_downloads();
         if count > 0 {
             notify_desktop(
-                "OpSec Cleaner 🛡️",
-                &format!("İndirilenler klasöründeki {} resmin EXIF bilgisi temizlendi.", count),
+                "OpSec Cleaner",
+                &format!("EXIF metadata stripped from {} images in Downloads.", count),
                 false,
             );
         } else {
             notify_desktop(
-                "OpSec Cleaner 🛡️",
-                "İndirilenler klasöründe temizlenecek yeni resim bulunamadı.",
+                "OpSec Cleaner",
+                "No images needing metadata scrubbing found in Downloads.",
                 false,
             );
         }
@@ -813,14 +813,14 @@ fn main() {
         }
         if cleaned > 0 {
             notify_desktop(
-                "OpSec Cleaner 🛡️",
-                &format!("{} dosyanın EXIF ve meta verileri temizlendi.", cleaned),
+                "OpSec Cleaner",
+                &format!("Stripped EXIF and metadata from {} files.", cleaned),
                 false,
             );
         } else {
             notify_desktop(
-                "OpSec Cleaner 🛡️",
-                "Seçilen dosyalarda temizlenecek meta veri bulunamadı veya işlem başarısız.",
+                "OpSec Cleaner",
+                "No metadata to scrub found in selected files or operation failed.",
                 true,
             );
         }
