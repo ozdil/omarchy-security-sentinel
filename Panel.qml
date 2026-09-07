@@ -89,7 +89,7 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: "\uf0483"
-    color: root.threatColor
+    foreground: root.threatColor
     slotSize: Style.bar.statusSlot
     tooltipText: "Security Sentinel Hub\nStatus: " + root.overallStatus + "\nThreat Level: " + root.threatLevel + "\nActive Subsystems: " + root.activeCount + " / 8\n\n[Left Click] Open Security Center"
 
@@ -241,7 +241,6 @@ Panel {
 
               Column {
                 Layout.preferredWidth: Style.space(160)
-                horizontalAlignment: Text.AlignRight
                 spacing: Style.space(2)
 
                 Text {
