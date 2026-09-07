@@ -88,11 +88,8 @@ Panel {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "\uf0483"
-    foreground: root.threatColor
-    slotSize: Style.bar.statusSlot
-    tooltipText: "Security Sentinel Hub\nStatus: " + root.overallStatus + "\nThreat Level: " + root.threatLevel + "\nActive Subsystems: " + root.activeCount + " / 8\n\n[Left Click] Open Security Center"
-
+    text: ""
+    tooltipText: "Security Sentinel Hub"
     onPressed: function(b) {
       if (root.opened) root.close()
       else root.open()
