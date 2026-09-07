@@ -425,6 +425,16 @@ Panel {
                   width: parent.width
                   height: headerRow.implicitHeight
 
+                  // Background click area for left portion (title/icon)
+                  MouseArea {
+                    anchors.left: parent.left
+                    anchors.top: parent.top
+                    anchors.bottom: parent.bottom
+                    width: Math.max(0, parent.width - (rowDelegate.isToggleable || rowDelegate.isOpSec ? Style.space(110) : Style.space(50)))
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.toggleExpand(rowDelegate.modId)
+                  }
+
                   RowLayout {
                     id: headerRow
                     anchors.fill: parent
@@ -503,17 +513,6 @@ Panel {
                         onClicked: root.toggleExpand(rowDelegate.modId)
                       }
                     }
-                  }
-
-                  // Click to expand / collapse for icon and title area
-                  MouseArea {
-                    anchors.left: parent.left
-                    anchors.top: parent.top
-                    anchors.bottom: parent.bottom
-                    anchors.right: headerLoader.left
-                    anchors.rightMargin: Style.space(6)
-                    cursorShape: Qt.PointingHandCursor
-                    onClicked: root.toggleExpand(rowDelegate.modId)
                   }
                 }
 
