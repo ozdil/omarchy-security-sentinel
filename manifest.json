@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "ozdil.security-sentinel",
+  "name": "Security Sentinel",
+  "description": "Unified Cyber Security & Privacy Sentinel Hub for Omarchy Linux",
+  "version": "1.0.0",
+  "author": "Ozan Özdil",
+  "license": "MIT",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "defaultSection": "right"
+  }
+}
