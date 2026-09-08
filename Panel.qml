@@ -242,7 +242,16 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     text: ""
-    tooltipText: "Security Sentinel Hub\nStatus: " + root.overallStatus + "\nThreat: " + root.threatLevel
+    foreground: {
+      if (root.threatLevel === "CRITICAL" || root.threatLevel === "HIGH" || root.overallStatus === "THREAT DETECTED") {
+        return Color.urgent
+      } else if (root.threatLevel === "ELEVATED" || root.threatLevel === "WARNING" || root.overallStatus === "ATTENTION REQUIRED") {
+        return "#f59e0b"
+      } else {
+        return root.bar ? root.bar.foreground : Color.foreground
+      }
+    }
+    tooltipText: "Security Sentinel Hub\nStatus: " + root.overallStatus + "\nThreat Level: " + root.threatLevel
     onPressed: function(b) {
       root.toggle()
     }
