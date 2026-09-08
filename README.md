@@ -37,14 +37,16 @@ Each subsystem features an interactive **Accordion / Drop-down Inspection Menu**
 
 ---
 
-## 📦 Local Installation & Setup
+## 📦 Installation & Setup
 
+### Install via Omarchy Marketplace
 ```bash
-# Build native release binary
-cd ~/.config/omarchy/plugins/ozdil.security-sentinel
-cargo build --release
-cp target/release/security-sentinel sentinel-engine
-cp target/release/security-sentinel ~/.local/bin/sentinel-engine
+omarchy plugin add ozdil.security-sentinel
+```
+
+### Or Build from Source
+```bash
+cargo build --release --locked
 ```
 
 Add to `bar.layout.right` in `~/.config/omarchy/shell.json`:
