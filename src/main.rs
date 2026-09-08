@@ -504,11 +504,12 @@ fn check_ghost_mac() -> (ModuleStatus, bool) {
 
 // 8. OpSec Cleaner
 fn check_opsec_cleaner() -> ModuleStatus {
-    let mut items = Vec::new();
-    items.push("Supported Formats: JPEG (EXIF / APP1-15), PNG (tEXt, zTXt, iTXt, eXIf)".to_string());
-    items.push("Engine: In-memory lossless binary metadata & EXIF stripper".to_string());
-    items.push("Drag & Drop: Drag any image from file manager onto this panel".to_string());
-    items.push("Batch Mode: Click 'Scrub Downloads' to sanitize recent downloads".to_string());
+    let items = vec![
+        "Supported Formats: JPEG (EXIF / APP1-15), PNG (tEXt, zTXt, iTXt, eXIf)".to_string(),
+        "Engine: In-memory lossless binary metadata & EXIF stripper".to_string(),
+        "Drag & Drop: Drag any image from file manager onto this panel".to_string(),
+        "Batch Mode: Click 'Scrub Downloads' to sanitize recent downloads".to_string(),
+    ];
 
     ModuleStatus {
         id: "opsec".to_string(),
@@ -568,7 +569,7 @@ fn clean_file(path: &Path) -> Result<(), String> {
             if idx + len > data.len() {
                 break;
             }
-            let is_meta = (marker >= 0xE1 && marker <= 0xEF) || marker == 0xFE;
+            let is_meta = (0xE1..=0xEF).contains(&marker) || marker == 0xFE;
             if !is_meta {
                 out.push(0xFF);
                 out.push(marker);
@@ -582,7 +583,7 @@ fn clean_file(path: &Path) -> Result<(), String> {
 
     // Check PNG
     let png_header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-    if data.len() >= 8 && &data[..8] == png_header {
+    if data.len() >= 8 && data[..8] == png_header {
         let mut out = Vec::with_capacity(data.len());
         out.extend_from_slice(&png_header);
         let mut idx = 8;
@@ -620,10 +621,8 @@ fn scrub_downloads() -> usize {
             if p.is_file() {
                 if let Some(ext) = p.extension() {
                     let ext_str = ext.to_string_lossy().to_lowercase();
-                    if ext_str == "jpg" || ext_str == "jpeg" || ext_str == "png" {
-                        if clean_file(&p).is_ok() {
-                            cleaned += 1;
-                        }
+                    if (ext_str == "jpg" || ext_str == "jpeg" || ext_str == "png") && clean_file(&p).is_ok() {
+                        cleaned += 1;
                     }
                 }
             }
