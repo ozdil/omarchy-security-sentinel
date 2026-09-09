@@ -317,6 +317,7 @@ Panel {
           spacing: Style.space(2)
 
           Text {
+            textFormat: Text.PlainText
             text: "Security Sentinel"
             color: root.foreground
             font.family: root.fontFamily
