@@ -1,9 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::fs;
-use std::io::Read;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod subproc;
+use subproc::run_cmd_bounded;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ModuleStatus {
@@ -139,7 +144,7 @@ fn check_network_sockets() -> ModuleStatus {
         status: status.to_string(),
         summary: format!("{} Active ({} Listen, {} Estab)", total, listen, estab),
         detail: if flagged > 0 {
-            format!("⚠️ {} Suspicious connections detected!", flagged)
+            format!("[ALERT] {} Suspicious connections detected!", flagged)
         } else {
             "All outbound connections verified".to_string()
         },
@@ -212,7 +217,7 @@ fn check_badusb() -> ModuleStatus {
         name: "BadUSB Defense".to_string(),
         status: status.to_string(),
         summary: if untrusted_count > 0 {
-            format!("⚠️ {} UNTRUSTED USB DETECTED", untrusted_count)
+            format!("[ALERT] {} UNTRUSTED USB DETECTED", untrusted_count)
         } else {
             format!("{} Devices ({} Trusted HID)", total_usb, hid_count)
         },
@@ -288,11 +293,22 @@ fn check_auth_watch() -> ModuleStatus {
     let mut failed_count = 0;
     let mut fail_entries = Vec::new();
 
-    if let Ok(output) = Command::new("journalctl")
-        .args(["--since", "24 hours ago", "-q", "-o", "cat"])
-        .output()
-    {
-        let text = String::from_utf8_lossy(&output.stdout);
+    let journal_bin = if Path::new("/usr/bin/journalctl").exists() {
+        "/usr/bin/journalctl"
+    } else {
+        "/bin/journalctl"
+    };
+
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    // Bounded execution: producer-side limit (-n 200), deadline 1.5s, buffer cap 64 KiB
+    if let Some(stdout) = run_cmd_bounded(
+        journal_bin,
+        &["-n", "200", "--since", "24 hours ago", "-q", "-o", "cat"],
+        &[],
+        deadline,
+        65536,
+    ) {
+        let text = String::from_utf8_lossy(&stdout);
         for line in text.lines() {
             let lower = line.to_lowercase();
             if lower.contains("authentication failure")
@@ -324,7 +340,7 @@ fn check_auth_watch() -> ModuleStatus {
         name: "Authentication Watch".to_string(),
         status: status.to_string(),
         summary: if failed_count > 0 {
-            format!("⚠️ {} Failed Logins (24h)", failed_count)
+            format!("[ALERT] {} Failed Logins (24h)", failed_count)
         } else {
             "0 Failed Logins (24h)".to_string()
         },
@@ -374,7 +390,7 @@ fn check_tripwire() -> ModuleStatus {
     items.push(if is_intact {
         "Ransomware Defense: Token intact | File baseline verified".to_string()
     } else {
-        "🚨 ALERT: Canary token modified or encrypted by untrusted process!".to_string()
+        "[ALERT] Canary token modified or encrypted by untrusted process!".to_string()
     });
 
     ModuleStatus {
@@ -384,7 +400,7 @@ fn check_tripwire() -> ModuleStatus {
         summary: if is_intact {
             "Honey-tokens Intact (SHA-256 Verified)".to_string()
         } else {
-            "🚨 TRIPWIRE TOKEN TAMPERED / ENCRYPTED!".to_string()
+            "[ALERT] TRIPWIRE TOKEN TAMPERED / ENCRYPTED!".to_string()
         },
         detail: if is_intact {
             "Canary file hash matches baseline | Ransomware early-warning active".to_string()
@@ -523,17 +539,60 @@ fn check_opsec_cleaner() -> ModuleStatus {
     }
 }
 
-// Lossless JPEG & PNG cleaner
-fn clean_file(path: &Path) -> Result<(), String> {
-    if !path.is_file() {
-        return Err("Not a file".to_string());
-    }
-    let mut data = Vec::new();
-    let mut f = fs::File::open(path).map_err(|e| e.to_string())?;
-    f.read_to_end(&mut data).map_err(|e| e.to_string())?;
+const MAX_IMAGE_SIZE: usize = 25 * 1024 * 1024; // 25 MiB cap
+const O_NOFOLLOW: i32 = 0o400000;
 
-    // Check JPEG
-    if data.len() >= 4 && data[0] == 0xFF && data[1] == 0xD8 {
+// Lossless JPEG & PNG cleaner with strict bounded I/O, no-follow descriptor binding, and atomic replacement
+fn clean_file(path: &Path) -> Result<(), String> {
+    // 1. Initial symlink and regular file verification
+    let sym_meta = fs::symlink_metadata(path).map_err(|e| format!("Cannot read metadata: {}", e))?;
+    if sym_meta.file_type().is_symlink() {
+        return Err("Symlinks are strictly prohibited".to_string());
+    }
+    if !sym_meta.is_file() {
+        return Err("Target is not a regular file".to_string());
+    }
+    if sym_meta.len() > MAX_IMAGE_SIZE as u64 {
+        return Err(format!("File exceeds maximum allowed size of {} bytes", MAX_IMAGE_SIZE));
+    }
+
+    // 2. Open through held descriptor with O_NOFOLLOW
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("Failed to open file safely with O_NOFOLLOW: {}", e))?;
+
+    // 3. Re-verify attributes on the held descriptor
+    let fd_meta = file.metadata().map_err(|e| format!("Failed to read descriptor metadata: {}", e))?;
+    if !fd_meta.is_file() {
+        return Err("Descriptor is not a regular file".to_string());
+    }
+    if fd_meta.len() > MAX_IMAGE_SIZE as u64 {
+        return Err(format!("Descriptor file size exceeds {} bytes", MAX_IMAGE_SIZE));
+    }
+
+    // SAFETY: getuid returns the real UID of the running process
+    unsafe {
+        extern "C" {
+            fn getuid() -> u32;
+        }
+        if fd_meta.uid() != getuid() {
+            return Err("File is not owned by current user".to_string());
+        }
+    }
+
+    // 4. Bounded read
+    let mut data = Vec::with_capacity(fd_meta.len() as usize);
+    let mut handle = (&mut file).take((MAX_IMAGE_SIZE + 1) as u64);
+    handle.read_to_end(&mut data).map_err(|e| format!("Read failed: {}", e))?;
+    if data.len() > MAX_IMAGE_SIZE {
+        return Err("Read data exceeded maximum image buffer limit".to_string());
+    }
+
+    // 5. Lossless metadata stripping
+    let cleaned_bytes: Option<Vec<u8>> = if data.len() >= 4 && data[0] == 0xFF && data[1] == 0xD8 {
+        // JPEG cleaner
         let mut out = Vec::with_capacity(data.len());
         out.push(0xFF);
         out.push(0xD8);
@@ -577,39 +636,110 @@ fn clean_file(path: &Path) -> Result<(), String> {
             }
             idx += len;
         }
-        let _ = fs::write(path, out);
-        return Ok(());
-    }
-
-    // Check PNG
-    let png_header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-    if data.len() >= 8 && data[..8] == png_header {
-        let mut out = Vec::with_capacity(data.len());
-        out.extend_from_slice(&png_header);
-        let mut idx = 8;
-        while idx + 12 <= data.len() {
-            let length = ((data[idx] as usize) << 24)
-                | ((data[idx + 1] as usize) << 16)
-                | ((data[idx + 2] as usize) << 8)
-                | (data[idx + 3] as usize);
-            let chunk_type = &data[idx + 4..idx + 8];
-            let total_chunk_len = 12 + length;
-            if idx + total_chunk_len > data.len() {
-                out.extend_from_slice(&data[idx..]);
-                break;
+        Some(out)
+    } else {
+        let png_header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        if data.len() >= 8 && data[..8] == png_header {
+            // PNG cleaner
+            let mut out = Vec::with_capacity(data.len());
+            out.extend_from_slice(&png_header);
+            let mut idx = 8;
+            while idx + 12 <= data.len() {
+                let length = ((data[idx] as usize) << 24)
+                    | ((data[idx + 1] as usize) << 16)
+                    | ((data[idx + 2] as usize) << 8)
+                    | (data[idx + 3] as usize);
+                let chunk_type = &data[idx + 4..idx + 8];
+                let total_chunk_len = 12 + length;
+                if idx + total_chunk_len > data.len() {
+                    out.extend_from_slice(&data[idx..]);
+                    break;
+                }
+                let type_str = String::from_utf8_lossy(chunk_type);
+                let is_meta = type_str == "tEXt" || type_str == "zTXt" || type_str == "iTXt" || type_str == "eXIf";
+                if !is_meta {
+                    out.extend_from_slice(&data[idx..idx + total_chunk_len]);
+                }
+                idx += total_chunk_len;
             }
-            let type_str = String::from_utf8_lossy(chunk_type);
-            let is_meta = type_str == "tEXt" || type_str == "zTXt" || type_str == "iTXt" || type_str == "eXIf";
-            if !is_meta {
-                out.extend_from_slice(&data[idx..idx + total_chunk_len]);
-            }
-            idx += total_chunk_len;
+            Some(out)
+        } else {
+            None
         }
-        let _ = fs::write(path, out);
-        return Ok(());
+    };
+
+    let out = match cleaned_bytes {
+        Some(b) => b,
+        None => return Err("Unsupported image format or invalid header".to_string()),
+    };
+
+    // Close descriptor before replacing file
+    drop(file);
+
+    // 6. Same-directory atomic replacement: write to .tmp_clean_..., verify, sync_all, rename
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = parent.join(format!(".tmp_clean_{}_{}", std::process::id(), nanos));
+
+    let orig_mode = fd_meta.mode() & 0o777;
+    let target_mode = if orig_mode != 0 { orig_mode } else { 0o600 };
+
+    struct TempFileGuard<'a> {
+        path: &'a Path,
+        active: bool,
+    }
+    impl<'a> Drop for TempFileGuard<'a> {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = fs::remove_file(self.path);
+            }
+        }
     }
 
-    Err("Unsupported image format".to_string())
+    let mut guard = TempFileGuard {
+        path: &tmp_path,
+        active: true,
+    };
+
+    let mut tmp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(target_mode)
+        .custom_flags(O_NOFOLLOW)
+        .open(&tmp_path)
+        .map_err(|e| format!("Failed to create temporary clean file: {}", e))?;
+
+    let _ = tmp_file.set_permissions(fs::Permissions::from_mode(target_mode));
+
+    tmp_file
+        .write_all(&out)
+        .map_err(|e| format!("Failed to write cleaned image bytes: {}", e))?;
+
+    tmp_file
+        .sync_all()
+        .map_err(|e| format!("Failed to sync cleaned file to disk: {}", e))?;
+
+    let tmp_meta = tmp_file.metadata().map_err(|e| format!("Failed to read temp metadata: {}", e))?;
+    if tmp_meta.len() != out.len() as u64 {
+        return Err("Written bytes verification mismatch".to_string());
+    }
+
+    drop(tmp_file);
+
+    // Re-verify target path is still regular file and not replaced with symlink prior to rename
+    let pre_rename_meta = fs::symlink_metadata(path).map_err(|e| format!("Cannot verify target prior to rename: {}", e))?;
+    if pre_rename_meta.file_type().is_symlink() {
+        return Err("Target path changed to symlink during cleaning".to_string());
+    }
+
+    fs::rename(&tmp_path, path).map_err(|e| format!("Failed to atomically replace image: {}", e))?;
+
+    guard.active = false;
+
+    Ok(())
 }
 
 fn scrub_downloads() -> usize {
@@ -618,11 +748,13 @@ fn scrub_downloads() -> usize {
     if let Ok(entries) = fs::read_dir(ddir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_file() {
-                if let Some(ext) = p.extension() {
-                    let ext_str = ext.to_string_lossy().to_lowercase();
-                    if (ext_str == "jpg" || ext_str == "jpeg" || ext_str == "png") && clean_file(&p).is_ok() {
-                        cleaned += 1;
+            if let Ok(meta) = fs::symlink_metadata(&p) {
+                if !meta.file_type().is_symlink() && meta.is_file() {
+                    if let Some(ext) = p.extension() {
+                        let ext_str = ext.to_string_lossy().to_lowercase();
+                        if (ext_str == "jpg" || ext_str == "jpeg" || ext_str == "png") && clean_file(&p).is_ok() {
+                            cleaned += 1;
+                        }
                     }
                 }
             }
@@ -856,3 +988,131 @@ fn main() {
         println!("{:<25} [{:<8}] {}", m.name, m.status, m.summary);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_clean_file_rejects_symlinks() {
+        let temp_dir = env::temp_dir().join(format!("sentinel_sym_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let real_file = temp_dir.join("real_image.png");
+        let png_header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        fs::write(&real_file, png_header).unwrap();
+
+        let sym_file = temp_dir.join("symlink_image.png");
+        std::os::unix::fs::symlink(&real_file, &sym_file).unwrap();
+
+        let res = clean_file(&sym_file);
+        assert!(res.is_err(), "clean_file must reject symlinks");
+        assert!(res.unwrap_err().contains("Symlinks are strictly prohibited"));
+
+        // Verify real file was untouched
+        assert_eq!(fs::read(&real_file).unwrap(), png_header);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_clean_file_rejects_directories_and_non_files() {
+        let temp_dir = env::temp_dir().join(format!("sentinel_dir_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let res = clean_file(&temp_dir);
+        assert!(res.is_err(), "clean_file must reject directories");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_clean_file_atomic_png_scrubbing_and_cleanup() {
+        let temp_dir = env::temp_dir().join(format!("sentinel_clean_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let png_file = temp_dir.join("test_photo.png");
+
+        // Construct a synthetic PNG with IHDR, tEXt (metadata), and IEND chunks
+        let mut png_data = Vec::new();
+        png_data.extend_from_slice(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]); // Header
+
+        // IHDR chunk (length 13, type IHDR, 13 data bytes, 4 CRC bytes = 25 bytes total)
+        png_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x0D]);
+        png_data.extend_from_slice(b"IHDR");
+        png_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00]);
+        png_data.extend_from_slice(&[0x1F, 0x15, 0xC4, 0x89]); // CRC
+
+        // tEXt metadata chunk (length 9, type tEXt, "Author=Oz", 4 CRC bytes)
+        png_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x09]);
+        png_data.extend_from_slice(b"tEXt");
+        png_data.extend_from_slice(b"Author=Oz");
+        png_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // CRC dummy
+
+        // IEND chunk (length 0, type IEND, 4 CRC bytes)
+        png_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        png_data.extend_from_slice(b"IEND");
+        png_data.extend_from_slice(&[0xAE, 0x42, 0x60, 0x82]);
+
+        fs::write(&png_file, &png_data).unwrap();
+
+        // Verify file contains metadata before cleaning
+        let raw_before = fs::read(&png_file).unwrap();
+        assert!(raw_before.windows(4).any(|w| w == b"tEXt"));
+
+        // Clean file
+        let clean_res = clean_file(&png_file);
+        assert!(clean_res.is_ok(), "clean_file must succeed on valid PNG: {:?}", clean_res.err());
+
+        // Verify metadata was stripped
+        let raw_after = fs::read(&png_file).unwrap();
+        assert_eq!(&raw_after[..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+        assert!(!raw_after.windows(4).any(|w| w == b"tEXt"), "tEXt metadata must be stripped");
+        assert!(raw_after.windows(4).any(|w| w == b"IHDR"), "IHDR chunk must be preserved");
+        assert!(raw_after.windows(4).any(|w| w == b"IEND"), "IEND chunk must be preserved");
+
+        // Verify no temporary files remain in directory
+        let remaining_files: Vec<_> = fs::read_dir(&temp_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(remaining_files, vec!["test_photo.png"]);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_clean_file_atomic_jpeg_scrubbing() {
+        let temp_dir = env::temp_dir().join(format!("sentinel_jpg_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let jpg_file = temp_dir.join("sample.jpg");
+
+        // Construct synthetic JPEG with APP1 (EXIF: 0xFF, 0xE1) and SOI (0xFF, 0xD8), EOI (0xFF, 0xD9)
+        let mut jpg_data = Vec::new();
+        jpg_data.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        // APP1 metadata segment (length 6: len bytes 0x00, 0x06 + 4 bytes payload)
+        jpg_data.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x06, 0x45, 0x78, 0x69, 0x66]);
+        // EOI marker
+        jpg_data.extend_from_slice(&[0xFF, 0xD9]);
+
+        fs::write(&jpg_file, &jpg_data).unwrap();
+
+        let clean_res = clean_file(&jpg_file);
+        assert!(clean_res.is_ok(), "clean_file must succeed on synthetic JPEG: {:?}", clean_res.err());
+
+        let raw_after = fs::read(&jpg_file).unwrap();
+        assert_eq!(&raw_after[..2], &[0xFF, 0xD8]);
+        assert_eq!(&raw_after[raw_after.len() - 2..], &[0xFF, 0xD9]);
+        // APP1 marker must be stripped
+        assert!(!raw_after.windows(2).any(|w| w == [0xFF, 0xE1]));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+}
+
