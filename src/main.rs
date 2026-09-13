@@ -4,11 +4,16 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod subproc;
 use subproc::run_cmd_bounded;
+
+const O_NOFOLLOW: i32 = 0o400000;
+
+extern "C" {
+    fn getuid() -> u32;
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ModuleStatus {
@@ -42,21 +47,229 @@ pub struct BarStatus {
     pub color: String,
 }
 
+/// Standalone in-memory SHA-256 implementation (FIPS 180-4 compliant)
+pub fn sha256_hex(data: &[u8]) -> String {
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+    ];
+
+    let k: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+    ];
+
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut msg = Vec::with_capacity(data.len() + 64);
+    msg.extend_from_slice(data);
+    msg.push(0x80);
+    while (msg.len() % 64) != 56 {
+        msg.push(0x00);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.as_chunks::<64>().0 {
+        let mut w = [0u32; 64];
+        for (i, w_val) in w.iter_mut().take(16).enumerate() {
+            let idx = i * 4;
+            *w_val = u32::from_be_bytes([chunk[idx], chunk[idx + 1], chunk[idx + 2], chunk[idx + 3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+        }
+
+        let mut a = h[0];
+        let mut b = h[1];
+        let mut c = h[2];
+        let mut d = h[3];
+        let mut e = h[4];
+        let mut f = h[5];
+        let mut g = h[6];
+        let mut h_val = h[7];
+
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h_val
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(k[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            h_val = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(h_val);
+    }
+
+    format!(
+        "{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+        h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]
+    )
+}
+
+/// Enforces 0700 mode state directory per AGENTS.md Rule 4
 fn get_state_dir() -> PathBuf {
     let base = env::var("XDG_STATE_HOME")
         .unwrap_or_else(|_| format!("{}/.local/state", env::var("HOME").unwrap_or_default()));
     let dir = Path::new(&base).join("omarchy/security-sentinel");
     let _ = fs::create_dir_all(&dir);
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
     dir
+}
+
+/// Atomically writes sensitive state file with mode 0600, sync_all, and O_NOFOLLOW per AGENTS.md Rule 4
+fn write_secure_state_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| "Invalid state file parent path".to_string())?;
+    if !parent.exists() {
+        fs::create_dir_all(parent).map_err(|e| format!("Failed to create parent dir: {}", e))?;
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = parent.join(format!(".tmp_state_{}_{}", std::process::id(), nanos));
+
+    struct StateFileGuard<'a> {
+        path: &'a Path,
+        active: bool,
+    }
+    impl<'a> Drop for StateFileGuard<'a> {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = fs::remove_file(self.path);
+            }
+        }
+    }
+
+    let mut guard = StateFileGuard {
+        path: &tmp_path,
+        active: true,
+    };
+
+    let mut tmp_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW)
+        .open(&tmp_path)
+        .map_err(|e| format!("Failed to create temp state file with 0600/O_NOFOLLOW: {}", e))?;
+
+    let _ = tmp_file.set_permissions(fs::Permissions::from_mode(0o600));
+
+    tmp_file
+        .write_all(content)
+        .map_err(|e| format!("Failed to write state file: {}", e))?;
+
+    tmp_file
+        .sync_all()
+        .map_err(|e| format!("Failed to sync state file to disk: {}", e))?;
+
+    let meta = tmp_file.metadata().map_err(|e| format!("Failed to read temp metadata: {}", e))?;
+    if meta.len() != content.len() as u64 {
+        return Err("State file size verification mismatch".to_string());
+    }
+
+    drop(tmp_file);
+
+    if path.exists() {
+        let dest_meta = fs::symlink_metadata(path).map_err(|e| format!("Cannot check existing target: {}", e))?;
+        if dest_meta.file_type().is_symlink() {
+            return Err("Refusing to overwrite symlinked state file".to_string());
+        }
+        if !dest_meta.is_file() {
+            return Err("Target state path is not a regular file".to_string());
+        }
+    }
+
+    fs::rename(&tmp_path, path).map_err(|e| format!("Atomic state rename failed: {}", e))?;
+    guard.active = false;
+    Ok(())
+}
+
+/// Reads sensitive state file with bounded buffer, O_NOFOLLOW, and UID verification
+fn read_secure_state_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
+    if !path.exists() {
+        return Err("File does not exist".to_string());
+    }
+
+    let sym_meta = fs::symlink_metadata(path).map_err(|e| format!("symlink_metadata failed: {}", e))?;
+    if sym_meta.file_type().is_symlink() {
+        return Err("Symlinks are strictly prohibited for state files".to_string());
+    }
+    if !sym_meta.is_file() {
+        return Err("State file target is not a regular file".to_string());
+    }
+    if sym_meta.len() > max_bytes as u64 {
+        return Err("State file exceeds maximum allowed size".to_string());
+    }
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("Failed to open state file with O_NOFOLLOW: {}", e))?;
+
+    let fd_meta = file.metadata().map_err(|e| format!("Descriptor metadata failed: {}", e))?;
+    if !fd_meta.is_file() {
+        return Err("Descriptor is not a regular file".to_string());
+    }
+
+    // SAFETY: getuid is a POSIX libc syscall returning the real UID of current process
+    let current_uid = unsafe { getuid() };
+    if fd_meta.uid() != current_uid {
+        return Err("State file is not owned by current user".to_string());
+    }
+
+    let mut buf = Vec::with_capacity(fd_meta.len() as usize);
+    let mut handle = (&mut file).take((max_bytes + 1) as u64);
+    handle.read_to_end(&mut buf).map_err(|e| format!("Read failed: {}", e))?;
+    if buf.len() > max_bytes {
+        return Err("Read exceeded max_bytes limit".to_string());
+    }
+    Ok(buf)
 }
 
 fn notify_desktop(title: &str, body: &str, is_critical: bool) {
     let urgency = if is_critical { "critical" } else { "normal" };
     let icon = if is_critical { "security-low" } else { "security-high" };
-    let _ = Command::new("notify-send")
-        .args(["-a", "Security Sentinel", "-u", urgency, "-i", icon, title, body])
-        .spawn();
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let _ = run_cmd_bounded(
+        "notify-send",
+        &["-a", "Security Sentinel", "-u", urgency, "-i", icon, title, body],
+        &[],
+        deadline,
+        4096,
+    );
 }
+
 
 fn parse_ip_port(s: &str) -> Option<(String, u16)> {
     let parts: Vec<&str> = s.split(':').collect();
@@ -162,10 +375,16 @@ fn check_badusb() -> ModuleStatus {
     let mut items = Vec::new();
 
     let trusted_file = get_state_dir().join("trusted_usb.json");
-    let trusted: Vec<String> = fs::read_to_string(&trusted_file)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
+    let file_existed = trusted_file.exists();
+    let mut trusted: Vec<String> = if file_existed {
+        if let Ok(bytes) = read_secure_state_file(&trusted_file, 65536) {
+            serde_json::from_slice(&bytes).unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
 
     if let Ok(entries) = fs::read_dir("/sys/bus/usb/devices") {
         for entry in entries.flatten() {
@@ -192,7 +411,7 @@ fn check_badusb() -> ModuleStatus {
                 }
 
                 let prod = fs::read_to_string(p.join("product")).unwrap_or_else(|_| "USB Device".to_string()).trim().to_string();
-                let is_trusted = trusted.contains(&dev_id);
+                let is_trusted = trusted.contains(&dev_id) || !file_existed;
                 let tag = if is_trusted { "Approved" } else { "UNAPPROVED" };
                 let hid_tag = if is_hid { " (HID)" } else { "" };
                 items.push(format!("{} [{}]{} [{}]", prod, dev_id, hid_tag, tag));
@@ -200,8 +419,11 @@ fn check_badusb() -> ModuleStatus {
         }
     }
 
-    if !trusted_file.exists() {
-        let _ = fs::write(&trusted_file, serde_json::to_string(&current_ids).unwrap_or_default());
+    if !file_existed {
+        trusted = current_ids.clone();
+        if let Ok(data) = serde_json::to_vec(&trusted) {
+            let _ = write_secure_state_file(&trusted_file, &data);
+        }
     }
 
     let mut untrusted_count = 0;
@@ -232,28 +454,58 @@ fn check_badusb() -> ModuleStatus {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct CveCache {
+    timestamp: u64,
+    pkg_count: usize,
+    pending_pkgs: Vec<String>,
+}
+
 // 3. CVE Vulnerability Radar
 fn check_cve() -> ModuleStatus {
     let pkg_count = fs::read_dir("/var/lib/pacman/local")
         .map(|entries| entries.flatten().filter(|e| e.path().is_dir()).count())
         .unwrap_or(0);
 
-    let output = Command::new("checkupdates").output();
+    let cache_file = get_state_dir().join("cve_cache.json");
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    const CACHE_TTL_SECS: u64 = 900; // 15 minutes TTL
+
     let mut pending_pkgs = Vec::new();
-    let (pending_count, _is_clean) = match output {
-        Ok(out) => {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout);
-                for l in text.lines().filter(|l| !l.trim().is_empty()) {
-                    pending_pkgs.push(l.trim().to_string());
-                }
-                (pending_pkgs.len(), pending_pkgs.is_empty())
-            } else {
-                (0, true)
+    let mut cache_hit = false;
+
+    if let Ok(bytes) = read_secure_state_file(&cache_file, 65536) {
+        if let Ok(cache) = serde_json::from_slice::<CveCache>(&bytes) {
+            if now_secs.saturating_sub(cache.timestamp) < CACHE_TTL_SECS {
+                pending_pkgs = cache.pending_pkgs;
+                cache_hit = true;
             }
         }
-        Err(_) => (0, true),
-    };
+    }
+
+    if !cache_hit {
+        let deadline = Instant::now() + Duration::from_millis(4000);
+        if let Some(stdout) = run_cmd_bounded("checkupdates", &[], &[], deadline, 65536) {
+            let text = String::from_utf8_lossy(&stdout);
+            for l in text.lines().filter(|l| !l.trim().is_empty()) {
+                pending_pkgs.push(l.trim().to_string());
+            }
+        }
+        let cache = CveCache {
+            timestamp: now_secs,
+            pkg_count,
+            pending_pkgs: pending_pkgs.clone(),
+        };
+        if let Ok(json_bytes) = serde_json::to_vec(&cache) {
+            let _ = write_secure_state_file(&cache_file, &json_bytes);
+        }
+    }
+
+    let pending_count = pending_pkgs.len();
 
     let mut items = Vec::new();
     items.push(format!("Audited Packages: {} local packages in /var/lib/pacman/local", pkg_count));
@@ -361,20 +613,19 @@ fn check_tripwire() -> ModuleStatus {
     let hash_path = get_state_dir().join("canary.sha256");
 
     if !token_path.exists() || !hash_path.exists() {
-        let token_data = "OMARCHY_SECURITY_SENTINEL_TRIPWIRE_TOKEN_V2_INIT\n";
-        let _ = fs::write(&token_path, token_data);
-        if let Ok(out) = Command::new("sha256sum").arg(&token_path).output() {
-            let hash = String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string();
-            let _ = fs::write(&hash_path, hash);
-        }
+        let token_data = b"OMARCHY_SECURITY_SENTINEL_TRIPWIRE_TOKEN_V2_INIT\n";
+        let _ = write_secure_state_file(&token_path, token_data);
+        let hash = sha256_hex(token_data);
+        let _ = write_secure_state_file(&hash_path, hash.as_bytes());
     }
 
-    let expected_hash = fs::read_to_string(&hash_path).unwrap_or_default().trim().to_string();
-    let current_hash = if let Ok(out) = Command::new("sha256sum").arg(&token_path).output() {
-        String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string()
-    } else {
-        String::new()
-    };
+    let expected_hash = read_secure_state_file(&hash_path, 128)
+        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+        .unwrap_or_default();
+
+    let current_hash = read_secure_state_file(&token_path, 4096)
+        .map(|b| sha256_hex(&b))
+        .unwrap_or_default();
 
     let is_intact = !expected_hash.is_empty() && expected_hash == current_hash;
     let status = if is_intact { "SECURE" } else { "ALERT" };
@@ -415,8 +666,9 @@ fn check_tripwire() -> ModuleStatus {
 
 // 6. DNS Leak Guard
 fn check_dns_leak() -> (ModuleStatus, bool) {
-    let current_provider = if let Ok(out) = Command::new("/usr/bin/omarchy-dns").output() {
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let current_provider = if let Some(out) = run_cmd_bounded("omarchy-dns", &[], &[], deadline, 4096) {
+        String::from_utf8_lossy(&out).trim().to_string()
     } else {
         "DHCP".to_string()
     };
@@ -464,8 +716,15 @@ fn check_ghost_mac() -> (ModuleStatus, bool) {
     let mut conn_name = String::new();
     let mut dev_name = String::new();
 
-    if let Ok(out) = Command::new("nmcli").args(["-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"]).output() {
-        let text = String::from_utf8_lossy(&out.stdout);
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    if let Some(out) = run_cmd_bounded(
+        "nmcli",
+        &["-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"],
+        &[],
+        deadline,
+        8192,
+    ) {
+        let text = String::from_utf8_lossy(&out);
         for line in text.lines() {
             let parts: Vec<&str> = line.split(':').collect();
             if parts.len() >= 3 && parts[1] == "802-11-wireless" {
@@ -476,8 +735,15 @@ fn check_ghost_mac() -> (ModuleStatus, bool) {
                     current_mac = addr.trim().to_string();
                 }
 
-                if let Ok(c_out) = Command::new("nmcli").args(["-t", "-f", "802-11-wireless.cloned-mac-address", "connection", "show", &conn_name]).output() {
-                    let c_val = String::from_utf8_lossy(&c_out.stdout).trim().to_string();
+                let sub_deadline = Instant::now() + Duration::from_millis(1500);
+                if let Some(c_out) = run_cmd_bounded(
+                    "nmcli",
+                    &["-t", "-f", "802-11-wireless.cloned-mac-address", "connection", "show", &conn_name],
+                    &[],
+                    sub_deadline,
+                    4096,
+                ) {
+                    let c_val = String::from_utf8_lossy(&c_out).trim().to_string();
                     if c_val.contains("random") || c_val.contains("stable-random") {
                         is_randomized = true;
                     }
@@ -540,7 +806,6 @@ fn check_opsec_cleaner() -> ModuleStatus {
 }
 
 const MAX_IMAGE_SIZE: usize = 25 * 1024 * 1024; // 25 MiB cap
-const O_NOFOLLOW: i32 = 0o400000;
 
 // Lossless JPEG & PNG cleaner with strict bounded I/O, no-follow descriptor binding, and atomic replacement
 fn clean_file(path: &Path) -> Result<(), String> {
@@ -769,28 +1034,44 @@ fn dirs_downloads() -> PathBuf {
 }
 
 fn toggle_ghost_mac() -> bool {
-    // Find active Wi-Fi connection
-    if let Ok(out) = Command::new("nmcli").args(["-t", "-f", "NAME,TYPE", "connection", "show", "--active"]).output() {
-        let text = String::from_utf8_lossy(&out.stdout);
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    if let Some(out) = run_cmd_bounded(
+        "nmcli",
+        &["-t", "-f", "NAME,TYPE", "connection", "show", "--active"],
+        &[],
+        deadline,
+        8192,
+    ) {
+        let text = String::from_utf8_lossy(&out);
         for line in text.lines() {
             let parts: Vec<&str> = line.split(':').collect();
             if parts.len() >= 2 && parts[1] == "802-11-wireless" {
                 let conn = parts[0];
-                // Check current state
-                let current_cloned = Command::new("nmcli")
-                    .args(["-t", "-f", "802-11-wireless.cloned-mac-address", "connection", "show", conn])
-                    .output()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                    .unwrap_or_default();
+                let sub_deadline = Instant::now() + Duration::from_millis(1500);
+                let current_cloned = if let Some(c_out) = run_cmd_bounded(
+                    "nmcli",
+                    &["-t", "-f", "802-11-wireless.cloned-mac-address", "connection", "show", conn],
+                    &[],
+                    sub_deadline,
+                    4096,
+                ) {
+                    String::from_utf8_lossy(&c_out).trim().to_string()
+                } else {
+                    String::new()
+                };
 
                 if current_cloned.contains("random") {
-                    let _ = Command::new("nmcli").args(["connection", "modify", conn, "802-11-wireless.cloned-mac-address", "permanent"]).output();
-                    let _ = Command::new("nmcli").args(["connection", "up", conn]).output();
+                    let mod_deadline = Instant::now() + Duration::from_millis(2000);
+                    let _ = run_cmd_bounded("nmcli", &["connection", "modify", conn, "802-11-wireless.cloned-mac-address", "permanent"], &[], mod_deadline, 4096);
+                    let up_deadline = Instant::now() + Duration::from_millis(3000);
+                    let _ = run_cmd_bounded("nmcli", &["connection", "up", conn], &[], up_deadline, 4096);
                     notify_desktop("Ghost MAC", "Reverted to Wi-Fi hardware (original) MAC address.", false);
                     return false;
                 } else {
-                    let _ = Command::new("nmcli").args(["connection", "modify", conn, "802-11-wireless.cloned-mac-address", "random"]).output();
-                    let _ = Command::new("nmcli").args(["connection", "up", conn]).output();
+                    let mod_deadline = Instant::now() + Duration::from_millis(2000);
+                    let _ = run_cmd_bounded("nmcli", &["connection", "modify", conn, "802-11-wireless.cloned-mac-address", "random"], &[], mod_deadline, 4096);
+                    let up_deadline = Instant::now() + Duration::from_millis(3000);
+                    let _ = run_cmd_bounded("nmcli", &["connection", "up", conn], &[], up_deadline, 4096);
                     notify_desktop("Ghost MAC", "Wi-Fi MAC randomization enabled (random MAC per connection).", false);
                     return true;
                 }
@@ -801,17 +1082,21 @@ fn toggle_ghost_mac() -> bool {
 }
 
 fn toggle_dns() -> bool {
-    let current = Command::new("/usr/bin/omarchy-dns")
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    let current = if let Some(out) = run_cmd_bounded("omarchy-dns", &[], &[], deadline, 4096) {
+        String::from_utf8_lossy(&out).trim().to_string()
+    } else {
+        String::new()
+    };
 
     if current == "Cloudflare" || current == "Google" {
-        let _ = Command::new("/usr/bin/omarchy-dns").arg("DHCP").output();
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        let _ = run_cmd_bounded("omarchy-dns", &["DHCP"], &[], deadline, 4096);
         notify_desktop("DNS Leak Guard", "Switched to standard ISP DNS (DHCP) mode.", false);
         false
     } else {
-        let _ = Command::new("/usr/bin/omarchy-dns").arg("Cloudflare").output();
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        let _ = run_cmd_bounded("omarchy-dns", &["Cloudflare"], &[], deadline, 4096);
         notify_desktop("DNS Leak Guard", "Cloudflare DNS-over-TLS (DoT 1.1.1.1) encrypted tunnel enabled.", false);
         true
     }
@@ -831,7 +1116,9 @@ fn trust_all_usb() -> usize {
     }
     let count = ids.len();
     let trusted_file = get_state_dir().join("trusted_usb.json");
-    let _ = fs::write(&trusted_file, serde_json::to_string(&ids).unwrap_or_default());
+    if let Ok(data) = serde_json::to_vec(&ids) {
+        let _ = write_secure_state_file(&trusted_file, &data);
+    }
     notify_desktop("BadUSB Defense", &format!("Added {} connected USB devices to trusted whitelist.", count), false);
     count
 }
@@ -839,13 +1126,11 @@ fn trust_all_usb() -> usize {
 fn reset_canaries() {
     let token_path = get_state_dir().join("canary.token");
     let hash_path = get_state_dir().join("canary.sha256");
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let token_data = format!("OMARCHY_SECURITY_SENTINEL_TRIPWIRE_TOKEN_GEN_{}\n", now);
-    let _ = fs::write(&token_path, token_data);
-    if let Ok(out) = Command::new("sha256sum").arg(&token_path).output() {
-        let hash = String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string();
-        let _ = fs::write(&hash_path, hash);
-    }
+    let _ = write_secure_state_file(&token_path, token_data.as_bytes());
+    let hash = sha256_hex(token_data.as_bytes());
+    let _ = write_secure_state_file(&hash_path, hash.as_bytes());
     notify_desktop("Tripwire Canaries", "New canary honeypot token generated and SHA-256 hash sealed.", false);
 }
 
@@ -978,7 +1263,7 @@ fn main() {
     }
 
     if args.iter().any(|a| a == "--json") {
-        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        println!("{}", serde_json::to_string(&report).unwrap());
         return;
     }
 
@@ -1111,6 +1396,76 @@ mod tests {
         assert_eq!(&raw_after[raw_after.len() - 2..], &[0xFF, 0xD9]);
         // APP1 marker must be stripped
         assert!(!raw_after.windows(2).any(|w| w == [0xFF, 0xE1]));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sha256_hex_known_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b"message digest"),
+            "f7846f55cf23e14eebeab5b4e1550cad5b509e3348fbc4efa3a1413d393cb650"
+        );
+    }
+
+    #[test]
+    fn test_secure_state_file_mode_0600_and_symlink_rejection() {
+        let temp_dir = env::temp_dir().join(format!("sentinel_state_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let _ = fs::set_permissions(&temp_dir, fs::Permissions::from_mode(0o700));
+
+        let state_file = temp_dir.join("test_state.json");
+        let content = b"{\"active\":true,\"count\":42}";
+
+        // 1. Write file securely
+        let write_res = write_secure_state_file(&state_file, content);
+        assert!(write_res.is_ok(), "write_secure_state_file should succeed: {:?}", write_res.err());
+
+        // 2. Verify file permissions are strictly 0600
+        let meta = fs::symlink_metadata(&state_file).unwrap();
+        assert_eq!(
+            meta.mode() & 0o777,
+            0o600,
+            "State file mode must be strictly 0600 (-rw-------)"
+        );
+
+        // 3. Read file back
+        let read_bytes = read_secure_state_file(&state_file, 1024).unwrap();
+        assert_eq!(read_bytes, content);
+
+        // 4. Overwrite atomically
+        let new_content = b"{\"active\":false,\"count\":99}";
+        assert!(write_secure_state_file(&state_file, new_content).is_ok());
+        let read_bytes2 = read_secure_state_file(&state_file, 1024).unwrap();
+        assert_eq!(read_bytes2, new_content);
+
+        // 5. Test symlink rejection on read
+        let sym_file = temp_dir.join("sym_state.json");
+        std::os::unix::fs::symlink(&state_file, &sym_file).unwrap();
+        let sym_read = read_secure_state_file(&sym_file, 1024);
+        assert!(sym_read.is_err(), "read_secure_state_file must reject symlinks");
+
+        // 6. Test symlink rejection on write
+        let sym_write = write_secure_state_file(&sym_file, b"hack");
+        assert!(sym_write.is_err(), "write_secure_state_file must refuse to overwrite symlink");
+
+        // 7. Verify no temporary files remain
+        let remaining_files: Vec<_> = fs::read_dir(&temp_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".tmp_state_"))
+            .collect();
+        assert!(remaining_files.is_empty(), "No temp files should remain");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

@@ -1,2 +1,8 @@
 target/
 sentinel-engine
+security-sentinel
+**/*.rs.bk
+*.token
+*.sha256
+cve_cache.json
+trusted_usb.json

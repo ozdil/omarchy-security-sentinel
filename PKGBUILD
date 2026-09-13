@@ -18,9 +18,10 @@ build() {
 
 package() {
   cd "$startdir"
-  install -Dm755 target/release/security-sentinel "$pkgdir/usr/bin/sentinel-engine"
+  install -Dm755 target/release/sentinel-engine "$pkgdir/usr/bin/sentinel-engine"
   
   install -d "$pkgdir/usr/share/omarchy/plugins/security-sentinel"
+  install -Dm755 target/release/sentinel-engine "$pkgdir/usr/share/omarchy/plugins/security-sentinel/sentinel-engine"
   install -m644 manifest.json "$pkgdir/usr/share/omarchy/plugins/security-sentinel/"
   install -m644 Panel.qml "$pkgdir/usr/share/omarchy/plugins/security-sentinel/"
 }

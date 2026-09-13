@@ -1,9 +1,13 @@
 [package]
-name = "security-sentinel"
+name = "sentinel-engine"
 version = "1.0.0"
 edition = "2021"
 authors = ["Ozan Özdil"]
 description = "Unified Cyber Security & Privacy Sentinel Hub for Omarchy Linux"
+
+[[bin]]
+name = "sentinel-engine"
+path = "src/main.rs"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
