@@ -21,7 +21,7 @@ Each subsystem features an interactive inspection menu:
 1. Network and Sockets Radar: Real-time socket monitoring (`/proc/net/tcp*`, `/proc/net/udp*`) reporting Listening versus Established sockets and detecting suspicious ports. Expands to display individual listening ports (`LISTEN :53`, `LISTEN :631`) and active sockets.
 2. BadUSB Defense: Hardware HID device monitoring (`/sys/bus/usb/devices`), maintaining a cryptographically hashed local baseline (`trusted_usb.json`) to alert against unauthorized Rubber Ducky and BadUSB keystroke injectors. Expands to list all attached USB hardware, device vendor:product IDs, and provides a 1-click action to trust all currently connected USB devices.
 3. CVE Vulnerability Radar: Local package vulnerability auditing synchronized with Arch Security Tracker and pending updates across installed packages.
-4. Authentication Watch: Systemd journald and PAM audit monitoring unauthorized root, sudo, and SSH login failures over a rolling 24-hour window.
+4. Authentication Watch: Systemd journald and PAM audit monitoring unauthorized login and SSH authentication failures over a rolling 24-hour window.
 5. Tripwire Canaries: Honey-token canary files with SHA-256 baseline verification for ransomware and tampering early warning, with an instant action to reset baseline hashes.
 6. DNS Leak Guard (DoT): Native integration with `/usr/bin/omarchy-dns`, featuring an interactive toggle to enable encrypted Cloudflare DNS-over-TLS (DoT 1.1.1.1) and prevent ISP plaintext sniffing.
 7. Ghost MAC (Wi-Fi Randomizer): NetworkManager integration (`nmcli`) featuring an interactive toggle enforcing per-connection randomized MAC addressing and triggering live interface re-association to cloak hardware vendor fingerprints.
@@ -92,7 +92,7 @@ sentinel-engine --json
 
 Security Sentinel Hub complies strictly with the Omarchy Linux Security Standards (AGENTS.md):
 - Subprocess Isolation: Process executions run in isolated process groups (`cmd.process_group(0)`) with non-blocking I/O and strict monotonic deadlines.
-- Safe Privilege Boundaries: Sudo and system operations are bounded without shell string interpolation.
+- Zero Elevated Privileges: Runs entirely unprivileged in user space without requiring root or elevated credentials.
 - State File Hardening: Baseline hashes and state files are written with POSIX mode 0600 permissions. Symlinks are rejected.
 - Plain Text UI: All dynamic text rendered in QML components utilizes `textFormat: Text.PlainText` to prevent script and markup injection.
 

@@ -579,7 +579,7 @@ fn check_auth_watch() -> ModuleStatus {
     items.push("Log Target: systemd-journald & Linux PAM (24h scope)".to_string());
     items.push(format!("Failed Authentication Events: {} recorded", failed_count));
     if failed_count == 0 {
-        items.push("Integrity: No brute-force or unauthorized sudo/ssh attempts".to_string());
+        items.push("Integrity: No brute-force or unauthorized auth/ssh attempts".to_string());
     } else {
         for fe in fail_entries {
             items.push(format!("Alert -> {}", fe));
