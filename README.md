@@ -1,5 +1,7 @@
 # Security Sentinel Hub - Unified Cyber Defense and Privacy Sentinel for Omarchy Linux
 
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-Support_Development-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ozdil)
+
 All-in-one native cyber defense, hardware integrity, and privacy sentinel plugin for Omarchy Linux.
 
 Author: Ozan Ozdil (ozdil)  
@@ -95,6 +97,14 @@ Security Sentinel Hub complies strictly with the Omarchy Linux Security Standard
 - Zero Elevated Privileges: Runs entirely unprivileged in user space without requiring root or elevated credentials.
 - State File Hardening: Baseline hashes and state files are written with POSIX mode 0600 permissions. Symlinks are rejected.
 - Plain Text UI: All dynamic text rendered in QML components utilizes `textFormat: Text.PlainText` to prevent script and markup injection.
+
+---
+
+## Support & Sponsorship
+
+If you find Security Sentinel Hub valuable and want to support independent Linux cyber defense:
+
+<a href="https://buymeacoffee.com/ozdil" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 50px !important;width: 180px !important;" ></a>
 
 ---
 
