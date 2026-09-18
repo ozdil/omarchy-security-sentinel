@@ -261,17 +261,58 @@ fn notify_desktop(title: &str, body: &str, is_critical: bool) {
     let urgency = if is_critical { "critical" } else { "normal" };
     let icon = if is_critical { "security-low" } else { "security-high" };
     let deadline = Instant::now() + Duration::from_millis(1500);
+
+    let mut extra_envs = Vec::new();
+    let dbus = env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_default();
+    if !dbus.is_empty() {
+        extra_envs.push(("DBUS_SESSION_BUS_ADDRESS", dbus.as_str()));
+    }
+    let wayland = env::var("WAYLAND_DISPLAY").unwrap_or_default();
+    if !wayland.is_empty() {
+        extra_envs.push(("WAYLAND_DISPLAY", wayland.as_str()));
+    }
+    let display = env::var("DISPLAY").unwrap_or_default();
+    if !display.is_empty() {
+        extra_envs.push(("DISPLAY", display.as_str()));
+    }
+    let runtime_dir = env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+    if !runtime_dir.is_empty() {
+        extra_envs.push(("XDG_RUNTIME_DIR", runtime_dir.as_str()));
+    }
+
     let _ = run_cmd_bounded(
         "notify-send",
-        &["-a", "Security Sentinel", "-u", urgency, "-i", icon, title, body],
-        &[],
+        &["-a", "Security Sentinel", "-u", urgency, "-i", icon, "--", title, body],
+        &extra_envs,
         deadline,
         4096,
     );
 }
 
+/// Reads a system/procfs file with bounded buffer and O_NOFOLLOW to prevent symlink traversal and DoS memory exhaustion
+pub fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<String, String> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|e| format!("Failed to open {} with O_NOFOLLOW: {}", path.display(), e))?;
 
-fn parse_ip_port(s: &str) -> Option<(String, u16)> {
+    let meta = file.metadata().map_err(|e| format!("Failed to read metadata: {}", e))?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+
+    let mut buf = Vec::new();
+    let mut handle = (&mut file).take((max_bytes + 1) as u64);
+    handle.read_to_end(&mut buf).map_err(|e| format!("Read failed on {}: {}", path.display(), e))?;
+    if buf.len() > max_bytes {
+        return Err(format!("File {} exceeded limit of {} bytes", path.display(), max_bytes));
+    }
+
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+pub fn parse_ip_port(s: &str) -> Option<(String, u16)> {
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() != 2 { return None; }
     let port = u16::from_str_radix(parts[1], 16).ok()?;
@@ -285,20 +326,45 @@ fn parse_ip_port(s: &str) -> Option<(String, u16)> {
     }
 }
 
-fn port_service_name(port: u16) -> &'static str {
+pub fn port_service_name(port: u16) -> &'static str {
     match port {
+        21 => "FTP",
         22 => "SSH",
+        23 => "Telnet",
+        25 => "SMTP",
         53 => "DNS Resolver",
         80 => "HTTP",
+        110 => "POP3",
+        143 => "IMAP",
         443 => "HTTPS",
+        445 => "SMB",
         631 => "CUPS Print",
         853 => "DoT Encrypted",
+        993 => "IMAPS",
+        995 => "POP3S",
+        1337 => "Backdoor/C2",
+        1883 => "MQTT",
         3000 => "Node/Web",
+        3306 => "MySQL/MariaDB",
+        4444 => "Metasploit C2",
         5173 => "Vite Dev",
+        5432 => "PostgreSQL",
+        5555 => "ADB/Trojan",
+        6379 => "Redis Cache",
+        6666 | 6667 => "IRC Botnet",
+        8000 => "Dev Server",
         8080 => "HTTP Proxy",
+        8443 => "HTTPS Alt",
         8844 => "Local Service",
+        9001 => "Tor/Malware C2",
+        27017 => "MongoDB",
+        31337 => "Back Orifice",
         _ => "System Port",
     }
+}
+
+pub fn is_suspicious_port(port: u16) -> bool {
+    matches!(port, 1337 | 4444 | 5555 | 6666 | 6667 | 9001 | 31337)
 }
 
 // 1. Network Sockets Radar
@@ -307,12 +373,13 @@ fn check_network_sockets() -> ModuleStatus {
     let mut listen = 0;
     let mut estab = 0;
     let mut flagged = 0;
+    let mut alert_items = Vec::new();
     let mut listen_items = Vec::new();
     let mut estab_items = Vec::new();
 
     let paths = ["/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6"];
     for p in &paths {
-        if let Ok(content) = fs::read_to_string(p) {
+        if let Ok(content) = read_file_bounded(Path::new(p), 1024 * 1024) {
             for line in content.lines().skip(1) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() > 3 {
@@ -320,21 +387,24 @@ fn check_network_sockets() -> ModuleStatus {
                     let st = parts[3];
                     if st == "0A" {
                         listen += 1;
-                        if listen_items.len() < 5 {
-                            if let Some((ip, port)) = parse_ip_port(parts[1]) {
+                        if let Some((ip, port)) = parse_ip_port(parts[1]) {
+                            if is_suspicious_port(port) {
+                                flagged += 1;
+                                alert_items.push(format!("[ALERT] Unauthorized listening backdoor on port {} ({}) [{}]", port, port_service_name(port), ip));
+                            }
+                            if listen_items.len() < 5 {
                                 listen_items.push(format!("LISTEN :{} ({}) [{}]", port, port_service_name(port), ip));
                             }
                         }
                     } else if st == "01" {
                         estab += 1;
-                        if estab_items.len() < 5 {
-                            if let Some((rem_ip, rem_port)) = parse_ip_port(parts[2]) {
-                                estab_items.push(format!("ESTAB -> {}:{} ({})", rem_ip, rem_port, port_service_name(rem_port)));
-                            }
-                        }
-                        if let Some(rem) = parts.get(2) {
-                            if rem.ends_with(":115C") || rem.ends_with(":1F90") || rem.ends_with(":1A0A") {
+                        if let Some((rem_ip, rem_port)) = parse_ip_port(parts[2]) {
+                            if is_suspicious_port(rem_port) {
                                 flagged += 1;
+                                alert_items.push(format!("[ALERT] Outbound C2/Reverse Shell to {}:{} ({})", rem_ip, rem_port, port_service_name(rem_port)));
+                            }
+                            if estab_items.len() < 5 {
+                                estab_items.push(format!("ESTAB -> {}:{} ({})", rem_ip, rem_port, port_service_name(rem_port)));
                             }
                         }
                     }
@@ -344,6 +414,7 @@ fn check_network_sockets() -> ModuleStatus {
     }
 
     let mut items = Vec::new();
+    items.extend(alert_items);
     items.extend(listen_items);
     items.extend(estab_items);
     if items.is_empty() {
@@ -391,8 +462,8 @@ fn check_badusb() -> ModuleStatus {
             let p = entry.path();
             if p.join("idVendor").is_file() {
                 total_usb += 1;
-                let v = fs::read_to_string(p.join("idVendor")).unwrap_or_default().trim().to_string();
-                let pr = fs::read_to_string(p.join("idProduct")).unwrap_or_default().trim().to_string();
+                let v = read_file_bounded(&p.join("idVendor"), 512).unwrap_or_default().trim().to_string();
+                let pr = read_file_bounded(&p.join("idProduct"), 512).unwrap_or_default().trim().to_string();
                 let dev_id = format!("{}:{}", v, pr);
                 current_ids.push(dev_id.clone());
 
@@ -410,7 +481,7 @@ fn check_badusb() -> ModuleStatus {
                     }
                 }
 
-                let prod = fs::read_to_string(p.join("product")).unwrap_or_else(|_| "USB Device".to_string()).trim().to_string();
+                let prod = read_file_bounded(&p.join("product"), 512).unwrap_or_else(|_| "USB Device".to_string()).trim().to_string();
                 let is_trusted = trusted.contains(&dev_id) || !file_existed;
                 let tag = if is_trusted { "Approved" } else { "UNAPPROVED" };
                 let hid_tag = if is_hid { " (HID)" } else { "" };
@@ -731,8 +802,14 @@ fn check_ghost_mac() -> (ModuleStatus, bool) {
                 conn_name = parts[0].to_string();
                 dev_name = parts[2].to_string();
 
-                if let Ok(addr) = fs::read_to_string(format!("/sys/class/net/{}/address", dev_name)) {
-                    current_mac = addr.trim().to_string();
+                if !dev_name.is_empty()
+                    && dev_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+                    && !dev_name.contains("..")
+                {
+                    let addr_path = Path::new("/sys/class/net").join(&dev_name).join("address");
+                    if let Ok(addr) = read_file_bounded(&addr_path, 64) {
+                        current_mac = addr.trim().to_string();
+                    }
                 }
 
                 let sub_deadline = Instant::now() + Duration::from_millis(1500);
@@ -1108,8 +1185,8 @@ fn trust_all_usb() -> usize {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.join("idVendor").is_file() {
-                let v = fs::read_to_string(p.join("idVendor")).unwrap_or_default().trim().to_string();
-                let pr = fs::read_to_string(p.join("idProduct")).unwrap_or_default().trim().to_string();
+                let v = read_file_bounded(&p.join("idVendor"), 512).unwrap_or_default().trim().to_string();
+                let pr = read_file_bounded(&p.join("idProduct"), 512).unwrap_or_default().trim().to_string();
                 ids.push(format!("{}:{}", v, pr));
             }
         }
@@ -1468,6 +1545,73 @@ mod tests {
         assert!(remaining_files.is_empty(), "No temp files should remain");
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_read_file_bounded_success_and_overflow() {
+        let temp_dir = env::temp_dir().join(format!("sentinel_read_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let test_file = temp_dir.join("sample.txt");
+        fs::write(&test_file, b"1234567890").unwrap();
+
+        // Reading with exact or larger limit succeeds
+        let res1 = read_file_bounded(&test_file, 10);
+        assert!(res1.is_ok());
+        assert_eq!(res1.unwrap(), "1234567890");
+
+        let res2 = read_file_bounded(&test_file, 100);
+        assert!(res2.is_ok());
+        assert_eq!(res2.unwrap(), "1234567890");
+
+        // Reading with smaller limit fails with bounded overflow error
+        let res3 = read_file_bounded(&test_file, 9);
+        assert!(res3.is_err());
+        assert!(res3.unwrap_err().contains("exceeded limit"));
+
+        // Symlink rejection
+        let sym_file = temp_dir.join("sym_sample.txt");
+        std::os::unix::fs::symlink(&test_file, &sym_file).unwrap();
+        let sym_res = read_file_bounded(&sym_file, 100);
+        assert!(sym_res.is_err(), "read_file_bounded must reject symlinks via O_NOFOLLOW");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_suspicious_port_detection_and_service_mapping() {
+        assert!(is_suspicious_port(1337));
+        assert!(is_suspicious_port(4444));
+        assert!(is_suspicious_port(5555));
+        assert!(is_suspicious_port(6666));
+        assert!(is_suspicious_port(6667));
+        assert!(is_suspicious_port(9001));
+        assert!(is_suspicious_port(31337));
+
+        assert!(!is_suspicious_port(22));
+        assert!(!is_suspicious_port(53));
+        assert!(!is_suspicious_port(80));
+        assert!(!is_suspicious_port(443));
+        assert!(!is_suspicious_port(853));
+
+        assert_eq!(port_service_name(4444), "Metasploit C2");
+        assert_eq!(port_service_name(1337), "Backdoor/C2");
+        assert_eq!(port_service_name(31337), "Back Orifice");
+        assert_eq!(port_service_name(853), "DoT Encrypted");
+        assert_eq!(port_service_name(6379), "Redis Cache");
+    }
+
+    #[test]
+    fn test_parse_ip_port_ipv4() {
+        let parsed = parse_ip_port("0100007F:115C");
+        assert!(parsed.is_some());
+        let (ip, port) = parsed.unwrap();
+        assert_eq!(ip, "127.0.0.1");
+        assert_eq!(port, 4444);
+
+        assert!(parse_ip_port("invalid").is_none());
+        assert!(parse_ip_port("0100007F:GGGG").is_none());
     }
 }
 
