@@ -6,6 +6,8 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub mod ai;
+pub mod kernel;
 mod subproc;
 use subproc::run_cmd_bounded;
 
@@ -35,6 +37,9 @@ pub struct SentinelReport {
     pub active_modules: usize,
     pub ghost_mac_enabled: bool,
     pub dns_dot_enabled: bool,
+    pub ai_threat_score: u32,
+    pub ai_anomalies: Vec<ai::ProcessAnomaly>,
+    pub kernel_capabilities: Vec<String>,
     pub modules: Vec<ModuleStatus>,
     pub timestamp: String,
 }
@@ -1211,11 +1216,61 @@ fn reset_canaries() {
     notify_desktop("Tripwire Canaries", "New canary honeypot token generated and SHA-256 hash sealed.", false);
 }
 
+fn check_ai_behavior() -> (ModuleStatus, u32, Vec<ai::ProcessAnomaly>) {
+    let anomalies = ai::analyze_all_processes();
+    let max_score = anomalies.iter().map(|a| a.score).max().unwrap_or(0);
+
+    let (status, summary, detail) = if max_score >= 80 {
+        (
+            "ALERT",
+            format!("CRITICAL: {} suspicious behavioral anomalies detected (Highest Threat Score: {})", anomalies.len(), max_score),
+            "Immediate kernel intervention recommended (freeze process / sever active socket).".to_string(),
+        )
+    } else if max_score >= 40 {
+        (
+            "WARNING",
+            format!("ELEVATED: {} behavioral process anomalies flagged (Score: {})", anomalies.len(), max_score),
+            "Suspicious process behavior, commandline obfuscation, or untrusted filesystem execution detected.".to_string(),
+        )
+    } else {
+        (
+            "SECURE",
+            "Zero process anomalies or covert shell behaviors detected".to_string(),
+            "Shannon entropy, memory injection, reverse shell heuristics, and execution paths verified normal.".to_string(),
+        )
+    };
+
+    let items = anomalies
+        .iter()
+        .take(8)
+        .map(|a| {
+            format!("[PID {} - {}] Score {}: {}", a.pid, a.name, a.score, a.reasons.join(", "))
+        })
+        .collect();
+
+    (
+        ModuleStatus {
+            id: "ai_behavior".to_string(),
+            name: "AI Behavioral Threat Shield".to_string(),
+            status: status.to_string(),
+            summary,
+            detail,
+            is_toggleable: false,
+            toggle_state: true,
+            items,
+        },
+        max_score,
+        anomalies,
+    )
+}
+
 fn build_report() -> SentinelReport {
+    let (ai_mod, ai_threat_score, ai_anomalies) = check_ai_behavior();
     let (dns_mod, dns_dot_enabled) = check_dns_leak();
     let (ghost_mac_mod, ghost_mac_enabled) = check_ghost_mac();
 
     let modules = vec![
+        ai_mod,
         check_network_sockets(),
         check_badusb(),
         check_cve(),
@@ -1237,6 +1292,14 @@ fn build_report() -> SentinelReport {
         ("ALL SYSTEMS SECURE", "ZERO", "#22c55e")
     };
 
+    let kernel_capabilities = vec![
+        "cgroups_v2_freeze".to_string(),
+        "posix_kernel_sigstop".to_string(),
+        "sock_diag_tcp_reset".to_string(),
+        "sysfs_usb_deauthorization".to_string(),
+        "nftables_ip_quarantine".to_string(),
+    ];
+
     SentinelReport {
         overall_status: overall_status.to_string(),
         threat_level: threat_level.to_string(),
@@ -1244,6 +1307,9 @@ fn build_report() -> SentinelReport {
         active_modules: modules.len(),
         ghost_mac_enabled,
         dns_dot_enabled,
+        ai_threat_score,
+        ai_anomalies,
+        kernel_capabilities,
         modules,
         timestamp: "Live Defense".to_string(),
     }
@@ -1251,6 +1317,72 @@ fn build_report() -> SentinelReport {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+
+    // AI audit subcommand
+    if args.iter().any(|a| a == "--ai-audit" || a == "ai-audit") {
+        let anomalies = ai::analyze_all_processes();
+        println!("{}", serde_json::to_string_pretty(&anomalies).unwrap());
+        return;
+    }
+
+    // Kernel freeze process
+    if let Some(pos) = args.iter().position(|a| a == "--kernel-freeze" || a == "kernel-freeze") {
+        if let Some(pid_str) = args.get(pos + 1) {
+            if let Ok(pid) = pid_str.parse::<i32>() {
+                let res = kernel::kernel_freeze_process(pid);
+                println!("{}", serde_json::to_string(&res).unwrap());
+                return;
+            }
+        }
+        eprintln!("Error: Valid numeric PID required for kernel freeze");
+        std::process::exit(1);
+    }
+
+    // Kernel thaw process
+    if let Some(pos) = args.iter().position(|a| a == "--kernel-thaw" || a == "kernel-thaw") {
+        if let Some(pid_str) = args.get(pos + 1) {
+            if let Ok(pid) = pid_str.parse::<i32>() {
+                let res = kernel::kernel_thaw_process(pid);
+                println!("{}", serde_json::to_string(&res).unwrap());
+                return;
+            }
+        }
+        eprintln!("Error: Valid numeric PID required for kernel thaw");
+        std::process::exit(1);
+    }
+
+    // Kernel sever socket
+    if let Some(pos) = args.iter().position(|a| a == "--kernel-sever-socket" || a == "kernel-sever-socket") {
+        if let Some(target) = args.get(pos + 1) {
+            let res = kernel::kernel_sever_socket(target);
+            println!("{}", serde_json::to_string(&res).unwrap());
+            return;
+        }
+        eprintln!("Error: Target port or IP required for socket severing");
+        std::process::exit(1);
+    }
+
+    // Kernel de-auth USB
+    if let Some(pos) = args.iter().position(|a| a == "--kernel-deauth-usb" || a == "kernel-deauth-usb") {
+        if let Some(bus_id) = args.get(pos + 1) {
+            let res = kernel::kernel_deauth_usb(bus_id);
+            println!("{}", serde_json::to_string(&res).unwrap());
+            return;
+        }
+        eprintln!("Error: USB bus ID required for de-authorization");
+        std::process::exit(1);
+    }
+
+    // Kernel quarantine IP
+    if let Some(pos) = args.iter().position(|a| a == "--kernel-quarantine-ip" || a == "kernel-quarantine-ip") {
+        if let Some(ip) = args.get(pos + 1) {
+            let res = kernel::kernel_quarantine_ip(ip);
+            println!("{}", serde_json::to_string(&res).unwrap());
+            return;
+        }
+        eprintln!("Error: IP address required for quarantine");
+        std::process::exit(1);
+    }
 
     if args.iter().any(|a| a == "--toggle-ghost-mac") {
         let state = toggle_ghost_mac();
@@ -1326,8 +1458,8 @@ fn main() {
     if args.iter().any(|a| a == "--status" || a == "--bar") {
         let text = "\u{f0483}".to_string();
         let tooltip = format!(
-            "Security Sentinel Hub\nStatus: {}\nThreat Level: {}\nActive Subsystems: 8 / 8\n\n[Left Click] Open Security Center",
-            report.overall_status, report.threat_level
+            "Security Sentinel Hub\nStatus: {}\nThreat Level: {}\nActive Subsystems: {} / {}\n\n[Left Click] Open Security Center",
+            report.overall_status, report.threat_level, report.active_modules, report.active_modules
         );
         let out = BarStatus {
             text,

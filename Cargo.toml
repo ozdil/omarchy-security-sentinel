@@ -5,6 +5,10 @@ edition = "2021"
 authors = ["Ozan Özdil"]
 description = "Unified Cyber Security & Privacy Sentinel Hub for Omarchy Linux"
 
+[lib]
+name = "sentinel_engine"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sentinel-engine"
 path = "src/main.rs"

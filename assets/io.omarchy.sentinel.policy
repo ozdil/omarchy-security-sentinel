@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>Omarchy Linux</vendor>
+  <vendor_url>https://omarchy.org</vendor_url>
+
+  <action id="io.omarchy.sentinel.intervention">
+    <description>Perform kernel-level security interventions</description>
+    <message>Authentication is required to execute kernel security interventions (process freeze, socket sever, USB deauth, or netfilter quarantine).</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/sentinel-engine</annotate>
+  </action>
+
+  <action id="io.omarchy.sentinel.network">
+    <description>Manage network privacy and DoT settings</description>
+    <message>Authentication is required to configure privacy network settings.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/sentinel-engine</annotate>
+  </action>
+</policyconfig>

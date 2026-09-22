@@ -16,7 +16,10 @@ Panel {
 
   property string overallStatus: "ALL SYSTEMS SECURE"
   property string threatLevel: "ZERO"
-  property int activeCount: 8
+  property int activeCount: 9
+  property int aiThreatScore: 0
+  property var aiAnomalies: []
+  property var kernelCapabilities: []
   property var modules: []
   property string expandedId: ""
 
@@ -33,6 +36,30 @@ Panel {
     if (!stateProc.running) {
       stateProc.running = true
     }
+  }
+
+  function kernelFreezeProcess(pid) {
+    if (!pid) return
+    actionProc.command = [root.resolveEnginePath(), "--kernel-freeze", String(pid)]
+    actionProc.running = true
+  }
+
+  function kernelSeverSocket(target) {
+    if (!target) return
+    actionProc.command = [root.resolveEnginePath(), "--kernel-sever-socket", String(target)]
+    actionProc.running = true
+  }
+
+  function kernelDeauthUsb(busId) {
+    if (!busId) return
+    actionProc.command = [root.resolveEnginePath(), "--kernel-deauth-usb", String(busId)]
+    actionProc.running = true
+  }
+
+  function kernelQuarantineIp(ip) {
+    if (!ip) return
+    actionProc.command = [root.resolveEnginePath(), "--kernel-quarantine-ip", String(ip)]
+    actionProc.running = true
   }
 
   function toggleExpand(id) {
@@ -123,6 +150,7 @@ Panel {
 
   function moduleIcon(id) {
     switch (id) {
+      case "ai_behavior": return "󰚩"
       case "network": return "󰒃"
       case "badusb": return "󰕓"
       case "cve": return "󰮯"
@@ -168,12 +196,15 @@ Panel {
       waitForEnd: true
       onStreamFinished: {
         try {
-          var clean = String(text || "").slice(0, 65536)
+          var clean = String(text || "").slice(0, 131072)
           var d = JSON.parse(clean)
           root.overallStatus = String(d.overall_status || "ALL SYSTEMS SECURE")
           root.threatLevel = String(d.threat_level || "ZERO")
-          root.activeCount = Number(d.active_modules) || 8
+          root.activeCount = Number(d.active_modules) || 9
           root.modules = d.modules || []
+          root.aiThreatScore = Number(d.ai_threat_score) || 0
+          root.aiAnomalies = d.ai_anomalies || []
+          root.kernelCapabilities = d.kernel_capabilities || []
         } catch(e) {}
       }
     }
@@ -569,13 +600,41 @@ Panel {
 
                   // Contextual In-Card Actions
                   Item {
-                    visible: rowDelegate.modId === "badusb" || rowDelegate.modId === "tripwire" || rowDelegate.modId === "opsec"
+                    visible: rowDelegate.modId === "badusb" || rowDelegate.modId === "tripwire" || rowDelegate.modId === "opsec" || rowDelegate.modId === "ai_behavior"
                     width: parent.width
                     height: (visible ? Style.space(32) : 0)
 
                     RowLayout {
                       anchors.fill: parent
                       spacing: Style.space(8)
+
+                      Button {
+                        visible: rowDelegate.modId === "ai_behavior"
+                        text: "AI Behavioral Scan"
+                        iconText: "󰚩"
+                        foreground: root.foreground
+                        accent: root.accent
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        bordered: true
+                        onClicked: root.refresh()
+                      }
+
+                      Button {
+                        visible: rowDelegate.modId === "ai_behavior" && root.aiAnomalies.length > 0
+                        text: "Kernel Freeze PID " + (root.aiAnomalies.length > 0 ? root.aiAnomalies[0].pid : "")
+                        iconText: "󰟀"
+                        foreground: Color.urgent
+                        accent: Color.urgent
+                        fontFamily: root.fontFamily
+                        fontSize: Style.font.caption
+                        bordered: true
+                        onClicked: {
+                          if (root.aiAnomalies.length > 0) {
+                            root.kernelFreezeProcess(root.aiAnomalies[0].pid)
+                          }
+                        }
+                      }
 
                       Button {
                         visible: rowDelegate.modId === "badusb"
