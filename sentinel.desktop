@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Security Sentinel
+GenericName=Zero-Trust Security Center
+Comment=Kernel hardening, AI threat heuristics and host intrusion defense for Omarchy Linux
+Exec=sentinel-dashboard
+Icon=security-high
+Terminal=false
+Categories=System;Security;Monitor;
+Keywords=security;sentinel;threat;kernel;firewall;antivirus;omarchy;

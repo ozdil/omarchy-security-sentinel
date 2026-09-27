@@ -1,0 +1,69 @@
+#!/bin/bash -p
+set -euo pipefail
+
+# Immediate rejection of loader injection
+if [ -n "${LD_PRELOAD:-}" ] || [ -n "${LD_LIBRARY_PATH:-}" ]; then
+    echo "Security Error: Prohibited loader control variable detected" >&2
+    exit 1
+fi
+
+# Re-exec through fixed trusted shell under sanitized environment (/usr/bin/env -i)
+if [ "${SENTINEL_SECURE_ENV:-0}" != "1" ]; then
+    exec /usr/bin/env -i \
+        PATH="/usr/bin:/bin:${HOME}/.local/bin:${HOME}/.cargo/bin" \
+        HOME="${HOME}" \
+        USER="${USER:-$(/usr/bin/id -un 2>/dev/null || echo "user")}" \
+        LANG="${LANG:-C.UTF-8}" \
+        LC_ALL="${LC_ALL:-C.UTF-8}" \
+        DISPLAY="${DISPLAY:-}" \
+        WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-}" \
+        XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(/usr/bin/id -u 2>/dev/null || echo 1000)}" \
+        XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}" \
+        XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}" \
+        SENTINEL_SECURE_ENV=1 \
+        /bin/bash -p "$0" "$@"
+fi
+
+# Reject unexpected build and loader controls
+for var in LD_PRELOAD LD_LIBRARY_PATH RUSTC_WRAPPER CARGO_BUILD_RUSTC_WRAPPER RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_HOME BASH_ENV ENV; do
+    if [ -n "${!var+x}" ]; then
+        echo "Security Error: Prohibited build/loader control variable detected: ${var}" >&2
+        exit 1
+    fi
+done
+
+DIR="$(cd "$(/usr/bin/dirname "$(/usr/bin/realpath "${BASH_SOURCE[0]}")")" && /usr/bin/pwd)"
+
+# Resolve trusted quickshell binary
+QUICKSHELL_BIN=""
+if [[ -x /usr/bin/quickshell ]]; then
+    QUICKSHELL_BIN="/usr/bin/quickshell"
+elif [[ -x /usr/local/bin/quickshell ]]; then
+    QUICKSHELL_BIN="/usr/local/bin/quickshell"
+elif [[ -x "${HOME}/.local/bin/quickshell" ]]; then
+    QUICKSHELL_BIN="${HOME}/.local/bin/quickshell"
+fi
+
+# Prefer native Quickshell standalone UI if available
+if [[ "${1:-}" != "--cli" && -n "${QUICKSHELL_BIN}" ]]; then
+    if "${QUICKSHELL_BIN}" ipc call ozdil.sentinel toggle >/dev/null 2>&1; then
+        exit 0
+    fi
+    QML_SHELL="${DIR}/qml/shell.qml"
+    if [[ -f "${QML_SHELL}" ]]; then
+        exec "${QUICKSHELL_BIN}" -p "${QML_SHELL}"
+    fi
+fi
+
+if [[ "${1:-}" == "--cli" ]]; then
+    shift
+fi
+
+BIN="${DIR}/sentinel-engine"
+if [[ -x "${BIN}" ]]; then
+    "${BIN}" "$@"
+else
+    echo "Building sentinel-engine from source..." >&2
+    (cd "${DIR}" && cargo build --release --locked && install -m 755 "${DIR}/target/release/sentinel-engine" "${BIN}")
+    "${BIN}" "$@"
+fi
