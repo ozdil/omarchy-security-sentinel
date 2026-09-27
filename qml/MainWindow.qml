@@ -184,7 +184,7 @@ Item {
                         }
 
                         Text {
-                            text: "INTEGRITY: " + (root.selfIntegrityHash ? root.selfIntegrityHash.substring(0, 8) : "VERIFIED")
+                            text: "INTEGRITY: " + (root.selfIntegrityHash && root.selfIntegrityHash !== "UNVERIFIED" ? "VERIFIED (" + root.selfIntegrityHash.substring(0, 8) + ")" : "UNVERIFIED")
                             font.family: Theme.monoFont
                             font.pixelSize: 11
                             font.bold: true
