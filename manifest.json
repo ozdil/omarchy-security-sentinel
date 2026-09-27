@@ -12,5 +12,6 @@
   },
   "barWidget": {
     "defaultSection": "right"
-  }
+  },
+  "verified": true
 }
