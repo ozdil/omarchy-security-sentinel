@@ -1,6 +1,7 @@
 use sentinel_engine::ai::{AnomalySeverity, BehaviorAnalyzer};
 use sentinel_engine::kernel::{
     kernel_deauth_usb, kernel_freeze_process, kernel_quarantine_ip, kernel_sever_socket,
+    kernel_terminate_process,
 };
 
 #[test]
@@ -184,4 +185,36 @@ fn test_kernel_quarantine_ip_validation() {
 
     let res_broadcast = kernel_quarantine_ip("255.255.255.255");
     assert!(!res_broadcast.success);
+}
+
+#[test]
+fn test_kernel_terminate_prevents_init_or_invalid_pid() {
+    let res0 = kernel_terminate_process(0);
+    assert!(!res0.success);
+    assert!(res0.message.contains("PID <= 2"));
+
+    let res1 = kernel_terminate_process(1);
+    assert!(!res1.success);
+    assert!(res1.message.contains("PID <= 2"));
+
+    let res2 = kernel_terminate_process(2);
+    assert!(!res2.success);
+    assert!(res2.message.contains("PID <= 2"));
+
+    let res_neg = kernel_terminate_process(-10);
+    assert!(!res_neg.success);
+}
+
+#[test]
+fn test_kernel_network_blackout_status_query() {
+    // Tests that query does not panic or hang
+    let _ = sentinel_engine::kernel_is_network_blackout_active();
+}
+
+#[test]
+fn test_self_defense_prctl_and_hash() {
+    assert!(sentinel_engine::enforce_anti_tamper());
+    let hash_res = sentinel_engine::calculate_self_exe_sha256();
+    assert!(hash_res.is_ok());
+    assert_eq!(hash_res.unwrap().len(), 64);
 }

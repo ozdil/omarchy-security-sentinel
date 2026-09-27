@@ -19,9 +19,15 @@ build() {
 package() {
   cd "$startdir"
   install -Dm755 target/release/sentinel-engine "$pkgdir/usr/bin/sentinel-engine"
+  install -Dm755 sentinel-dashboard "$pkgdir/usr/bin/sentinel-dashboard"
+  install -Dm644 sentinel.desktop "$pkgdir/usr/share/applications/sentinel.desktop"
+  install -Dm644 assets/io.omarchy.sentinel.policy "$pkgdir/usr/share/polkit-1/actions/io.omarchy.sentinel.policy"
   
   install -d "$pkgdir/usr/share/omarchy/plugins/security-sentinel"
   install -Dm755 target/release/sentinel-engine "$pkgdir/usr/share/omarchy/plugins/security-sentinel/sentinel-engine"
   install -m644 manifest.json "$pkgdir/usr/share/omarchy/plugins/security-sentinel/"
   install -m644 Panel.qml "$pkgdir/usr/share/omarchy/plugins/security-sentinel/"
+
+  install -d "$pkgdir/usr/share/omarchy/plugins/security-sentinel/qml"
+  cp -r qml/* "$pkgdir/usr/share/omarchy/plugins/security-sentinel/qml/"
 }

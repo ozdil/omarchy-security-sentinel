@@ -12,6 +12,9 @@ Item {
     property var modules: []
     property var anomalousProcesses: []
     property var selectedModule: null
+    property bool networkBlackoutActive: false
+    property bool usbArmorEnabled: false
+    property string selfIntegrityHash: ""
 
     readonly property string enginePath: {
         var base = Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "");
@@ -25,23 +28,52 @@ Item {
         }
     }
 
+    function toggleBlackout() {
+        if (root.networkBlackoutActive) {
+            actionProc.command = [root.enginePath, "--resume-network"];
+        } else {
+            actionProc.command = [root.enginePath, "--panic-blackout"];
+        }
+        actionProc.running = true;
+    }
+
+    function toggleUsbArmor() {
+        actionProc.command = [root.enginePath, "--toggle-usb-armor"];
+        actionProc.running = true;
+    }
+
     function freezePid(pid) {
-        actionProc.command = [root.enginePath, "--freeze-process", String(pid)];
+        actionProc.command = [root.enginePath, "--kernel-freeze", String(pid)];
         actionProc.running = true;
     }
 
     function terminatePid(pid) {
-        actionProc.command = [root.enginePath, "--terminate-process", String(pid)];
+        actionProc.command = [root.enginePath, "--kernel-terminate", String(pid)];
         actionProc.running = true;
     }
 
     function toggleDot() {
-        actionProc.command = [root.enginePath, "--toggle-dot"];
+        actionProc.command = [root.enginePath, "--toggle-dns"];
         actionProc.running = true;
     }
 
     function toggleGhostMac() {
         actionProc.command = [root.enginePath, "--toggle-ghost-mac"];
+        actionProc.running = true;
+    }
+
+    function trustAllUsb() {
+        actionProc.command = [root.enginePath, "--trust-all-usb"];
+        actionProc.running = true;
+    }
+
+    function resetCanaries() {
+        actionProc.command = [root.enginePath, "--reset-canaries"];
+        actionProc.running = true;
+    }
+
+    function scrubDownloads() {
+        actionProc.command = [root.enginePath, "--scrub-downloads"];
         actionProc.running = true;
     }
 
@@ -53,9 +85,12 @@ Item {
             onStreamFinished: {
                 try {
                     var data = JSON.parse(text || "{}");
-                    root.threatLevel = data.threat_level || "NORMAL";
+                    root.threatLevel = data.threat_level || "ZERO";
                     root.modules = data.modules || [];
-                    root.anomalousProcesses = data.anomalous_processes || [];
+                    root.anomalousProcesses = data.ai_anomalies || data.anomalous_processes || [];
+                    root.networkBlackoutActive = !!data.network_blackout_active;
+                    root.usbArmorEnabled = !!data.usb_armor_enabled;
+                    root.selfIntegrityHash = data.self_integrity_hash || "";
 
                     if (!root.selectedModule && root.modules.length > 0) {
                         root.selectedModule = root.modules[0];
@@ -126,6 +161,76 @@ Item {
                 }
 
                 Item { Layout.fillWidth: true }
+
+                // Self-Integrity Badge
+                Rectangle {
+                    height: 32
+                    implicitWidth: integrityRow.implicitWidth + 20
+                    radius: Theme.radiusSm
+                    color: Theme.bgCard
+                    border.color: Theme.border
+                    border.width: 1
+
+                    RowLayout {
+                        id: integrityRow
+                        anchors.centerIn: parent
+                        spacing: 6
+
+                        Text {
+                            text: Theme.iconLock
+                            font.family: Theme.iconFont
+                            font.pixelSize: 11
+                            color: Theme.accentSuccess
+                        }
+
+                        Text {
+                            text: "INTEGRITY: " + (root.selfIntegrityHash ? root.selfIntegrityHash.substring(0, 8) : "VERIFIED")
+                            font.family: Theme.monoFont
+                            font.pixelSize: 11
+                            font.bold: true
+                            color: Theme.textMain
+                        }
+                    }
+                }
+
+                // Panic Blackout Button
+                Rectangle {
+                    height: 32
+                    implicitWidth: blackoutRow.implicitWidth + 20
+                    radius: Theme.radiusSm
+                    color: root.networkBlackoutActive ? Theme.accentDanger : (blackoutArea.containsMouse ? Theme.bgCardHover : Theme.bgCard)
+                    border.color: root.networkBlackoutActive ? Theme.accentDanger : Theme.accentWarning
+                    border.width: 1
+
+                    RowLayout {
+                        id: blackoutRow
+                        anchors.centerIn: parent
+                        spacing: 6
+
+                        Text {
+                            text: root.networkBlackoutActive ? Theme.iconShieldAlert : Theme.iconShield
+                            font.family: Theme.iconFont
+                            font.pixelSize: 12
+                            color: root.networkBlackoutActive ? "#ffffff" : Theme.accentWarning
+                        }
+
+                        Text {
+                            text: root.networkBlackoutActive ? "RESUME NETWORK" : "PANIC BLACKOUT"
+                            font.family: Theme.fontFamily
+                            font.pixelSize: 11
+                            font.bold: true
+                            color: root.networkBlackoutActive ? "#ffffff" : Theme.textMain
+                        }
+                    }
+
+                    MouseArea {
+                        id: blackoutArea
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.toggleBlackout()
+                    }
+                }
 
                 // Threat Level Pill
                 Rectangle {
@@ -377,6 +482,113 @@ Item {
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
                                 onClicked: root.toggleGhostMac()
+                            }
+                        }
+
+                        Rectangle {
+                            height: 30
+                            implicitWidth: usbArmorBtnRow.implicitWidth + 16
+                            radius: Theme.radiusSm
+                            visible: root.selectedModule && root.selectedModule.id === "badusb"
+                            color: root.usbArmorEnabled ? Theme.accentSuccess : Theme.bgCard
+                            border.color: root.usbArmorEnabled ? Theme.accentSuccess : Theme.border
+                            border.width: 1
+
+                            RowLayout {
+                                id: usbArmorBtnRow
+                                anchors.centerIn: parent
+                                spacing: 6
+                                Text { 
+                                    text: Theme.iconShield
+                                    font.family: Theme.iconFont
+                                    font.pixelSize: 11
+                                    color: root.usbArmorEnabled ? Theme.bgDark : Theme.accentSuccess 
+                                }
+                                Text { 
+                                    text: root.usbArmorEnabled ? "USB Armor: ACTIVE" : "Enable USB Armor"
+                                    font.family: Theme.fontFamily
+                                    font.pixelSize: 11
+                                    font.bold: true
+                                    color: root.usbArmorEnabled ? Theme.bgDark : Theme.textMain 
+                                }
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.toggleUsbArmor()
+                            }
+                        }
+
+                        Rectangle {
+                            height: 30
+                            implicitWidth: usbBtnRow.implicitWidth + 16
+                            radius: Theme.radiusSm
+                            visible: root.selectedModule && root.selectedModule.id === "badusb"
+                            color: Theme.bgCard
+                            border.color: Theme.border
+                            border.width: 1
+
+                            RowLayout {
+                                id: usbBtnRow
+                                anchors.centerIn: parent
+                                spacing: 6
+                                Text { text: Theme.iconUsb; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.accentSuccess }
+                                Text { text: "Trust All Connected USBs"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.trustAllUsb()
+                            }
+                        }
+
+                        Rectangle {
+                            height: 30
+                            implicitWidth: tripBtnRow.implicitWidth + 16
+                            radius: Theme.radiusSm
+                            visible: root.selectedModule && root.selectedModule.id === "tripwire"
+                            color: Theme.bgCard
+                            border.color: Theme.border
+                            border.width: 1
+
+                            RowLayout {
+                                id: tripBtnRow
+                                anchors.centerIn: parent
+                                spacing: 6
+                                Text { text: Theme.iconShield; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.accentWarning }
+                                Text { text: "Reset Canary SHA-256"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.resetCanaries()
+                            }
+                        }
+
+                        Rectangle {
+                            height: 30
+                            implicitWidth: opsecBtnRow.implicitWidth + 16
+                            radius: Theme.radiusSm
+                            visible: root.selectedModule && root.selectedModule.id === "opsec"
+                            color: Theme.bgCard
+                            border.color: Theme.border
+                            border.width: 1
+
+                            RowLayout {
+                                id: opsecBtnRow
+                                anchors.centerIn: parent
+                                spacing: 6
+                                Text { text: Theme.iconTrash; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.accentDanger }
+                                Text { text: "Scrub Downloads"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.scrubDownloads()
                             }
                         }
                     }

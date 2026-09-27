@@ -7,6 +7,8 @@ pub use ai::{
     ProcessAnomaly, SocketAnomaly,
 };
 pub use kernel::{
-    kernel_deauth_usb, kernel_freeze_process, kernel_quarantine_ip, kernel_sever_socket,
-    kernel_thaw_process, InterventionResult,
+    calculate_self_exe_sha256, constant_time_eq, enforce_anti_tamper, kernel_apply_network_blackout,
+    kernel_clear_network_blackout, kernel_deauth_usb, kernel_freeze_process,
+    kernel_is_network_blackout_active, kernel_quarantine_ip, kernel_sever_socket,
+    kernel_terminate_process, kernel_thaw_process, sha256_hex, InterventionResult, SecureBuffer,
 };

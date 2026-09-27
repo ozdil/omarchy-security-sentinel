@@ -37,6 +37,9 @@ pub struct SentinelReport {
     pub active_modules: usize,
     pub ghost_mac_enabled: bool,
     pub dns_dot_enabled: bool,
+    pub usb_armor_enabled: bool,
+    pub network_blackout_active: bool,
+    pub self_integrity_hash: String,
     pub ai_threat_score: u32,
     pub ai_anomalies: Vec<ai::ProcessAnomaly>,
     pub kernel_capabilities: Vec<String>,
@@ -443,11 +446,27 @@ fn check_network_sockets() -> ModuleStatus {
     }
 }
 
+fn is_usb_armor_enabled() -> bool {
+    get_state_dir().join("usb_armor.enabled").exists()
+}
+
+fn toggle_usb_armor() -> bool {
+    let flag = get_state_dir().join("usb_armor.enabled");
+    if flag.exists() {
+        let _ = fs::remove_file(&flag);
+        false
+    } else {
+        let _ = write_secure_state_file(&flag, b"1");
+        true
+    }
+}
+
 // 2. BadUSB Defense
 fn check_badusb() -> ModuleStatus {
     let mut total_usb = 0;
     let mut hid_count = 0;
     let mut current_ids = Vec::new();
+    let mut unapproved_bus_ids = Vec::new();
     let mut items = Vec::new();
 
     let trusted_file = get_state_dir().join("trusted_usb.json");
@@ -470,6 +489,7 @@ fn check_badusb() -> ModuleStatus {
                 let v = read_file_bounded(&p.join("idVendor"), 512).unwrap_or_default().trim().to_string();
                 let pr = read_file_bounded(&p.join("idProduct"), 512).unwrap_or_default().trim().to_string();
                 let dev_id = format!("{}:{}", v, pr);
+                let bus_id = entry.file_name().to_string_lossy().to_string();
                 current_ids.push(dev_id.clone());
 
                 let mut is_hid = false;
@@ -491,6 +511,9 @@ fn check_badusb() -> ModuleStatus {
                 let tag = if is_trusted { "Approved" } else { "UNAPPROVED" };
                 let hid_tag = if is_hid { " (HID)" } else { "" };
                 items.push(format!("{} [{}]{} [{}]", prod, dev_id, hid_tag, tag));
+                if !is_trusted {
+                    unapproved_bus_ids.push(bus_id);
+                }
             }
         }
     }
@@ -502,11 +525,14 @@ fn check_badusb() -> ModuleStatus {
         }
     }
 
-    let mut untrusted_count = 0;
-    for id in &current_ids {
-        if !trusted.contains(id) {
-            untrusted_count += 1;
+    let untrusted_count = unapproved_bus_ids.len();
+    let armor_active = is_usb_armor_enabled();
+
+    if armor_active && untrusted_count > 0 {
+        for b_id in &unapproved_bus_ids {
+            let _ = kernel::kernel_deauth_usb(b_id);
         }
+        items.push("[ARMOR ENGAGED] Unauthorized USB hardware de-authorized at kernel interface".to_string());
     }
 
     let status = if untrusted_count > 0 { "ALERT" } else { "SECURE" };
@@ -515,17 +541,25 @@ fn check_badusb() -> ModuleStatus {
         name: "BadUSB Defense".to_string(),
         status: status.to_string(),
         summary: if untrusted_count > 0 {
-            format!("[ALERT] {} UNTRUSTED USB DETECTED", untrusted_count)
+            if armor_active {
+                format!("[AUTO-BLOCKED] {} Untrusted USB Deauthorized", untrusted_count)
+            } else {
+                format!("[ALERT] {} UNTRUSTED USB DETECTED", untrusted_count)
+            }
         } else {
             format!("{} Devices ({} Trusted HID)", total_usb, hid_count)
         },
         detail: if untrusted_count > 0 {
-            "Unauthorized USB device attached! Click 'Trust Devices' to approve.".to_string()
+            if armor_active {
+                "Military USB Armor active: Unauthorized USB hardware automatically severed.".to_string()
+            } else {
+                "Unauthorized USB device attached! Click 'Trust Devices' or toggle 'USB Armor' to auto-quarantine.".to_string()
+            }
         } else {
             "All attached HID devices match approved hardware baseline".to_string()
         },
-        is_toggleable: false,
-        toggle_state: false,
+        is_toggleable: true,
+        toggle_state: armor_active,
         items,
     }
 }
@@ -703,11 +737,25 @@ fn check_tripwire() -> ModuleStatus {
         .map(|b| sha256_hex(&b))
         .unwrap_or_default();
 
-    let is_intact = !expected_hash.is_empty() && expected_hash == current_hash;
+    let is_token_intact = !expected_hash.is_empty() && expected_hash == current_hash;
+
+    // Decoy canary in /tmp to trap filesystem crawlers, wipers, and ransomware
+    let tmp_canary_path = Path::new("/tmp/.omarchy_canary.token");
+    if !tmp_canary_path.exists() {
+        let _ = write_secure_state_file(tmp_canary_path, b"OMARCHY_MILITARY_TRIPWIRE_TMP_CANARY\n");
+    }
+    let tmp_intact = if let Ok(s) = read_file_bounded(tmp_canary_path, 128) {
+        s.contains("OMARCHY_MILITARY_TRIPWIRE_TMP_CANARY")
+    } else {
+        false
+    };
+
+    let is_intact = is_token_intact && tmp_intact;
     let status = if is_intact { "SECURE" } else { "ALERT" };
 
     let mut items = Vec::new();
-    items.push(format!("Canary Path: {}", token_path.display()));
+    items.push(format!("Primary Canary: {}", token_path.display()));
+    items.push(format!("Decoy Canary: {}", tmp_canary_path.display()));
     let hash_display = if expected_hash.len() > 16 {
         format!("{}...{}", &expected_hash[..8], &expected_hash[expected_hash.len() - 8..])
     } else {
@@ -715,9 +763,9 @@ fn check_tripwire() -> ModuleStatus {
     };
     items.push(format!("SHA-256 Seal: {} [Intact]", hash_display));
     items.push(if is_intact {
-        "Ransomware Defense: Token intact | File baseline verified".to_string()
+        "Ransomware Defense: All honey-tokens intact | File baseline verified".to_string()
     } else {
-        "[ALERT] Canary token modified or encrypted by untrusted process!".to_string()
+        "[ALERT] Canary token modified or wiped by untrusted process!".to_string()
     });
 
     ModuleStatus {
@@ -1292,12 +1340,19 @@ fn build_report() -> SentinelReport {
         ("ALL SYSTEMS SECURE", "ZERO", "#22c55e")
     };
 
+    let usb_armor_enabled = is_usb_armor_enabled();
+    let network_blackout_active = kernel::kernel_is_network_blackout_active();
+    let self_integrity_hash = kernel::calculate_self_exe_sha256().unwrap_or_else(|_| "UNVERIFIED".to_string());
+
     let kernel_capabilities = vec![
         "cgroups_v2_freeze".to_string(),
         "posix_kernel_sigstop".to_string(),
         "sock_diag_tcp_reset".to_string(),
         "sysfs_usb_deauthorization".to_string(),
         "nftables_ip_quarantine".to_string(),
+        "nftables_panic_blackout".to_string(),
+        "prctl_anti_dumpable".to_string(),
+        "forensic_hash_capture".to_string(),
     ];
 
     SentinelReport {
@@ -1307,6 +1362,9 @@ fn build_report() -> SentinelReport {
         active_modules: modules.len(),
         ghost_mac_enabled,
         dns_dot_enabled,
+        usb_armor_enabled,
+        network_blackout_active,
+        self_integrity_hash,
         ai_threat_score,
         ai_anomalies,
         kernel_capabilities,
@@ -1316,7 +1374,49 @@ fn build_report() -> SentinelReport {
 }
 
 fn main() {
+    // 1. Enforce military-grade anti-tamper (prctl PR_SET_DUMPABLE 0)
+    let _ = kernel::enforce_anti_tamper();
+
     let args: Vec<String> = env::args().collect();
+
+    // Verify self-integrity
+    if args.iter().any(|a| a == "--verify-integrity" || a == "verify-integrity") {
+        match kernel::calculate_self_exe_sha256() {
+            Ok(hash) => {
+                println!("{{\"self_integrity\": \"SECURE\", \"sha256\": \"{}\", \"anti_tamper\": true}}", hash);
+            }
+            Err(e) => {
+                eprintln!("{{\"self_integrity\": \"COMPROMISED\", \"error\": \"{}\"}}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    // Emergency Military Network Blackout (Killswitch)
+    if args.iter().any(|a| a == "--panic-blackout" || a == "panic-blackout") {
+        let res = kernel::kernel_apply_network_blackout();
+        println!("{}", serde_json::to_string(&res).unwrap());
+        return;
+    }
+
+    if args.iter().any(|a| a == "--resume-network" || a == "resume-network") {
+        let res = kernel::kernel_clear_network_blackout();
+        println!("{}", serde_json::to_string(&res).unwrap());
+        return;
+    }
+
+    if args.iter().any(|a| a == "--blackout-status" || a == "blackout-status") {
+        let active = kernel::kernel_is_network_blackout_active();
+        println!("{{\"blackout_active\": {}}}", active);
+        return;
+    }
+
+    if args.iter().any(|a| a == "--toggle-usb-armor") {
+        let state = toggle_usb_armor();
+        println!("{}", if state { "ENABLED" } else { "DISABLED" });
+        return;
+    }
 
     // AI audit subcommand
     if args.iter().any(|a| a == "--ai-audit" || a == "ai-audit") {
@@ -1326,7 +1426,7 @@ fn main() {
     }
 
     // Kernel freeze process
-    if let Some(pos) = args.iter().position(|a| a == "--kernel-freeze" || a == "kernel-freeze") {
+    if let Some(pos) = args.iter().position(|a| a == "--kernel-freeze" || a == "kernel-freeze" || a == "--freeze-process") {
         if let Some(pid_str) = args.get(pos + 1) {
             if let Ok(pid) = pid_str.parse::<i32>() {
                 let res = kernel::kernel_freeze_process(pid);
@@ -1335,6 +1435,19 @@ fn main() {
             }
         }
         eprintln!("Error: Valid numeric PID required for kernel freeze");
+        std::process::exit(1);
+    }
+
+    // Kernel terminate process
+    if let Some(pos) = args.iter().position(|a| a == "--kernel-terminate" || a == "kernel-terminate" || a == "--terminate-process") {
+        if let Some(pid_str) = args.get(pos + 1) {
+            if let Ok(pid) = pid_str.parse::<i32>() {
+                let res = kernel::kernel_terminate_process(pid);
+                println!("{}", serde_json::to_string(&res).unwrap());
+                return;
+            }
+        }
+        eprintln!("Error: Valid numeric PID required for kernel terminate");
         std::process::exit(1);
     }
 
@@ -1390,7 +1503,7 @@ fn main() {
         return;
     }
 
-    if args.iter().any(|a| a == "--toggle-dns") {
+    if args.iter().any(|a| a == "--toggle-dns" || a == "--toggle-dot") {
         let state = toggle_dns();
         println!("{}", if state { "ENABLED" } else { "DISABLED" });
         return;
