@@ -210,10 +210,7 @@ Panel {
     }
   }
 
-  Process {
-    id: openWindowProc
-    command: ["sentinel-dashboard"]
-  }
+
 
   Process {
     id: toggleGhostProc
@@ -344,27 +341,11 @@ Panel {
           anchors.verticalCenter: parent.verticalCenter
         }
 
-        Button {
-          id: windowBtn
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          text: "Window"
-          iconText: "\uf2d0"
-          tooltipText: "Open Standalone Security Center Window"
-          fontFamily: root.fontFamily
-          fontSize: Style.font.caption
-          bordered: true
-          onClicked: {
-            root.close()
-            openWindowProc.running = true
-          }
-        }
-
         Column {
           id: heroLabels
           anchors.left: heroIcon.right
           anchors.leftMargin: Style.space(14)
-          anchors.right: windowBtn.left
+          anchors.right: parent.right
           anchors.rightMargin: Style.space(8)
           anchors.verticalCenter: parent.verticalCenter
           spacing: Style.space(2)
