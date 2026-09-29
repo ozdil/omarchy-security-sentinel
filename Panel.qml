@@ -22,8 +22,45 @@ Panel {
   property var kernelCapabilities: []
   property var modules: []
   property string expandedId: ""
+  property bool showAboutModal: false
+  property int selectedIndex: 0
+  property bool cursorActive: false
+
+  onOpenedChanged: {
+    if (opened) {
+      selectedIndex = 0
+      cursorActive = false
+    }
+  }
+
+  function moveCursor(dy) {
+    if (!cursorActive) {
+      cursorActive = true
+      selectedIndex = 0
+      return
+    }
+    var len = root.modules ? root.modules.length : 0
+    if (len === 0) return
+    var next = selectedIndex + dy
+    if (next < 0) next = 0
+    if (next >= len) next = len - 1
+    selectedIndex = next
+  }
+
+  function activateSelected() {
+    if (!root.modules || root.modules.length === 0) return
+    var mod = root.modules[selectedIndex]
+    if (!mod) return
+    if (mod.is_toggleable) {
+      if (mod.id === "ghost_mac") root.toggleGhostMac()
+      else if (mod.id === "dns") root.toggleDns()
+    } else {
+      root.toggleExpand(mod.id)
+    }
+  }
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color dim: Qt.darker(foreground, 1.45)
   readonly property color accent: Color.accent
   readonly property color urgent: Color.urgent
   readonly property string fontFamily: (bar && bar.fontFamily) ? bar.fontFamily : ((typeof Style !== "undefined" && Style.font && Style.font.family) ? Style.font.family : "JetBrainsMono Nerd Font, JetBrains Mono, monospace")
@@ -276,12 +313,10 @@ Panel {
     bar: root.bar
     text: ""
     foreground: {
-      if (root.threatLevel === "CRITICAL" || root.threatLevel === "HIGH" || root.overallStatus === "THREAT DETECTED") {
+      if (root.threatLevel === "CRITICAL" || root.overallStatus === "THREAT DETECTED") {
         return Color.urgent
-      } else if (root.threatLevel === "ELEVATED" || root.threatLevel === "WARNING" || root.overallStatus === "ATTENTION REQUIRED") {
-        return "#f59e0b"
       } else {
-        return root.bar ? root.bar.foreground : Color.foreground
+        return root.bar ? root.bar.foreground : root.foreground
       }
     }
     tooltipText: "Security Sentinel Hub\nStatus: " + root.overallStatus + "\nThreat Level: " + root.threatLevel
@@ -296,34 +331,56 @@ Panel {
     owner: root
     bar: root.bar
     open: root.opened
+    focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(500))
     contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight)
 
-    DropArea {
-      id: dropArea
+    PanelKeyCatcher {
+      id: keyCatcher
       anchors.fill: parent
-      onEntered: function(drag) {
-        if (drag.hasUrls) drag.acceptProposedAction()
+      onCloseRequested: {
+        if (root.showAboutModal) {
+          root.showAboutModal = false
+        } else {
+          root.close()
+        }
       }
-      onDropped: function(drop) {
-        if (drop.hasUrls) {
-          var files = []
-          for (var i = 0; i < drop.urls.length; i++) {
-            var urlStr = drop.urls[i].toString()
-            var localPath = urlStr.replace(/^file:\/\//, "")
-            files.push(decodeURIComponent(localPath))
-          }
-          if (files.length > 0) {
-            root.cleanFiles(files)
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+      onMoveRequested: function(dx, dy) { root.moveCursor(dy) }
+      onActivateRequested: root.activateSelected()
+      onTextKey: function(t) {
+        if (t === "r" || t === "R") {
+          root.refresh()
+        } else if (t === "a" || t === "A") {
+          root.showAboutModal = !root.showAboutModal
+        }
+      }
+
+      DropArea {
+        id: dropArea
+        anchors.fill: parent
+        onEntered: function(drag) {
+          if (drag.hasUrls) drag.acceptProposedAction()
+        }
+        onDropped: function(drop) {
+          if (drop.hasUrls) {
+            var files = []
+            for (var i = 0; i < drop.urls.length; i++) {
+              var urlStr = drop.urls[i].toString()
+              var localPath = urlStr.replace(/^file:\/\//, "")
+              files.push(decodeURIComponent(localPath))
+            }
+            if (files.length > 0) {
+              root.cleanFiles(files)
+            }
           }
         }
       }
-    }
 
-    Column {
-      id: panelColumn
-      width: parent.width
-      spacing: Style.space(12)
+      Column {
+        id: panelColumn
+        width: parent.width
+        spacing: Style.space(12)
 
       // ---------- Hero: Shield icon · title/status ----------
       Item {
@@ -334,7 +391,7 @@ Panel {
           id: heroIcon
           textFormat: Text.PlainText
           text: ""
-          color: root.threatLevel === "ZERO" ? (root.bar ? root.bar.foreground : Color.foreground) : (root.threatLevel === "CRITICAL" ? Color.urgent : "#f59e0b")
+          color: root.threatLevel === "CRITICAL" ? Color.urgent : root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.display
           anchors.left: parent.left
@@ -350,21 +407,37 @@ Panel {
           anchors.verticalCenter: parent.verticalCenter
           spacing: Style.space(2)
 
-          Text {
-            textFormat: Text.PlainText
-            text: "Security Sentinel"
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.title
-            font.bold: true
-            elide: Text.ElideRight
+          RowLayout {
             width: parent.width
+            spacing: Style.space(8)
+
+            Text {
+              textFormat: Text.PlainText
+              text: "Security Sentinel"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.title
+              font.bold: true
+              Layout.fillWidth: true
+              elide: Text.ElideRight
+            }
+
+            Button {
+              iconText: "󰋽"
+              tooltipText: "About & Imprint"
+              foreground: root.foreground
+              accent: root.accent
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              bordered: true
+              onClicked: root.showAboutModal = !root.showAboutModal
+            }
           }
 
           Text {
             textFormat: Text.PlainText
             text: root.overallStatus.toUpperCase()
-            color: root.threatLevel === "ZERO" ? Qt.darker(root.foreground, 1.4) : (root.threatLevel === "CRITICAL" ? Color.urgent : "#f59e0b")
+            color: root.threatLevel === "CRITICAL" ? Color.urgent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             font.bold: true
@@ -374,7 +447,7 @@ Panel {
           Text {
             textFormat: Text.PlainText
             text: "Threat: " + root.threatLevel + " • " + root.activeCount + " Active Subsystems (Click to inspect)"
-            color: Qt.darker(root.foreground, 1.6)
+            color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption - 1
           }
@@ -445,15 +518,17 @@ Panel {
               readonly property bool isWarning: modStatus === "WARNING"
               readonly property bool isExpanded: root.expandedId === modId
 
+              readonly property bool isKeyboardFocused: root.cursorActive && (index === root.selectedIndex)
+
               color: isAlert
                      ? Qt.rgba(0.94, 0.27, 0.27, 0.12)
-                     : (isWarning
-                        ? Qt.rgba(0.96, 0.62, 0.04, 0.08)
-                        : (isExpanded
-                           ? Qt.darker(Color.popups.background, 0.85)
+                     : (isExpanded
+                        ? Qt.darker(Color.popups.background, 0.85)
+                        : (isKeyboardFocused
+                           ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.18)
                            : Style.selectedFillFor(root.foreground, root.accent)))
-              border.color: isAlert ? Color.urgent : (isWarning ? "#f59e0b" : (isExpanded ? root.accent : "transparent"))
-              border.width: (isAlert || isWarning || isExpanded) ? 1 : 0
+              border.color: isAlert ? Color.urgent : (isKeyboardFocused ? root.accent : (isExpanded ? root.accent : Style.controlBorder(false, false, root.foreground, root.accent)))
+              border.width: (isAlert || isExpanded || isKeyboardFocused) ? 1 : 1
 
               Column {
                 id: contentCol
@@ -488,7 +563,7 @@ Panel {
                     Text {
                       textFormat: Text.PlainText
                       text: root.moduleIcon(rowDelegate.modId)
-                      color: rowDelegate.isAlert ? Color.urgent : (rowDelegate.isWarning ? "#f59e0b" : root.accent)
+                      color: rowDelegate.isAlert ? Color.urgent : root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.title
                       Layout.alignment: Qt.AlignVCenter
@@ -515,7 +590,7 @@ Panel {
                         Layout.fillWidth: true
                         textFormat: Text.PlainText
                         text: rowDelegate.modData ? String(rowDelegate.modData.summary) : "--"
-                        color: rowDelegate.isAlert ? Color.urgent : (rowDelegate.isWarning ? "#f59e0b" : Qt.darker(root.foreground, 1.45))
+                        color: rowDelegate.isAlert ? Color.urgent : root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                         elide: Text.ElideRight
@@ -760,14 +835,14 @@ Panel {
                   implicitWidth: badgeText.implicitWidth + Style.space(12)
                   implicitHeight: badgeText.implicitHeight + Style.space(6)
                   radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                  color: rowDelegate.modStatus === "SECURE"
-                         ? Qt.rgba(0.13, 0.77, 0.37, 0.15)
-                         : (rowDelegate.modStatus === "READY"
-                            ? Qt.rgba(0.2, 0.6, 1.0, 0.15)
-                            : Qt.rgba(0.96, 0.62, 0.04, 0.15))
-                  border.color: rowDelegate.modStatus === "SECURE"
-                                ? "#22c55e"
-                                : (rowDelegate.modStatus === "READY" ? "#38bdf8" : "#f59e0b")
+                  color: rowDelegate.modStatus === "ALERT"
+                         ? Qt.rgba(0.94, 0.27, 0.27, 0.15)
+                         : (rowDelegate.modStatus === "SECURE"
+                            ? Style.selectedFillFor(root.foreground, root.accent)
+                            : Qt.rgba(0.5, 0.5, 0.5, 0.1))
+                  border.color: rowDelegate.modStatus === "ALERT"
+                                ? Color.urgent
+                                : (rowDelegate.modStatus === "SECURE" ? root.accent : root.dim)
                   border.width: 1
 
                   Text {
@@ -840,6 +915,91 @@ Panel {
           }
         }
       }
+    }
+
+    // About & Imprint Modal Overlay
+    Rectangle {
+      id: aboutOverlay
+      anchors.fill: parent
+      visible: root.showAboutModal
+      color: Qt.rgba(0.05, 0.05, 0.07, 0.96)
+      z: 99
+
+      MouseArea {
+        anchors.fill: parent
+        // Block underlying clicks
+      }
+
+      Column {
+        anchors.centerIn: parent
+        width: parent.width - Style.space(40)
+        spacing: Style.space(12)
+
+        Row {
+          width: parent.width
+          Item {
+            width: parent.width - closeAboutBtn.implicitWidth
+            implicitHeight: aboutTitleText.implicitHeight
+            Text {
+              id: aboutTitleText
+              text: "Security Sentinel"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.title
+              font.bold: true
+            }
+          }
+
+          Button {
+            id: closeAboutBtn
+            text: "✕"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            onClicked: root.showAboutModal = false
+          }
+        }
+
+        Text {
+          text: "Version: 1.1.0\nDeveloper: Ozan Ozdil (@ozdil)\nLicense: MIT\nZero-Trust Kernel Monitoring, Threat Detection & Security Sentinel"
+          color: root.foreground
+          opacity: 0.7
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          lineHeight: 1.3
+        }
+
+        PanelSeparator {
+          width: parent.width
+          foreground: root.foreground
+        }
+
+        Button {
+          width: parent.width
+          text: "GitHub / Contact"
+          iconText: "󰊤"
+          bordered: true
+          foreground: root.foreground
+          accent: root.accent
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onClicked: Qt.openUrlExternally("https://github.com/ozdil")
+        }
+
+        Button {
+          width: parent.width
+          text: "Buy Me a Coffee"
+          iconText: "󰅖"
+          bordered: true
+          foreground: "#000000"
+          color: "#FFDD00"
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onClicked: Qt.openUrlExternally("https://buymeacoffee.com/ozdil")
+        }
+      }
+    }
     }
   }
 }

@@ -267,7 +267,6 @@ fn read_secure_state_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, Stri
 
 fn notify_desktop(title: &str, body: &str, is_critical: bool) {
     let urgency = if is_critical { "critical" } else { "normal" };
-    let icon = if is_critical { "security-low" } else { "security-high" };
     let deadline = Instant::now() + Duration::from_millis(1500);
 
     let mut extra_envs = Vec::new();
@@ -288,13 +287,36 @@ fn notify_desktop(title: &str, body: &str, is_critical: bool) {
         extra_envs.push(("XDG_RUNTIME_DIR", runtime_dir.as_str()));
     }
 
-    let _ = run_cmd_bounded(
-        "notify-send",
-        &["-a", "Security Sentinel", "-u", urgency, "-i", icon, "--", title, body],
+    // Try omarchy-notification-send first with explicit shield glyph (Nerd Font) and app identity
+    let glyph = "";
+    let status = run_cmd_bounded(
+        "omarchy-notification-send",
+        &[
+            "--app-name",
+            "Security Sentinel",
+            "-g",
+            glyph,
+            "-u",
+            urgency,
+            title,
+            body,
+        ],
         &extra_envs,
         deadline,
         4096,
     );
+
+    // Fallback to notify-send with verified system icon if omarchy-notification-send is absent
+    if status.is_none() {
+        let icon = if is_critical { "dialog-warning" } else { "dialog-information" };
+        let _ = run_cmd_bounded(
+            "notify-send",
+            &["-a", "Security Sentinel", "-u", urgency, "-i", icon, "--", title, body],
+            &extra_envs,
+            deadline,
+            4096,
+        );
+    }
 }
 
 /// Reads a system/procfs file with bounded buffer and O_NOFOLLOW to prevent symlink traversal and DoS memory exhaustion
