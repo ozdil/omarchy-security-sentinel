@@ -427,7 +427,6 @@ pub fn kernel_deauth_usb(bus_id: &str) -> InterventionResult {
     let auth_path = format!("/sys/bus/usb/devices/{}/authorized", clean_id);
     let path = Path::new(&auth_path);
 
-    // Direct open with O_NOFOLLOW to avoid TOCTOU race conditions
     let mut file = match OpenOptions::new()
         .write(true)
         .custom_flags(O_NOFOLLOW)
@@ -435,6 +434,25 @@ pub fn kernel_deauth_usb(bus_id: &str) -> InterventionResult {
     {
         Ok(f) => f,
         Err(e) => {
+            // Fallback to pkexec if sysfs write is denied
+            if Path::new("/usr/bin/pkexec").exists() {
+                let pk_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let pk_out = run_cmd_bounded(
+                    "/usr/bin/pkexec",
+                    &["/usr/bin/sh", "-c", &format!("echo 0 > /sys/bus/usb/devices/{}/authorized", clean_id)],
+                    &[],
+                    pk_deadline,
+                    4096,
+                );
+                if pk_out.is_some() {
+                    return InterventionResult::ok(
+                        "kernel_deauth_usb",
+                        clean_id,
+                        &format!("USB device {} de-authorized at kernel hardware interface via pkexec", clean_id),
+                    );
+                }
+            }
+
             return InterventionResult::err(
                 "kernel_deauth_usb",
                 clean_id,

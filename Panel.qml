@@ -54,6 +54,7 @@ Panel {
     if (mod.is_toggleable) {
       if (mod.id === "ghost_mac") root.toggleGhostMac()
       else if (mod.id === "dns") root.toggleDns()
+      else if (mod.id === "badusb") root.toggleUsbArmor()
     } else {
       root.toggleExpand(mod.id)
     }
@@ -142,6 +143,27 @@ Panel {
     root.modules = [].concat(mods)
     if (!toggleDnsProc.running) {
       toggleDnsProc.running = true
+    }
+  }
+
+  function toggleUsbArmor() {
+    var mods = root.modules
+    for (var i = 0; i < mods.length; i++) {
+      if (mods[i].id === "badusb") {
+        mods[i].toggle_state = !mods[i].toggle_state
+        if (mods[i].toggle_state) {
+          mods[i].status = "SECURE"
+          mods[i].summary = "Armor Active"
+        } else {
+          mods[i].status = "WARNING"
+          mods[i].summary = "Armor Disabled"
+        }
+        break
+      }
+    }
+    root.modules = [].concat(mods)
+    if (!toggleUsbArmorProc.running) {
+      toggleUsbArmorProc.running = true
     }
   }
 
@@ -264,6 +286,14 @@ Panel {
       root.refresh()
     }
   }
+  Process {
+    id: toggleUsbArmorProc
+    command: [root.resolveEnginePath(), "--toggle-usb-armor"]
+    onExited: function(code) {
+      root.refresh()
+    }
+  }
+
 
   Process {
     id: trustUsbProc
@@ -775,6 +805,8 @@ Panel {
                   onToggled: {
                     if (rowDelegate.modId === "ghost_mac") {
                       root.toggleGhostMac()
+                    } else if (rowDelegate.modId === "badusb") {
+                      root.toggleUsbArmor()
                     } else if (rowDelegate.modId === "dns") {
                       root.toggleDns()
                     }
