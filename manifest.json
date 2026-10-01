@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "id": "ozdil.security-sentinel",
   "name": "Security Sentinel",
-  "description": "Unified Cyber Security & Privacy Sentinel Hub for Omarchy Linux",
+  "description": "Unified cyber security sentinel for Omarchy Linux: BadUSB hardware guard, kernel integrity auditor, and zero-trust privacy monitor.",
   "version": "1.3.1",
-  "author": "Ozan \u00d6zdil",
+  "author": "Ozan Özdil",
   "license": "MIT",
   "kinds": [
     "bar-widget"
@@ -13,7 +13,8 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "defaultSection": "right"
+    "defaultSection": "right",
+    "description": "Cyber security sentinel: BadUSB hardware guard, kernel integrity, and privacy monitor."
   },
   "verified": true
 }

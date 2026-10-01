@@ -3,6 +3,8 @@
 [![Omarchy Verified Plugin](https://img.shields.io/badge/Omarchy-Verified_Plugin-22c55e?style=for-the-badge&logo=omarchy)](https://github.com/ozdil)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-Support_Development-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ozdil)
 
+![Security Sentinel Preview](preview.png)
+
 All-in-one native cyber defense, hardware integrity, and privacy sentinel plugin for Omarchy Linux.
 
 Author: Ozan Ozdil (ozdil)  
