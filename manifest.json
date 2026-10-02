@@ -3,7 +3,7 @@
   "id": "ozdil.security-sentinel",
   "name": "Security Sentinel",
   "description": "Unified cyber security sentinel for Omarchy Linux: BadUSB hardware guard, kernel integrity auditor, and zero-trust privacy monitor.",
-  "version": "1.3.1",
+  "version": "1.3.2",
   "author": "Ozan Özdil",
   "license": "MIT",
   "kinds": [

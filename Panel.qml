@@ -26,6 +26,52 @@ Panel {
   property int selectedIndex: 0
   property bool cursorActive: false
 
+  readonly property string manifestPath: Qt.resolvedUrl("manifest.json").toString().replace(/^file:\/\//, "")
+  readonly property string manifestFallbackPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.config/omarchy/plugins/ozdil.security-sentinel/manifest.json"
+
+  property string pluginName: "Security Sentinel"
+  property string pluginVersion: "1.3.2"
+  property string pluginDescription: "Unified cyber security sentinel for Omarchy Linux: BadUSB hardware guard, kernel integrity auditor, and zero-trust privacy monitor."
+  property string pluginAuthor: "Ozan Özdil"
+  property string pluginLicense: "MIT"
+  property bool pluginVerified: true
+
+  function loadManifest(rawJson) {
+    try {
+      if (!rawJson || String(rawJson).trim() === "") return
+      var parsed = JSON.parse(rawJson)
+      if (parsed.name) root.pluginName = parsed.name
+      if (parsed.version) root.pluginVersion = parsed.version
+      if (parsed.description) root.pluginDescription = parsed.description
+      if (parsed.author) root.pluginAuthor = parsed.author
+      if (parsed.license) root.pluginLicense = parsed.license
+      if (parsed.verified !== undefined) root.pluginVerified = Boolean(parsed.verified)
+    } catch(e) {}
+  }
+
+  FileView {
+    id: manifestWatcher
+    path: root.manifestPath
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.loadManifest(text())
+    onLoadFailed: {
+      manifestFallbackWatcher.reload()
+    }
+    onFileChanged: reload()
+  }
+
+  FileView {
+    id: manifestFallbackWatcher
+    path: root.manifestFallbackPath
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onLoaded: root.loadManifest(text())
+    onFileChanged: reload()
+  }
+
   onOpenedChanged: {
     if (opened) {
       selectedIndex = 0
@@ -969,16 +1015,54 @@ Panel {
 
         Row {
           width: parent.width
+          spacing: Style.space(8)
+
           Item {
-            width: parent.width - closeAboutBtn.implicitWidth
+            width: parent.width - closeAboutBtn.implicitWidth - (root.pluginVerified ? verifiedBadge.implicitWidth + Style.space(8) : 0) - Style.space(8)
             implicitHeight: aboutTitleText.implicitHeight
+
             Text {
               id: aboutTitleText
-              text: "Security Sentinel"
+              text: root.pluginName
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
               font.bold: true
+              elide: Text.ElideRight
+              width: parent.width
+            }
+          }
+
+          Rectangle {
+            id: verifiedBadge
+            visible: root.pluginVerified
+            width: verifiedRow.implicitWidth + Style.space(10)
+            height: verifiedRow.implicitHeight + Style.space(4)
+            radius: 4
+            color: Qt.rgba(0.13, 0.77, 0.37, 0.2)
+            border.color: "#22c55e"
+            border.width: 1
+            anchors.verticalCenter: parent.verticalCenter
+
+            Row {
+              id: verifiedRow
+              anchors.centerIn: parent
+              spacing: 4
+
+              Text {
+                text: "󰄬"
+                color: "#22c55e"
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+
+              Text {
+                text: "VERIFIED"
+                color: "#22c55e"
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption - 2
+                font.bold: true
+              }
             }
           }
 
@@ -994,12 +1078,14 @@ Panel {
         }
 
         Text {
-          text: "Version: 1.3.0\nDeveloper: Ozan Ozdil (@ozdil)\nLicense: MIT\nZero-Trust Kernel Monitoring, Threat Detection & Security Sentinel"
+          text: "Sürüm: " + root.pluginVersion + "\nGeliştirici: " + root.pluginAuthor + "\nLisans: " + root.pluginLicense + "\n\n" + root.pluginDescription
           color: root.foreground
-          opacity: 0.7
+          opacity: 0.8
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           lineHeight: 1.3
+          wrapMode: Text.WordWrap
+          width: parent.width
         }
 
         PanelSeparator {
