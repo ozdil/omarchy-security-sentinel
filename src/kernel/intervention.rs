@@ -3,7 +3,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::net::IpAddr;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::subproc::run_cmd_bounded;
@@ -12,6 +12,7 @@ const O_NOFOLLOW: i32 = 0o400000;
 
 extern "C" {
     fn kill(pid: i32, sig: i32) -> i32;
+    fn getuid() -> u32;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -567,8 +568,49 @@ pub fn kernel_quarantine_ip(ip_str: &str) -> InterventionResult {
     }
 }
 
+/// Retrieves and verifies the secure private state directory (~/.local/state/omarchy/sentinel),
+/// strictly validating permissions (0700) and rejecting symlink anomalies or foreign ownership.
+fn get_private_state_dir() -> Result<PathBuf, String> {
+    let state_dir = if let Ok(state) = std::env::var("XDG_STATE_HOME") {
+        if !state.is_empty() {
+            PathBuf::from(state).join("omarchy/sentinel")
+        } else {
+            let home = std::env::var("HOME").map_err(|_| "HOME environment variable is not set".to_string())?;
+            PathBuf::from(home).join(".local/state/omarchy/sentinel")
+        }
+    } else {
+        let home = std::env::var("HOME").map_err(|_| "HOME environment variable is not set".to_string())?;
+        PathBuf::from(home).join(".local/state/omarchy/sentinel")
+    };
+
+    if state_dir.exists() {
+        let meta = std::fs::symlink_metadata(&state_dir)
+            .map_err(|e| format!("Failed to read state dir metadata: {}", e))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!("State directory {} is a symlink", state_dir.display()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.uid() != unsafe { getuid() } {
+                return Err(format!("State directory {} is not owned by current user", state_dir.display()));
+            }
+        }
+    } else {
+        std::fs::create_dir_all(&state_dir)
+            .map_err(|e| format!("Failed to create private state directory: {}", e))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    Ok(state_dir)
+}
+
 /// Captures cryptographic forensic evidence (executable hash, cmdline, comm)
-/// of a frozen process to disk with 0600 file permissions.
+/// of a frozen process to disk with 0600 file permissions in private state storage.
 fn capture_forensic_evidence(pid: i32) {
     let proc_path = format!("/proc/{}", pid);
     let proc_dir = Path::new(&proc_path);
@@ -584,11 +626,16 @@ fn capture_forensic_evidence(pid: i32) {
         .map(|b| String::from_utf8_lossy(&b).trim().to_string())
         .unwrap_or_else(|_| "UNKNOWN".to_string());
 
-    let state_dir = match std::env::var("HOME") {
-        Ok(h) => Path::new(&h).join(".local/state/omarchy/sentinel_forensics"),
-        Err(_) => Path::new("/tmp/sentinel_forensics").to_path_buf(),
+    let state_dir = match get_private_state_dir() {
+        Ok(d) => d.join("forensics"),
+        Err(_) => return,
     };
     let _ = std::fs::create_dir_all(&state_dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700));
+    }
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -602,11 +649,22 @@ fn capture_forensic_evidence(pid: i32) {
         exe_hash,
         timestamp
     );
-    let _ = std::fs::write(&evidence_file, json.as_bytes());
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&evidence_file, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = OpenOptions::new();
+        opts.write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(O_NOFOLLOW)
+            .mode(0o600);
+        if let Ok(mut file) = opts.open(&evidence_file) {
+            let _ = file.write_all(json.as_bytes());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(&evidence_file, json.as_bytes());
     }
 }
 
@@ -623,53 +681,127 @@ pub fn kernel_apply_network_blackout() -> InterventionResult {
         );
     }
 
+    let state_dir = match get_private_state_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            return InterventionResult::err(
+                "network_blackout",
+                "all_interfaces",
+                &format!("Failed to initialize private rule storage: {}", e),
+            );
+        }
+    };
+
     let script = "table inet sentinel_blackout {\n    chain output {\n        type filter hook output priority -100; policy drop;\n        oif \"lo\" accept\n        counter reject with icmpx type admin-prohibited\n    }\n    chain input {\n        type filter hook input priority -100; policy drop;\n        iif \"lo\" accept\n        counter drop\n    }\n}\n";
 
-    let tmp_path = format!("/tmp/.sentinel_blackout_{}.nft", std::process::id());
-    let _ = std::fs::write(&tmp_path, script);
+    let rule_file_path = state_dir.join(format!("sentinel_blackout_{}.nft", std::process::id()));
+
+    // Write rule file to private storage with mode 0600 and O_NOFOLLOW
+    let write_res = (|| -> Result<(), String> {
+        if rule_file_path.exists() {
+            let meta = std::fs::symlink_metadata(&rule_file_path)
+                .map_err(|e| format!("Symlink check failed: {}", e))?;
+            if meta.file_type().is_symlink() {
+                let _ = std::fs::remove_file(&rule_file_path);
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            let mut opts = OpenOptions::new();
+            opts.write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(O_NOFOLLOW)
+                .mode(0o600);
+            let mut file = opts
+                .open(&rule_file_path)
+                .map_err(|e| format!("Failed to create private rule file: {}", e))?;
+            file.write_all(script.as_bytes())
+                .map_err(|e| format!("Failed to write rule content: {}", e))?;
+            file.sync_all()
+                .map_err(|e| format!("Failed to sync rule file: {}", e))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&rule_file_path, script)
+                .map_err(|e| format!("Failed to write rule file: {}", e))?;
+        }
+
+        // Verify written file is regular and owned by current user
+        let meta = std::fs::symlink_metadata(&rule_file_path)
+            .map_err(|e| format!("Verification failed: {}", e))?;
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err("Rule file is not a regular file".to_string());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.uid() != unsafe { getuid() } {
+                return Err("Rule file is not owned by current user".to_string());
+            }
+        }
+
+        Ok(())
+    })();
+
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&rule_file_path);
+        return InterventionResult::err(
+            "network_blackout",
+            "all_interfaces",
+            &format!("Aborting blackout: Failed to safely write rule file: {}", err),
+        );
+    }
+
+    let rule_str = rule_file_path.to_string_lossy().to_string();
 
     let out = run_cmd_bounded(
         "/usr/bin/nft",
-        &["-f", &tmp_path],
+        &["-f", &rule_str],
         &[],
         deadline,
         4096,
     );
 
-    let _ = std::fs::remove_file(&tmp_path);
-
-    if out.is_none() && Path::new("/usr/bin/pkexec").exists() {
+    let res = if out.is_some() {
+        InterventionResult::ok(
+            "network_blackout",
+            "all_interfaces",
+            "Emergency military network blackout engaged: All non-loopback egress and ingress severed",
+        )
+    } else if Path::new("/usr/bin/pkexec").exists() {
         let pk_deadline = Instant::now() + Duration::from_secs(10);
-        let _ = std::fs::write(&tmp_path, script);
         let pk_out = run_cmd_bounded(
             "/usr/bin/pkexec",
-            &["/usr/bin/nft", "-f", &tmp_path],
+            &["/usr/bin/nft", "-f", &rule_str],
             &[],
             pk_deadline,
             4096,
         );
-        let _ = std::fs::remove_file(&tmp_path);
         if pk_out.is_some() {
-            return InterventionResult::ok(
+            InterventionResult::ok(
                 "network_blackout",
                 "all_interfaces",
                 "Emergency military network blackout engaged via privileged nftables killswitch",
-            );
+            )
+        } else {
+            InterventionResult::err(
+                "network_blackout",
+                "all_interfaces",
+                "Failed to enforce network blackout via privileged nftables",
+            )
         }
-    }
-
-    match out {
-        Some(_) => InterventionResult::ok(
-            "network_blackout",
-            "all_interfaces",
-            "Emergency military network blackout engaged: All non-loopback egress and ingress severed",
-        ),
-        None => InterventionResult::err(
+    } else {
+        InterventionResult::err(
             "network_blackout",
             "all_interfaces",
             "Failed to enforce network blackout (insufficient privileges or nftables error)",
-        ),
-    }
+        )
+    };
+
+    let _ = std::fs::remove_file(&rule_file_path);
+    res
 }
 
 /// Clears the emergency network blackout, restoring normal networking.

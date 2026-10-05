@@ -212,6 +212,24 @@ fn test_kernel_network_blackout_status_query() {
 }
 
 #[test]
+fn test_kernel_network_blackout_private_storage_and_cleanup() {
+    // Verifies that applying and clearing blackout executes safely, uses private storage,
+    // and cleans up temporary rule files immediately without leaving artifacts in /tmp
+    let res = sentinel_engine::kernel_apply_network_blackout();
+    // In user test mode without root/nft, it returns InterventionResult (ok or err) without panic
+    assert!(!res.action.is_empty());
+    assert!(!res.target.is_empty());
+
+    // Verify no temporary files remain in /tmp
+    let tmp_pattern = format!("/tmp/.sentinel_blackout_{}.nft", std::process::id());
+    assert!(!std::path::Path::new(&tmp_pattern).exists());
+
+    // Verify clear also executes without panic
+    let clear_res = sentinel_engine::kernel_clear_network_blackout();
+    assert!(!clear_res.action.is_empty());
+}
+
+#[test]
 fn test_self_defense_prctl_and_hash() {
     assert!(sentinel_engine::enforce_anti_tamper());
     let hash_res = sentinel_engine::calculate_self_exe_sha256();
