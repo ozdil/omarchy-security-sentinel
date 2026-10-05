@@ -483,6 +483,23 @@ fn toggle_usb_armor() -> bool {
     }
 }
 
+/// Sanitizes USB hardware product strings to prevent HTML tag injection,
+/// control character evasion, and excessive length in telemetry displays.
+pub fn sanitize_usb_product(raw: &str) -> String {
+    let sanitized: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && *c != '<' && *c != '>' && *c != '&' && *c != '"' && *c != '\'')
+        .take(64)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if sanitized.is_empty() {
+        "USB Device".to_string()
+    } else {
+        sanitized
+    }
+}
+
 // 2. BadUSB Defense
 fn check_badusb() -> ModuleStatus {
     let mut total_usb = 0;
@@ -528,7 +545,8 @@ fn check_badusb() -> ModuleStatus {
                     }
                 }
 
-                let prod = read_file_bounded(&p.join("product"), 512).unwrap_or_else(|_| "USB Device".to_string()).trim().to_string();
+                let raw_prod = read_file_bounded(&p.join("product"), 512).unwrap_or_else(|_| "USB Device".to_string());
+                let prod = sanitize_usb_product(&raw_prod);
                 let is_trusted = trusted.contains(&dev_id) || !file_existed;
                 let tag = if is_trusted { "Approved" } else { "UNAPPROVED" };
                 let hid_tag = if is_hid { " (HID)" } else { "" };
@@ -1879,6 +1897,23 @@ mod tests {
 
         assert!(parse_ip_port("invalid").is_none());
         assert!(parse_ip_port("0100007F:GGGG").is_none());
+    }
+
+    #[test]
+    fn test_sanitize_usb_product_strips_html_and_control_chars() {
+        let malicious = "<img src=\"http://127.0.0.1:8080/beacon\">BadUSB Payload\0\x1b";
+        let cleaned = sanitize_usb_product(malicious);
+        assert!(!cleaned.contains('<'));
+        assert!(!cleaned.contains('>'));
+        assert!(!cleaned.contains('"'));
+        assert!(!cleaned.contains('\0'));
+        assert_eq!(cleaned, "img src=http://127.0.0.1:8080/beaconBadUSB Payload");
+
+        let empty = "   \n\t  ";
+        assert_eq!(sanitize_usb_product(empty), "USB Device");
+
+        let normal = "Logitech USB Optical Mouse";
+        assert_eq!(sanitize_usb_product(normal), "Logitech USB Optical Mouse");
     }
 }
 

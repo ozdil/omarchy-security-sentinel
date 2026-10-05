@@ -639,6 +639,7 @@ Item {
 
                                     Text {
                                         Layout.fillWidth: true
+                                        textFormat: Text.PlainText
                                         text: modelData.reasons ? modelData.reasons.join(", ") : ""
                                         font.family: Theme.fontFamily
                                         font.pixelSize: 11
@@ -730,7 +731,8 @@ Item {
 
                                 Text {
                                     Layout.fillWidth: true
-                                    text: modelData
+                                    textFormat: Text.PlainText
+                                    text: String(modelData || "")
                                     font.family: Theme.monoFont
                                     font.pixelSize: 11
                                     color: Theme.textMain
