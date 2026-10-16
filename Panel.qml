@@ -1096,74 +1096,66 @@ Panel {
       id: aboutOverlay
       anchors.fill: parent
       visible: root.showAboutModal
-      color: Qt.rgba(0.05, 0.05, 0.07, 0.96)
+      color: Qt.rgba(0, 0, 0, 0.6)
       z: 99
 
       MouseArea {
         anchors.fill: parent
-        // Block underlying clicks
+        // Block underlying clicks; clicking the dimmed area closes the dialog
+        onClicked: root.showAboutModal = false
       }
 
-      Column {
+      // Opaque card: the overlay alone let the module list show through and the
+      // header row overflowed it on narrow panels.
+      Rectangle {
+        id: aboutCard
         anchors.centerIn: parent
-        width: parent.width - Style.space(40)
+        width: parent.width - Style.space(32)
+        height: aboutColumn.implicitHeight + Style.space(32)
+        color: Color.popups.background
+        border.color: root.dim
+        border.width: 1
+
+        MouseArea {
+          anchors.fill: parent
+          // Swallow clicks so only the dimmed area outside the card closes it
+        }
+
+      Column {
+        id: aboutColumn
+        anchors.centerIn: parent
+        width: parent.width - Style.space(32)
         spacing: Style.space(12)
 
-        Row {
+        RowLayout {
           width: parent.width
           spacing: Style.space(8)
 
-          Item {
-            width: parent.width - closeAboutBtn.implicitWidth - (root.pluginVerified ? verifiedBadge.implicitWidth + Style.space(8) : 0) - Style.space(8)
-            implicitHeight: aboutTitleText.implicitHeight
-
-            Text {
-              id: aboutTitleText
-              text: root.pluginName
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.title
-              font.bold: true
-              elide: Text.ElideRight
-              width: parent.width
-            }
+          Text {
+            id: aboutTitleText
+            Layout.fillWidth: true
+            text: root.pluginName
+            textFormat: Text.PlainText
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+            font.bold: true
+            elide: Text.ElideRight
           }
 
-          Rectangle {
-            id: verifiedBadge
+          // Plain text in theme colours instead of a green pill (Omarchy style)
+          Text {
             visible: root.pluginVerified
-            width: verifiedRow.implicitWidth + Style.space(10)
-            height: verifiedRow.implicitHeight + Style.space(4)
-            radius: 4
-            color: Qt.rgba(0.13, 0.77, 0.37, 0.2)
-            border.color: "#22c55e"
-            border.width: 1
-            anchors.verticalCenter: parent.verticalCenter
-
-            Row {
-              id: verifiedRow
-              anchors.centerIn: parent
-              spacing: 4
-
-              Text {
-                text: "󰄬"
-                color: "#22c55e"
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-
-              Text {
-                text: "VERIFIED"
-                color: "#22c55e"
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption - 2
-                font.bold: true
-              }
-            }
+            Layout.alignment: Qt.AlignVCenter
+            text: "󰄬 verified"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
           }
 
           Button {
             id: closeAboutBtn
+            Layout.alignment: Qt.AlignVCenter
             text: "✕"
             bordered: true
             foreground: root.foreground
@@ -1204,14 +1196,15 @@ Panel {
         Button {
           width: parent.width
           text: "Buy Me a Coffee"
-          iconText: "󰅖"
+          iconText: "󰅶"
           bordered: true
-          foreground: "#000000"
-          color: "#FFDD00"
+          foreground: root.foreground
+          accent: root.accent
           fontFamily: root.fontFamily
           fontSize: Style.font.caption
           onClicked: Qt.openUrlExternally("https://buymeacoffee.com/ozdil")
         }
+      }
       }
     }
     }
