@@ -1,6 +1,7 @@
 # Security Sentinel Hub - Unified Cyber Defense and Privacy Sentinel for Omarchy Linux
 
-[![Omarchy Verified Plugin](https://img.shields.io/badge/Omarchy-Verified_Plugin-22c55e?style=for-the-badge&logo=omarchy)](https://github.com/ozdil)
+[![Version](https://img.shields.io/github/v/release/ozdil/omarchy-security-sentinel?style=for-the-badge)](https://github.com/ozdil/omarchy-security-sentinel/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/ozdil/omarchy-security-sentinel/rust.yml?branch=master&style=for-the-badge&label=CI)](https://github.com/ozdil/omarchy-security-sentinel/actions/workflows/rust.yml)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-Support_Development-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ozdil)
 
 ![Security Sentinel Preview](preview.png)
@@ -9,7 +10,8 @@ All-in-one native cyber defense, hardware integrity, and privacy sentinel plugin
 
 Author: Ozan Ozdil (ozdil)  
 License: MIT  
-Plugin ID: ozdil.security-sentinel
+Plugin ID: ozdil.security-sentinel  
+Version: 1.4.0 ([changelog](CHANGELOG.md))
 
 ---
 
@@ -17,6 +19,21 @@ Plugin ID: ozdil.security-sentinel
 
 Security Sentinel Hub unifies 8 essential Linux defense and privacy subsystems into a single high-performance native Rust daemon (`sentinel-engine`) with an integrated, theme-harmonized Omarchy Quickshell dashboard. 
 Fully hardened with HANCORE Military-Grade Security Standards, providing kernel-level zero-trust policies, bounded IPC processes, and real-time hardware integrity validation.
+
+---
+
+## What's New in 1.4.0
+
+Release from a full-stack security audit. Highlights (full list in [CHANGELOG.md](CHANGELOG.md)):
+
+- Event-driven background monitor: USB hot-plug is checked within a second, not on the next 20 s poll.
+- BadUSB fingerprints pin serial number and interface classes, so a cloned VID:PID with an added keyboard is caught.
+- Real CVE data from the Arch Security Tracker via `arch-audit`.
+- Every socket names its process and PID; the socket anomaly analyzer now runs.
+- Privileged actions go through the shipped polkit policy; PIDs are signalled via pidfd.
+- USB Armor no longer locks out your own keyboard and mouse after "Trust Devices".
+- Failed toggles roll back instead of reporting success; destructive actions need a confirming click.
+- Simpler, flat Omarchy-style panel and dashboard.
 
 ---
 
@@ -102,7 +119,7 @@ sentinel-engine --daemon
 
 Security Sentinel Hub complies strictly with the Omarchy Linux Security Standards (AGENTS.md):
 - Subprocess Isolation: Process executions run in isolated process groups (`cmd.process_group(0)`) with non-blocking I/O and strict monotonic deadlines.
-- Zero Elevated Privileges: Runs entirely unprivileged in user space without requiring root or elevated credentials.
+- Least Privilege: Monitoring runs unprivileged in user space. Interventions that need root (USB de-authorization, freeze, network quarantine) go through `pkexec` and the shipped polkit policy (`io.omarchy.sentinel.policy`), and the root-side helper re-validates every argument.
 - State File Hardening: Baseline hashes and state files are written with POSIX mode 0600 permissions. Symlinks are rejected.
 - Plain Text UI: All dynamic text rendered in QML components utilizes `textFormat: Text.PlainText` to prevent script and markup injection.
 

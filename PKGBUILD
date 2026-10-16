@@ -1,6 +1,6 @@
 # Maintainer: Ozan Özdil
 pkgname=omarchy-security-sentinel
-pkgver=1.3.2
+pkgver=1.4.0
 pkgrel=1
 pkgdesc="Unified Cyber Security & Privacy Sentinel Hub for Omarchy Linux"
 arch=('x86_64')
