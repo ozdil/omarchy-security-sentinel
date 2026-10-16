@@ -95,12 +95,19 @@ impl InterventionResult {
 
 /// Reads a procfs attribute file with strict take(MAX + 1) buffer ceiling
 fn read_proc_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
-    let mut file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+    let mut file =
+        File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
     let mut buf = Vec::new();
     let mut handle = (&mut file).take((max_bytes + 1) as u64);
-    handle.read_to_end(&mut buf).map_err(|e| format!("Read failed on {}: {}", path.display(), e))?;
+    handle
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("Read failed on {}: {}", path.display(), e))?;
     if buf.len() > max_bytes {
-        return Err(format!("File {} exceeded limit of {} bytes", path.display(), max_bytes));
+        return Err(format!(
+            "File {} exceeded limit of {} bytes",
+            path.display(),
+            max_bytes
+        ));
     }
     Ok(buf)
 }
@@ -128,12 +135,20 @@ fn escalate_via_helper(flag: &str, args: &[&str]) -> Option<InterventionResult> 
     let mut argv = vec![PRIVILEGED_ENGINE, flag];
     argv.extend_from_slice(args);
     let deadline = Instant::now() + PKEXEC_TIMEOUT;
-    let action = format!("{} {}", flag.trim_start_matches('-'), args.first().unwrap_or(&""));
+    let action = format!(
+        "{} {}",
+        flag.trim_start_matches('-'),
+        args.first().unwrap_or(&"")
+    );
     let target = args.get(1).copied().unwrap_or("");
     match run_cmd_bounded_status(PKEXEC, &argv, &[], deadline, 16384) {
         Some((_, out)) => Some(
             serde_json::from_slice::<InterventionResult>(&out).unwrap_or_else(|_| {
-                InterventionResult::err(&action, target, "Privileged helper failed or authentication was cancelled")
+                InterventionResult::err(
+                    &action,
+                    target,
+                    "Privileged helper failed or authentication was cancelled",
+                )
             }),
         ),
         None => Some(InterventionResult::err(
@@ -185,7 +200,9 @@ impl ProcessHandle {
     fn signal(&self, sig: i32) -> Result<(), i32> {
         let ret = match self.pidfd {
             // SAFETY: valid pidfd owned by self; info=NULL and flags=0 are permitted.
-            Some(fd) => unsafe { syscall(SYS_PIDFD_SEND_SIGNAL, fd as i64, sig as i64, 0i64, 0i64) },
+            Some(fd) => unsafe {
+                syscall(SYS_PIDFD_SEND_SIGNAL, fd as i64, sig as i64, 0i64, 0i64)
+            },
             // SAFETY: plain kill(2) fallback for kernels without pidfd (< 5.3)
             None => unsafe { kill(self.pid, sig) as i64 },
         };
@@ -253,7 +270,8 @@ fn immune_process_name(proc_dir: &Path) -> Option<String> {
     match std::fs::read_link(proc_dir.join("exe")) {
         Ok(exe) => {
             let exe = exe.to_string_lossy();
-            let trusted = !exe.ends_with(" (deleted)") && TRUSTED_EXE_PREFIXES.iter().any(|p| exe.starts_with(p));
+            let trusted = !exe.ends_with(" (deleted)")
+                && TRUSTED_EXE_PREFIXES.iter().any(|p| exe.starts_with(p));
             if trusted {
                 Some(comm)
             } else {
@@ -280,11 +298,17 @@ fn validate_signal_target(pid: i32, verb: &str) -> Result<(), String> {
     }
     if let Ok(cmd) = read_proc_bounded(&proc_dir.join("cmdline"), 65536) {
         if cmd.is_empty() {
-            return Err(format!("Refusing to {} core kernel thread (empty cmdline)", verb));
+            return Err(format!(
+                "Refusing to {} core kernel thread (empty cmdline)",
+                verb
+            ));
         }
     }
     if let Some(comm) = immune_process_name(proc_dir) {
-        return Err(format!("Refusing to {} immune critical system process '{}'", verb, comm));
+        return Err(format!(
+            "Refusing to {} immune critical system process '{}'",
+            verb, comm
+        ));
     }
     Ok(())
 }
@@ -340,7 +364,10 @@ pub fn kernel_freeze_process(pid: i32) -> InterventionResult {
         return InterventionResult::ok(
             "kernel_freeze",
             &pid_str,
-            &format!("Process {} frozen via privileged kernel signal with forensic capture", pid),
+            &format!(
+                "Process {} frozen via privileged kernel signal with forensic capture",
+                pid
+            ),
         );
     }
 
@@ -383,7 +410,10 @@ pub fn kernel_terminate_process(pid: i32) -> InterventionResult {
             return InterventionResult::ok(
                 "kernel_terminate",
                 &pid_str,
-                &format!("Process {} terminated via kernel signal (SIGTERM/SIGKILL)", pid),
+                &format!(
+                    "Process {} terminated via kernel signal (SIGTERM/SIGKILL)",
+                    pid
+                ),
             );
         }
         Err(ESRCH) => {
@@ -423,9 +453,15 @@ pub fn kernel_thaw_process(pid: i32) -> InterventionResult {
 
     match ProcessHandle::open(pid).signal(SIGCONT) {
         Ok(()) => {
-            return InterventionResult::ok("kernel_thaw", &pid_str, &format!("Process {} resumed (SIGCONT)", pid));
+            return InterventionResult::ok(
+                "kernel_thaw",
+                &pid_str,
+                &format!("Process {} resumed (SIGCONT)", pid),
+            );
         }
-        Err(ESRCH) => return InterventionResult::err("kernel_thaw", &pid_str, "Target PID does not exist"),
+        Err(ESRCH) => {
+            return InterventionResult::err("kernel_thaw", &pid_str, "Target PID does not exist")
+        }
         Err(_) => {}
     }
 
@@ -434,7 +470,11 @@ pub fn kernel_thaw_process(pid: i32) -> InterventionResult {
         return res;
     }
     if legacy_pkexec(&["/usr/bin/kill", "-CONT", "--", &pid_str], None) {
-        return InterventionResult::ok("kernel_thaw", &pid_str, &format!("Process {} resumed via signal", pid));
+        return InterventionResult::ok(
+            "kernel_thaw",
+            &pid_str,
+            &format!("Process {} resumed via signal", pid),
+        );
     }
     InterventionResult::err("kernel_thaw", &pid_str, "Failed to send SIGCONT to process")
 }
@@ -453,7 +493,12 @@ fn count_connected_tcp(filter: &str) -> Option<usize> {
         deadline,
         1024 * 1024,
     )?;
-    Some(String::from_utf8_lossy(&out).lines().filter(|l| !l.trim().is_empty()).count())
+    Some(
+        String::from_utf8_lossy(&out)
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count(),
+    )
 }
 
 fn ss_kill(filter: &str) -> bool {
@@ -476,7 +521,11 @@ fn ss_kill(filter: &str) -> bool {
 pub fn kernel_sever_socket(target: &str) -> InterventionResult {
     let target = target.trim();
     if target.is_empty() {
-        return InterventionResult::err("kernel_sever_socket", target, "Target endpoint cannot be empty");
+        return InterventionResult::err(
+            "kernel_sever_socket",
+            target,
+            "Target endpoint cannot be empty",
+        );
     }
 
     let filter = if let Ok(port) = target.parse::<u16>() {
@@ -508,20 +557,33 @@ pub fn kernel_sever_socket(target: &str) -> InterventionResult {
     let before = match count_connected_tcp(&filter) {
         Some(n) => n,
         None => {
-            return InterventionResult::err("kernel_sever_socket", target, "Failed to query sockets via /usr/bin/ss");
+            return InterventionResult::err(
+                "kernel_sever_socket",
+                target,
+                "Failed to query sockets via /usr/bin/ss",
+            );
         }
     };
     if before == 0 {
-        return InterventionResult::err("kernel_sever_socket", target, "No active TCP connections match the target");
+        return InterventionResult::err(
+            "kernel_sever_socket",
+            target,
+            "No active TCP connections match the target",
+        );
     }
 
     let _ = ss_kill(&filter);
     let mut remaining = count_connected_tcp(&filter).unwrap_or(before);
     if remaining > 0 {
-        if let Some(res) = escalate_via_helper(PRIVILEGED_INTERVENTION_FLAG, &["sever-socket", target]) {
+        if let Some(res) =
+            escalate_via_helper(PRIVILEGED_INTERVENTION_FLAG, &["sever-socket", target])
+        {
             return res;
         }
-        if legacy_pkexec(&["/usr/bin/ss", "-K", "-t", "state", "connected", &filter], None) {
+        if legacy_pkexec(
+            &["/usr/bin/ss", "-K", "-t", "state", "connected", &filter],
+            None,
+        ) {
             remaining = count_connected_tcp(&filter).unwrap_or(remaining);
         }
     }
@@ -530,7 +592,10 @@ pub fn kernel_sever_socket(target: &str) -> InterventionResult {
         InterventionResult::ok(
             "kernel_sever_socket",
             target,
-            &format!("Kernel sock_diag reset {} TCP connection(s) for {}", before, target),
+            &format!(
+                "Kernel sock_diag reset {} TCP connection(s) for {}",
+                before, target
+            ),
         )
     } else {
         InterventionResult::err(
@@ -559,7 +624,9 @@ pub fn kernel_deauth_usb(bus_id: &str) -> InterventionResult {
         || clean_id.len() > 32
         || clean_id.contains("..")
         || clean_id.starts_with('.')
-        || !clean_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == ':')
+        || !clean_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == ':')
     {
         return InterventionResult::err("kernel_deauth_usb", clean_id, "Invalid USB Bus ID format");
     }
@@ -567,13 +634,20 @@ pub fn kernel_deauth_usb(bus_id: &str) -> InterventionResult {
     let auth_path = format!("/sys/bus/usb/devices/{}/authorized", clean_id);
     let path = Path::new(&auth_path);
 
-    let open_err = match OpenOptions::new().write(true).custom_flags(O_NOFOLLOW).open(path) {
+    let open_err = match OpenOptions::new()
+        .write(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+    {
         Ok(mut file) => {
             return match file.write_all(b"0\n") {
                 Ok(_) => InterventionResult::ok(
                     "kernel_deauth_usb",
                     clean_id,
-                    &format!("USB device {} de-authorized at kernel hardware interface", clean_id),
+                    &format!(
+                        "USB device {} de-authorized at kernel hardware interface",
+                        clean_id
+                    ),
                 ),
                 Err(e) => InterventionResult::err(
                     "kernel_deauth_usb",
@@ -586,9 +660,14 @@ pub fn kernel_deauth_usb(bus_id: &str) -> InterventionResult {
     };
 
     if !path.exists() {
-        return InterventionResult::err("kernel_deauth_usb", clean_id, "USB device not found in sysfs");
+        return InterventionResult::err(
+            "kernel_deauth_usb",
+            clean_id,
+            "USB device not found in sysfs",
+        );
     }
-    if let Some(res) = escalate_via_helper(PRIVILEGED_INTERVENTION_FLAG, &["deauth-usb", clean_id]) {
+    if let Some(res) = escalate_via_helper(PRIVILEGED_INTERVENTION_FLAG, &["deauth-usb", clean_id])
+    {
         return res;
     }
     // tee writes stdin to the validated path without a shell in between
@@ -596,7 +675,10 @@ pub fn kernel_deauth_usb(bus_id: &str) -> InterventionResult {
         return InterventionResult::ok(
             "kernel_deauth_usb",
             clean_id,
-            &format!("USB device {} de-authorized at kernel hardware interface via pkexec", clean_id),
+            &format!(
+                "USB device {} de-authorized at kernel hardware interface via pkexec",
+                clean_id
+            ),
         );
     }
 
@@ -622,7 +704,11 @@ pub fn kernel_quarantine_ip(ip_str: &str) -> InterventionResult {
     let ip: IpAddr = match clean_ip.parse() {
         Ok(addr) => addr,
         Err(_) => {
-            return InterventionResult::err("kernel_quarantine_ip", clean_ip, "Invalid IP address format");
+            return InterventionResult::err(
+                "kernel_quarantine_ip",
+                clean_ip,
+                "Invalid IP address format",
+            );
         }
     };
 
@@ -635,7 +721,11 @@ pub fn kernel_quarantine_ip(ip_str: &str) -> InterventionResult {
     }
 
     if !Path::new(NFT).exists() {
-        return InterventionResult::err("kernel_quarantine_ip", clean_ip, "nft binary not found in /usr/bin/nft");
+        return InterventionResult::err(
+            "kernel_quarantine_ip",
+            clean_ip,
+            "nft binary not found in /usr/bin/nft",
+        );
     }
 
     // One atomic, idempotent nft transaction fed through stdin: the table, sets and
@@ -647,7 +737,10 @@ pub fn kernel_quarantine_ip(ip_str: &str) -> InterventionResult {
         return InterventionResult::ok(
             "kernel_quarantine_ip",
             clean_ip,
-            &format!("IP {} successfully quarantined in kernel nftables drop set", clean_ip),
+            &format!(
+                "IP {} successfully quarantined in kernel nftables drop set",
+                clean_ip
+            ),
         );
     }
 
@@ -658,7 +751,10 @@ pub fn kernel_quarantine_ip(ip_str: &str) -> InterventionResult {
         return InterventionResult::ok(
             "kernel_quarantine_ip",
             clean_ip,
-            &format!("IP {} quarantined in kernel nftables drop set via pkexec", clean_ip),
+            &format!(
+                "IP {} quarantined in kernel nftables drop set via pkexec",
+                clean_ip
+            ),
         );
     }
 
@@ -700,7 +796,11 @@ pub const BLACKOUT_SCRIPT: &str = "table inet sentinel_blackout {\n    chain out
 /// it could be swapped between being written and being read by a root `nft`.
 pub fn kernel_apply_network_blackout() -> InterventionResult {
     if !Path::new(NFT).exists() {
-        return InterventionResult::err("network_blackout", "all_interfaces", "nft binary not found in /usr/bin/nft");
+        return InterventionResult::err(
+            "network_blackout",
+            "all_interfaces",
+            "nft binary not found in /usr/bin/nft",
+        );
     }
 
     let res = if nft_apply(BLACKOUT_SCRIPT) {
@@ -767,7 +867,13 @@ pub fn kernel_clear_network_blackout() -> InterventionResult {
 /// Checks if the emergency network blackout table is currently active in the kernel.
 pub fn kernel_is_network_blackout_active() -> bool {
     let deadline = Instant::now() + Duration::from_secs(2);
-    let out = run_cmd_bounded(NFT, &["list", "table", "inet", "sentinel_blackout"], &[], deadline, 4096);
+    let out = run_cmd_bounded(
+        NFT,
+        &["list", "table", "inet", "sentinel_blackout"],
+        &[],
+        deadline,
+        4096,
+    );
     // Root can query the ruleset directly; unprivileged callers fall back to the
     // per-boot marker written when the blackout was engaged.
     out.is_some() || blackout_marker_matches_boot()
@@ -787,23 +893,32 @@ fn get_private_state_dir() -> Result<PathBuf, String> {
     let base = match std::env::var("XDG_STATE_HOME") {
         Ok(state) if !state.is_empty() => PathBuf::from(state),
         _ => {
-            let home = std::env::var("HOME").map_err(|_| "HOME environment variable is not set".to_string())?;
+            let home = std::env::var("HOME")
+                .map_err(|_| "HOME environment variable is not set".to_string())?;
             PathBuf::from(home).join(".local/state")
         }
     };
     let state_dir = base.join("omarchy/security-sentinel");
 
     if state_dir.exists() {
-        let meta = std::fs::symlink_metadata(&state_dir).map_err(|e| format!("Failed to read state dir metadata: {}", e))?;
+        let meta = std::fs::symlink_metadata(&state_dir)
+            .map_err(|e| format!("Failed to read state dir metadata: {}", e))?;
         if meta.file_type().is_symlink() {
-            return Err(format!("State directory {} is a symlink", state_dir.display()));
+            return Err(format!(
+                "State directory {} is a symlink",
+                state_dir.display()
+            ));
         }
         // SAFETY: getuid has no preconditions
         if meta.uid() != unsafe { getuid() } {
-            return Err(format!("State directory {} is not owned by current user", state_dir.display()));
+            return Err(format!(
+                "State directory {} is not owned by current user",
+                state_dir.display()
+            ));
         }
     } else {
-        std::fs::create_dir_all(&state_dir).map_err(|e| format!("Failed to create private state directory: {}", e))?;
+        std::fs::create_dir_all(&state_dir)
+            .map_err(|e| format!("Failed to create private state directory: {}", e))?;
         let _ = std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700));
     }
 
@@ -812,7 +927,11 @@ fn get_private_state_dir() -> Result<PathBuf, String> {
 
 fn write_private_file(path: &Path, content: &[u8]) {
     let mut opts = OpenOptions::new();
-    opts.write(true).create(true).truncate(true).custom_flags(O_NOFOLLOW).mode(0o600);
+    opts.write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(O_NOFOLLOW)
+        .mode(0o600);
     if let Ok(mut file) = opts.open(path) {
         let _ = file.write_all(content);
     }
@@ -821,7 +940,9 @@ fn write_private_file(path: &Path, content: &[u8]) {
 /// Captures cryptographic forensic evidence (executable hash, cmdline, comm)
 /// of a frozen process to disk with 0600 file permissions in private state storage.
 fn capture_forensic_evidence(pid: i32) {
-    let Ok(base) = get_private_state_dir() else { return };
+    let Ok(base) = get_private_state_dir() else {
+        return;
+    };
     let proc_path = format!("/proc/{}", pid);
     let proc_dir = Path::new(&proc_path);
     let exe_hash = if let Ok(bytes) = read_proc_bounded(&proc_dir.join("exe"), 16 * 1024 * 1024) {
@@ -874,7 +995,9 @@ fn current_boot_id() -> Option<String> {
 /// `nft list` the ruleset, so without this marker the UI would always report the
 /// killswitch as inactive after a pkexec-elevated blackout.
 fn record_blackout_marker() {
-    let (Ok(dir), Some(boot_id)) = (get_private_state_dir(), current_boot_id()) else { return };
+    let (Ok(dir), Some(boot_id)) = (get_private_state_dir(), current_boot_id()) else {
+        return;
+    };
     write_private_file(&dir.join(BLACKOUT_MARKER), boot_id.as_bytes());
 }
 
@@ -885,7 +1008,9 @@ fn clear_blackout_marker() {
 }
 
 fn blackout_marker_matches_boot() -> bool {
-    let Ok(dir) = get_private_state_dir() else { return false };
+    let Ok(dir) = get_private_state_dir() else {
+        return false;
+    };
     let marker = dir.join(BLACKOUT_MARKER);
     match std::fs::symlink_metadata(&marker) {
         Ok(meta) if meta.is_file() => {}
@@ -908,7 +1033,11 @@ pub fn run_privileged_operation(flag: &str, op: &str, arg: Option<&str>) -> Inte
     let action = format!("{} {}", flag.trim_start_matches('-'), op);
     // SAFETY: getuid has no preconditions
     if unsafe { getuid() } != 0 {
-        return InterventionResult::err(&action, arg.unwrap_or(""), "Privileged helper must be started via pkexec");
+        return InterventionResult::err(
+            &action,
+            arg.unwrap_or(""),
+            "Privileged helper must be started via pkexec",
+        );
     }
     enter_privileged_mode();
 
@@ -941,7 +1070,10 @@ mod tests {
 
     #[test]
     fn test_pidfd_refuses_to_signal_a_reaped_process() {
-        let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
         let handle = ProcessHandle::open(child.id() as i32);
         assert!(handle.is_alive());
         let _ = child.kill();

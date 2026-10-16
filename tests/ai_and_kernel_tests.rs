@@ -37,7 +37,9 @@ fn test_evaluate_process_reverse_shell() {
     assert!(res.is_some());
     let anomaly = res.unwrap();
     assert!(anomaly.score >= 60);
-    assert!(anomaly.severity == AnomalySeverity::High || anomaly.severity == AnomalySeverity::Critical);
+    assert!(
+        anomaly.severity == AnomalySeverity::High || anomaly.severity == AnomalySeverity::Critical
+    );
     assert!(anomaly.reasons.iter().any(|r| r.contains("reverse-shell")));
 }
 
@@ -52,7 +54,10 @@ fn test_evaluate_process_curl_pipe_sh() {
     assert!(res.is_some());
     let anomaly = res.unwrap();
     assert!(anomaly.score >= 45);
-    assert!(anomaly.reasons.iter().any(|r| r.contains("remote code pipe")));
+    assert!(anomaly
+        .reasons
+        .iter()
+        .any(|r| r.contains("remote code pipe")));
 }
 
 #[test]
@@ -84,31 +89,26 @@ fn test_evaluate_process_cryptominer() {
 
 #[test]
 fn test_evaluate_socket_backdoor_port() {
-    let res = BehaviorAnalyzer::evaluate_socket(
-        Some(5555),
-        "unknown_listener",
-        "tcp",
-        "0.0.0.0",
-        4444,
-    );
+    let res =
+        BehaviorAnalyzer::evaluate_socket(Some(5555), "unknown_listener", "tcp", "0.0.0.0", 4444);
     assert!(res.is_some());
     let anomaly = res.unwrap();
     assert!(anomaly.score >= 45);
-    assert!(anomaly.reasons.iter().any(|r| r.contains("exploit or reverse backdoor")));
+    assert!(anomaly
+        .reasons
+        .iter()
+        .any(|r| r.contains("exploit or reverse backdoor")));
 }
 
 #[test]
 fn test_evaluate_socket_rogue_ssh() {
-    let res = BehaviorAnalyzer::evaluate_socket(
-        Some(2222),
-        "python3",
-        "tcp",
-        "0.0.0.0",
-        22,
-    );
+    let res = BehaviorAnalyzer::evaluate_socket(Some(2222), "python3", "tcp", "0.0.0.0", 22);
     assert!(res.is_some());
     let anomaly = res.unwrap();
-    assert!(anomaly.reasons.iter().any(|r| r.contains("Non-sshd binary")));
+    assert!(anomaly
+        .reasons
+        .iter()
+        .any(|r| r.contains("Non-sshd binary")));
 }
 
 #[test]
@@ -282,5 +282,9 @@ fn test_spoofed_immune_name_outside_system_paths_is_not_immune() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(res.success, "spoofed process should be terminable: {}", res.message);
+    assert!(
+        res.success,
+        "spoofed process should be terminable: {}",
+        res.message
+    );
 }

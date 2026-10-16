@@ -67,7 +67,12 @@ impl BehaviorAnalyzer {
     }
 
     /// Evaluates a process commandline and environment to calculate threat score
-    pub fn evaluate_process(pid: i32, name: &str, exe_path: Option<&str>, cmdline: &str) -> Option<ProcessAnomaly> {
+    pub fn evaluate_process(
+        pid: i32,
+        name: &str,
+        exe_path: Option<&str>,
+        cmdline: &str,
+    ) -> Option<ProcessAnomaly> {
         let mut score = 0u32;
         let mut reasons = Vec::new();
 
@@ -79,7 +84,8 @@ impl BehaviorAnalyzer {
             || lower_exe.starts_with("/dev/shm")
             || lower_exe.starts_with("/var/tmp");
 
-        let has_suspicious_script_arg = (lower_cmd.contains("/tmp/") || lower_cmd.contains("/dev/shm/"))
+        let has_suspicious_script_arg = (lower_cmd.contains("/tmp/")
+            || lower_cmd.contains("/dev/shm/"))
             && (lower_cmd.ends_with(".sh")
                 || lower_cmd.ends_with(".py")
                 || lower_cmd.ends_with(".elf")
@@ -93,7 +99,9 @@ impl BehaviorAnalyzer {
             reasons.push("Process binary executed directly from temporary or memory filesystem (/tmp or /dev/shm)".to_string());
         } else if has_suspicious_script_arg {
             score += 30;
-            reasons.push("Process argument executes script or binary from temporary directory".to_string());
+            reasons.push(
+                "Process argument executes script or binary from temporary directory".to_string(),
+            );
         }
 
         // 2. Check for deleted executable in memory (process ghosting vs system upgrade)
@@ -122,20 +130,31 @@ impl BehaviorAnalyzer {
 
         if is_reverse_shell {
             score += 65;
-            reasons.push("Signature match: Interactive reverse-shell execution pattern detected".to_string());
+            reasons.push(
+                "Signature match: Interactive reverse-shell execution pattern detected".to_string(),
+            );
         }
 
         // 4. Remote code execution pipe into shell
         if (lower_cmd.contains("curl ") || lower_cmd.contains("wget "))
-            && (lower_cmd.contains("| sh") || lower_cmd.contains("| bash") || lower_cmd.contains("| sudo"))
+            && (lower_cmd.contains("| sh")
+                || lower_cmd.contains("| bash")
+                || lower_cmd.contains("| sudo"))
         {
             score += 45;
-            reasons.push("Direct unauthenticated remote code pipe into shell (curl/wget | sh/bash)".to_string());
+            reasons.push(
+                "Direct unauthenticated remote code pipe into shell (curl/wget | sh/bash)"
+                    .to_string(),
+            );
         }
 
         // 5. Obfuscation & Base64 decoding piped to interpreter
-        if (lower_cmd.contains("base64 -d") || lower_cmd.contains("base64 --decode") || lower_cmd.contains("openssl enc -d"))
-            && (lower_cmd.contains("| sh") || lower_cmd.contains("| bash") || lower_cmd.contains("| python"))
+        if (lower_cmd.contains("base64 -d")
+            || lower_cmd.contains("base64 --decode")
+            || lower_cmd.contains("openssl enc -d"))
+            && (lower_cmd.contains("| sh")
+                || lower_cmd.contains("| bash")
+                || lower_cmd.contains("| python"))
         {
             score += 50;
             reasons.push("Obfuscated payload decoding directly into shell/interpreter".to_string());
@@ -145,10 +164,14 @@ impl BehaviorAnalyzer {
         if lower_cmd.contains("/proc/kcore")
             || lower_cmd.contains("/dev/mem")
             || lower_cmd.contains("/dev/kmem")
-            || (lower_cmd.contains("/etc/shadow") && !lower_cmd.contains("passwd") && !lower_cmd.contains("useradd"))
+            || (lower_cmd.contains("/etc/shadow")
+                && !lower_cmd.contains("passwd")
+                && !lower_cmd.contains("useradd"))
         {
             score += 40;
-            reasons.push("Suspicious low-level memory or shadow credential access pattern".to_string());
+            reasons.push(
+                "Suspicious low-level memory or shadow credential access pattern".to_string(),
+            );
         }
 
         // 7. Hidden cryptocurrency mining signatures
@@ -176,9 +199,18 @@ impl BehaviorAnalyzer {
 
         let clamped_score = score.min(100);
         let (severity, recommended_action) = match clamped_score {
-            80..=100 => (AnomalySeverity::Critical, "IMMEDIATE KERNEL FREEZE OR TERMINATION".to_string()),
-            50..=79 => (AnomalySeverity::High, "KERNEL FREEZE & SEVER ACTIVE SOCKETS".to_string()),
-            25..=49 => (AnomalySeverity::Medium, "AUDIT PROCESS TREE & NETWORK MONITORING".to_string()),
+            80..=100 => (
+                AnomalySeverity::Critical,
+                "IMMEDIATE KERNEL FREEZE OR TERMINATION".to_string(),
+            ),
+            50..=79 => (
+                AnomalySeverity::High,
+                "KERNEL FREEZE & SEVER ACTIVE SOCKETS".to_string(),
+            ),
+            25..=49 => (
+                AnomalySeverity::Medium,
+                "AUDIT PROCESS TREE & NETWORK MONITORING".to_string(),
+            ),
             _ => (AnomalySeverity::Low, "MONITOR".to_string()),
         };
 
@@ -208,7 +240,10 @@ impl BehaviorAnalyzer {
         let critical_ports: &[u16] = &[1337, 31337, 4444, 5555, 6667, 8888, 9999, 12345, 54321];
         if critical_ports.contains(&port) {
             score += 45;
-            reasons.push(format!("Listening on well-known exploit or reverse backdoor port {}", port));
+            reasons.push(format!(
+                "Listening on well-known exploit or reverse backdoor port {}",
+                port
+            ));
         }
 
         // 2. Sensitive ports exposed to 0.0.0.0 or wildcard
@@ -216,20 +251,35 @@ impl BehaviorAnalyzer {
         if is_wildcard {
             if port == 22 && process_name != "sshd" && !process_name.is_empty() {
                 score += 50;
-                reasons.push(format!("Non-sshd binary '{}' listening on standard SSH port 22", process_name));
-            } else if (port == 80 || port == 443) && !["nginx", "caddy", "apache2", "httpd", "lighttpd"].contains(&process_name) && !process_name.is_empty() {
+                reasons.push(format!(
+                    "Non-sshd binary '{}' listening on standard SSH port 22",
+                    process_name
+                ));
+            } else if (port == 80 || port == 443)
+                && !["nginx", "caddy", "apache2", "httpd", "lighttpd"].contains(&process_name)
+                && !process_name.is_empty()
+            {
                 score += 30;
-                reasons.push(format!("Non-standard web server '{}' bound to public web port {}", process_name, port));
+                reasons.push(format!(
+                    "Non-standard web server '{}' bound to public web port {}",
+                    process_name, port
+                ));
             } else if port == 23 || port == 21 {
                 score += 40;
-                reasons.push(format!("Insecure plaintext service listening on port {}", port));
+                reasons.push(format!(
+                    "Insecure plaintext service listening on port {}",
+                    port
+                ));
             }
         }
 
         // 3. Process name check for listener
         if ["nc", "netcat", "ncat", "socat"].contains(&process_name) {
             score += 55;
-            reasons.push(format!("Raw socket utility '{}' listening for incoming connections", process_name));
+            reasons.push(format!(
+                "Raw socket utility '{}' listening for incoming connections",
+                process_name
+            ));
         }
 
         if score == 0 {
@@ -281,7 +331,10 @@ pub fn analyze_all_processes() -> Vec<ProcessAnomaly> {
             let mut cmdline = String::new();
             if let Ok(mut f) = File::open(&cmdline_path) {
                 let mut buf = Vec::new();
-                let _ = f.by_ref().take(MAX_CMDLINE_READ_BYTES + 1).read_to_end(&mut buf);
+                let _ = f
+                    .by_ref()
+                    .take(MAX_CMDLINE_READ_BYTES + 1)
+                    .read_to_end(&mut buf);
                 if buf.len() <= MAX_CMDLINE_READ_BYTES as usize {
                     // Split null bytes into spaces
                     cmdline = buf
@@ -306,7 +359,9 @@ pub fn analyze_all_processes() -> Vec<ProcessAnomaly> {
             let exe_path_buf = fs::read_link(pid_path.join("exe")).ok();
             let exe_str = exe_path_buf.as_ref().and_then(|p| p.to_str());
 
-            if let Some(anomaly) = BehaviorAnalyzer::evaluate_process(pid, &proc_name, exe_str, &cmdline) {
+            if let Some(anomaly) =
+                BehaviorAnalyzer::evaluate_process(pid, &proc_name, exe_str, &cmdline)
+            {
                 anomalies.push(anomaly);
             }
         }
@@ -317,10 +372,14 @@ pub fn analyze_all_processes() -> Vec<ProcessAnomaly> {
 }
 
 /// Analyzes socket anomalies from ss or /proc/net
-pub fn analyze_socket_anomalies(open_sockets: &[(&str, &str, u16, Option<i32>, &str)]) -> Vec<SocketAnomaly> {
+pub fn analyze_socket_anomalies(
+    open_sockets: &[(&str, &str, u16, Option<i32>, &str)],
+) -> Vec<SocketAnomaly> {
     let mut results = Vec::new();
     for (proto, local_addr, port, pid, proc_name) in open_sockets {
-        if let Some(anomaly) = BehaviorAnalyzer::evaluate_socket(*pid, proc_name, proto, local_addr, *port) {
+        if let Some(anomaly) =
+            BehaviorAnalyzer::evaluate_socket(*pid, proc_name, proto, local_addr, *port)
+        {
             results.push(anomaly);
         }
     }

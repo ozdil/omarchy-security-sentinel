@@ -187,7 +187,8 @@ pub fn run_cmd_bounded_status(
         }
 
         let now = Instant::now();
-        let remaining_ms = (deadline.saturating_duration_since(now).as_millis().min(50) as i32).max(1);
+        let remaining_ms =
+            (deadline.saturating_duration_since(now).as_millis().min(50) as i32).max(1);
         let mut pfd = PollFd {
             fd: raw_fd,
             events: POLLIN | POLLHUP | POLLERR,
@@ -364,7 +365,8 @@ mod tests {
     #[test]
     fn test_status_variant_reports_nonzero_exit_code() {
         let deadline = Instant::now() + Duration::from_millis(2000);
-        let out = run_cmd_bounded_status("/bin/sh", &["-c", "echo hi; exit 2"], &[], deadline, 1024);
+        let out =
+            run_cmd_bounded_status("/bin/sh", &["-c", "echo hi; exit 2"], &[], deadline, 1024);
         assert_eq!(out, Some((2, b"hi\n".to_vec())));
         // The success-only wrapper still rejects non-zero exits
         let deadline = Instant::now() + Duration::from_millis(2000);
