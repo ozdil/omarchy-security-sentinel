@@ -1,4 +1,5 @@
 pub mod ai;
+pub mod cve;
 pub mod kernel;
 pub mod net;
 pub mod subproc;

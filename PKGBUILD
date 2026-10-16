@@ -7,6 +7,8 @@ arch=('x86_64')
 url="https://github.com/ozdil/omarchy-security-sentinel"
 license=('MIT')
 depends=('quickshell')
+optdepends=('arch-audit: CVE data from the Arch Security Tracker'
+            'pacman-contrib: pending update check (checkupdates)')
 makedepends=('cargo' 'rust')
 source=()
 sha256sums=()
