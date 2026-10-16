@@ -237,8 +237,9 @@ impl BehaviorAnalyzer {
         let mut reasons = Vec::new();
 
         // 1. High-risk backdoor ports
-        let critical_ports: &[u16] = &[1337, 31337, 4444, 5555, 6667, 8888, 9999, 12345, 54321];
-        if critical_ports.contains(&port) {
+        // Same list as the network radar, so a socket is never "critical" in one view
+        // and unremarkable in the other (8888/9999 are everyday Jupyter/dev ports)
+        if crate::net::is_suspicious_port(port) {
             score += 45;
             reasons.push(format!(
                 "Listening on well-known exploit or reverse backdoor port {}",
@@ -247,7 +248,8 @@ impl BehaviorAnalyzer {
         }
 
         // 2. Sensitive ports exposed to 0.0.0.0 or wildcard
-        let is_wildcard = local_address.starts_with("0.0.0.0") || local_address.starts_with("::");
+        // Exact match: a prefix test would treat ::1 (loopback) as the :: wildcard
+        let is_wildcard = crate::net::is_wildcard_address(local_address);
         if is_wildcard {
             if port == 22 && process_name != "sshd" && !process_name.is_empty() {
                 score += 50;

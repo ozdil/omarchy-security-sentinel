@@ -38,10 +38,72 @@ Item {
         actionProc.running = true;
     }
 
+    property bool rescanPending: false
+
+    // One colour per verdict; everything that is fine stays muted
+    function statusColor(status) {
+        if (status === "ALERT" || status === "CRITICAL") return Theme.accentDanger;
+        if (status === "WARNING" || status === "ELEVATED") return Theme.accentWarning;
+        return Theme.textMuted;
+    }
+
+    function itemColor(text) {
+        var t = String(text || "");
+        if (t.indexOf("[ALERT") === 0 || t.indexOf("[Critical]") === 0) return Theme.accentDanger;
+        if (t.indexOf("[WARNING") === 0 || t.indexOf("[High]") === 0) return Theme.accentWarning;
+        return Theme.textMain;
+    }
+
     function refresh() {
-        if (!sentinelProc.running) {
-            sentinelProc.running = true;
+        if (sentinelProc.running) {
+            root.rescanPending = true;
+            return;
         }
+        sentinelProc.running = true;
+    }
+
+    // Live updates (USB hot-plug, 20 s cycle) come from the engine daemon's cache
+    readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
+    readonly property string reportCachePath: runtimeDir !== "" ? runtimeDir + "/omarchy-security-sentinel/report.json" : ""
+
+    function applyReport(data) {
+        root.threatLevel = data.threat_level || "ZERO";
+        root.modules = data.modules || [];
+        root.anomalousProcesses = data.ai_anomalies || data.anomalous_processes || [];
+        root.networkBlackoutActive = !!data.network_blackout_active;
+        root.usbArmorEnabled = !!data.usb_armor_enabled;
+        root.selfIntegrityHash = data.self_integrity_hash || "";
+
+        if (!root.selectedModule && root.modules.length > 0) {
+            root.selectedModule = root.modules[0];
+        } else if (root.selectedModule) {
+            for (var i = 0; i < root.modules.length; i++) {
+                if (root.modules[i].id === root.selectedModule.id) {
+                    root.selectedModule = root.modules[i];
+                    break;
+                }
+            }
+        }
+    }
+
+    // Destructive actions (blackout, freeze, kill) need a second click within a few seconds
+    property string armedAction: ""
+
+    function confirmOrArm(key, action) {
+        if (root.armedAction === key) {
+            root.armedAction = "";
+            disarmTimer.stop();
+            action();
+        } else {
+            root.armedAction = key;
+            disarmTimer.restart();
+        }
+    }
+
+    Timer {
+        id: disarmTimer
+        interval: 4000
+        onTriggered: root.armedAction = ""
     }
 
     function toggleBlackout() {
@@ -83,28 +145,17 @@ Item {
     Process {
         id: sentinelProc
         command: [root.enginePath, "--json"]
+        onExited: {
+            if (root.rescanPending) {
+                root.rescanPending = false;
+                root.refresh();
+            }
+        }
         stdout: StdioCollector {
             waitForEnd: true
             onStreamFinished: {
                 try {
-                    var data = JSON.parse(text || "{}");
-                    root.threatLevel = data.threat_level || "ZERO";
-                    root.modules = data.modules || [];
-                    root.anomalousProcesses = data.ai_anomalies || data.anomalous_processes || [];
-                    root.networkBlackoutActive = !!data.network_blackout_active;
-                    root.usbArmorEnabled = !!data.usb_armor_enabled;
-                    root.selfIntegrityHash = data.self_integrity_hash || "";
-
-                    if (!root.selectedModule && root.modules.length > 0) {
-                        root.selectedModule = root.modules[0];
-                    } else if (root.selectedModule) {
-                        for (var i = 0; i < root.modules.length; i++) {
-                            if (root.modules[i].id === root.selectedModule.id) {
-                                root.selectedModule = root.modules[i];
-                                break;
-                            }
-                        }
-                    }
+                    root.applyReport(JSON.parse(String(text || "{}").slice(0, 131072)));
                 } catch(e) {
                     console.warn("Failed to parse sentinel json:", e);
                 }
@@ -117,6 +168,46 @@ Item {
         onExited: {
             root.refresh();
             root.startNextAction();
+        }
+    }
+
+    // Shares the panel's daemon when one already runs (flock single instance)
+    Process {
+        id: daemonProc
+        command: [root.enginePath, "--daemon"]
+        running: root.reportCachePath !== ""
+    }
+
+    FileView {
+        id: reportView
+        path: root.reportCachePath
+        watchChanges: true
+        printErrors: false
+        // A stale, missing or unreadable cache means the daemon is not keeping up:
+        // fall back to a direct scan so the dashboard never shows old data as live
+        onLoaded: {
+            var fresh = false;
+            try {
+                var d = JSON.parse(String(text() || "").slice(0, 131072));
+                var age = Date.now() / 1000 - Number(d.generated_at || 0);
+                if (age >= 0 && age <= 60) {
+                    root.applyReport(d);
+                    fresh = true;
+                }
+            } catch(e) {}
+            if (!fresh) root.refresh();
+        }
+        onLoadFailed: root.refresh()
+        onFileChanged: reload()
+    }
+
+    Timer {
+        interval: 20000
+        running: root.reportCachePath !== ""
+        repeat: true
+        onTriggered: {
+            if (!daemonProc.running) daemonProc.running = true;
+            reportView.reload();
         }
     }
 
@@ -146,21 +237,21 @@ Item {
                     text: root.threatLevel === "CRITICAL" ? Theme.iconShieldAlert : (root.threatLevel === "ELEVATED" ? Theme.iconShield : Theme.iconShieldCheck)
                     font.family: Theme.iconFont
                     font.pixelSize: 24
-                    color: root.threatLevel === "CRITICAL" ? Theme.accentDanger : (root.threatLevel === "ELEVATED" ? Theme.accentWarning : Theme.accentSuccess)
+                    color: root.threatLevel === "ZERO" ? Theme.textMain : root.statusColor(root.threatLevel)
                 }
 
                 ColumnLayout {
                     spacing: 2
                     Text {
-                        text: "SECURITY SENTINEL HUB"
+                        text: "Security Sentinel"
                         font.family: Theme.fontFamily
                         font.pixelSize: 15
                         font.bold: true
                         color: Theme.textMain
                     }
                     Text {
-                        text: "Kernel Hardening, AI Threat Heuristics & Host Intrusion Shield"
-                        font.family: Theme.fontFamily
+                        text: "integrity " + (root.selfIntegrityHash && root.selfIntegrityHash !== "UNVERIFIED" ? root.selfIntegrityHash.substring(0, 12) : "unverified")
+                        font.family: Theme.monoFont
                         font.pixelSize: 11
                         color: Theme.textMuted
                     }
@@ -168,44 +259,13 @@ Item {
 
                 Item { Layout.fillWidth: true }
 
-                // Self-Integrity Badge
-                Rectangle {
-                    height: 32
-                    implicitWidth: integrityRow.implicitWidth + 20
-                    radius: Theme.radiusSm
-                    color: Theme.bgCard
-                    border.color: Theme.border
-                    border.width: 1
-
-                    RowLayout {
-                        id: integrityRow
-                        anchors.centerIn: parent
-                        spacing: 6
-
-                        Text {
-                            text: Theme.iconLock
-                            font.family: Theme.iconFont
-                            font.pixelSize: 11
-                            color: Theme.accentSuccess
-                        }
-
-                        Text {
-                            text: "INTEGRITY: " + (root.selfIntegrityHash && root.selfIntegrityHash !== "UNVERIFIED" ? "VERIFIED (" + root.selfIntegrityHash.substring(0, 8) + ")" : "UNVERIFIED")
-                            font.family: Theme.monoFont
-                            font.pixelSize: 11
-                            font.bold: true
-                            color: Theme.textMain
-                        }
-                    }
-                }
-
                 // Panic Blackout Button
                 Rectangle {
                     height: 32
                     implicitWidth: blackoutRow.implicitWidth + 20
                     radius: Theme.radiusSm
-                    color: root.networkBlackoutActive ? Theme.accentDanger : (blackoutArea.containsMouse ? Theme.bgCardHover : Theme.bgCard)
-                    border.color: root.networkBlackoutActive ? Theme.accentDanger : Theme.accentWarning
+                    color: blackoutArea.containsMouse ? Theme.bgCardHover : "transparent"
+                    border.color: (root.networkBlackoutActive || root.armedAction === "blackout") ? Theme.accentDanger : Theme.border
                     border.width: 1
 
                     RowLayout {
@@ -217,15 +277,14 @@ Item {
                             text: root.networkBlackoutActive ? Theme.iconShieldAlert : Theme.iconShield
                             font.family: Theme.iconFont
                             font.pixelSize: 12
-                            color: root.networkBlackoutActive ? "#ffffff" : Theme.accentWarning
+                            color: root.networkBlackoutActive ? Theme.accentDanger : Theme.textMuted
                         }
 
                         Text {
-                            text: root.networkBlackoutActive ? "RESUME NETWORK" : "PANIC BLACKOUT"
+                            text: root.networkBlackoutActive ? "Resume network" : (root.armedAction === "blackout" ? "Click again to cut all network" : "Panic blackout")
                             font.family: Theme.fontFamily
                             font.pixelSize: 11
-                            font.bold: true
-                            color: root.networkBlackoutActive ? "#ffffff" : Theme.textMain
+                            color: (root.networkBlackoutActive || root.armedAction === "blackout") ? Theme.accentDanger : Theme.textMain
                         }
                     }
 
@@ -234,39 +293,20 @@ Item {
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: root.toggleBlackout()
+                        onClicked: {
+                            // Resuming is always safe; cutting the network asks first
+                            if (root.networkBlackoutActive) root.toggleBlackout();
+                            else root.confirmOrArm("blackout", root.toggleBlackout);
+                        }
                     }
                 }
 
-                // Threat Level Pill
-                Rectangle {
-                    height: 32
-                    implicitWidth: threatPillRow.implicitWidth + 20
-                    radius: Theme.radiusSm
-                    color: Theme.bgCard
-                    border.color: Theme.border
-                    border.width: 1
-
-                    RowLayout {
-                        id: threatPillRow
-                        anchors.centerIn: parent
-                        spacing: 8
-
-                        Rectangle {
-                            width: 8
-                            height: 8
-                            radius: 4
-                            color: root.threatLevel === "CRITICAL" ? Theme.accentDanger : (root.threatLevel === "ELEVATED" ? Theme.accentWarning : Theme.accentSuccess)
-                        }
-
-                        Text {
-                            text: "THREAT: " + root.threatLevel
-                            font.family: Theme.monoFont
-                            font.pixelSize: 11
-                            font.bold: true
-                            color: Theme.textMain
-                        }
-                    }
+                Text {
+                    text: "threat " + root.threatLevel.toLowerCase()
+                    font.family: Theme.monoFont
+                    font.pixelSize: 12
+                    font.bold: root.threatLevel !== "ZERO"
+                    color: root.statusColor(root.threatLevel)
                 }
 
                 // Refresh Button
@@ -318,7 +358,7 @@ Item {
                     spacing: 10
 
                     Text {
-                        text: "ACTIVE SECURITY DEFENSE SUBSYSTEMS"
+                        text: "MODULES"
                         font.family: Theme.fontFamily
                         font.pixelSize: 11
                         font.bold: true
@@ -336,10 +376,10 @@ Item {
 
                         delegate: Rectangle {
                             width: modListView.width
-                            height: 54
-                            radius: Theme.radiusSm
-                            color: root.selectedModule && root.selectedModule.id === modelData.id ? Theme.bgCardHover : Theme.bgCard
-                            border.color: root.selectedModule && root.selectedModule.id === modelData.id ? Theme.accent : Theme.border
+                            height: 48
+                            readonly property bool selected: root.selectedModule && root.selectedModule.id === modelData.id
+                            color: selected ? Theme.bgCard : "transparent"
+                            border.color: selected ? Theme.accent : "transparent"
                             border.width: 1
 
                             MouseArea {
@@ -354,10 +394,11 @@ Item {
                                 spacing: 10
 
                                 Text {
-                                    text: modelData.status === "WARNING" ? Theme.iconShieldAlert : Theme.iconShieldCheck
+                                    // ALERT used to render as a green check
+                                    text: (modelData.status === "ALERT" || modelData.status === "WARNING") ? Theme.iconShieldAlert : Theme.iconShieldCheck
                                     font.family: Theme.iconFont
-                                    font.pixelSize: 16
-                                    color: modelData.status === "WARNING" ? Theme.accentWarning : Theme.accentSuccess
+                                    font.pixelSize: 14
+                                    color: root.statusColor(modelData.status)
                                 }
 
                                 ColumnLayout {
@@ -384,19 +425,11 @@ Item {
                                     }
                                 }
 
-                                Rectangle {
-                                    height: 18
-                                    implicitWidth: modStatusText.implicitWidth + 8
-                                    radius: 3
-                                    color: Theme.bgDark
-                                    Text {
-                                        id: modStatusText
-                                        anchors.centerIn: parent
-                                        text: modelData.status || "OK"
-                                        font.family: Theme.monoFont
-                                        font.pixelSize: 9
-                                        color: modelData.status === "WARNING" ? Theme.accentWarning : Theme.accentSuccess
-                                    }
+                                Text {
+                                    text: String(modelData.status || "").toLowerCase()
+                                    font.family: Theme.monoFont
+                                    font.pixelSize: 10
+                                    color: root.statusColor(modelData.status)
                                 }
                             }
                         }
@@ -456,7 +489,7 @@ Item {
                                 id: dotBtnRow
                                 anchors.centerIn: parent
                                 spacing: 6
-                                Text { text: Theme.iconLock; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.accentSuccess }
+                                Text { text: Theme.iconLock; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.textMuted }
                                 Text { text: "Toggle DNS-over-TLS"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
                             }
 
@@ -480,8 +513,8 @@ Item {
                                 id: macBtnRow
                                 anchors.centerIn: parent
                                 spacing: 6
-                                Text { text: Theme.iconNetwork; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.accentWarning }
-                                Text { text: "Randomize Wi-Fi MAC"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
+                                Text { text: Theme.iconNetwork; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.textMuted }
+                                Text { text: "Toggle MAC randomization"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
                             }
 
                             MouseArea {
@@ -496,8 +529,8 @@ Item {
                             implicitWidth: usbArmorBtnRow.implicitWidth + 16
                             radius: Theme.radiusSm
                             visible: root.selectedModule && root.selectedModule.id === "badusb"
-                            color: root.usbArmorEnabled ? Theme.accentSuccess : Theme.bgCard
-                            border.color: root.usbArmorEnabled ? Theme.accentSuccess : Theme.border
+                            color: Theme.bgCard
+                            border.color: root.usbArmorEnabled ? Theme.accent : Theme.border
                             border.width: 1
 
                             RowLayout {
@@ -508,14 +541,13 @@ Item {
                                     text: Theme.iconShield
                                     font.family: Theme.iconFont
                                     font.pixelSize: 11
-                                    color: root.usbArmorEnabled ? Theme.bgDark : Theme.accentSuccess 
+                                    color: root.usbArmorEnabled ? Theme.accent : Theme.textMuted
                                 }
                                 Text { 
-                                    text: root.usbArmorEnabled ? "USB Armor: ACTIVE" : "Enable USB Armor"
+                                    text: root.usbArmorEnabled ? "USB Armor on" : "USB Armor off"
                                     font.family: Theme.fontFamily
                                     font.pixelSize: 11
-                                    font.bold: true
-                                    color: root.usbArmorEnabled ? Theme.bgDark : Theme.textMain 
+                                    color: Theme.textMain
                                 }
                             }
 
@@ -539,8 +571,8 @@ Item {
                                 id: usbBtnRow
                                 anchors.centerIn: parent
                                 spacing: 6
-                                Text { text: Theme.iconUsb; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.accentSuccess }
-                                Text { text: "Trust All Connected USBs"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
+                                Text { text: Theme.iconUsb; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.textMuted }
+                                Text { text: "Trust connected"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
                             }
 
                             MouseArea {
@@ -563,8 +595,8 @@ Item {
                                 id: tripBtnRow
                                 anchors.centerIn: parent
                                 spacing: 6
-                                Text { text: Theme.iconShield; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.accentWarning }
-                                Text { text: "Reset Canary SHA-256"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
+                                Text { text: Theme.iconShield; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.textMuted }
+                                Text { text: "Reset canaries"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
                             }
 
                             MouseArea {
@@ -587,7 +619,7 @@ Item {
                                 id: opsecBtnRow
                                 anchors.centerIn: parent
                                 spacing: 6
-                                Text { text: Theme.iconTrash; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.accentDanger }
+                                Text { text: Theme.iconTrash; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.textMuted }
                                 Text { text: "Scrub Downloads"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
                             }
 
@@ -612,7 +644,7 @@ Item {
                         visible: root.selectedModule && root.selectedModule.id === "ai_behavior" && root.anomalousProcesses.length > 0
 
                         Text {
-                            text: "HEURISTIC SUSPICIOUS PROCESS TELEMETRY"
+                            text: "SUSPICIOUS PROCESSES"
                             font.family: Theme.fontFamily
                             font.pixelSize: 11
                             font.bold: true
@@ -666,14 +698,18 @@ Item {
                                             anchors.centerIn: parent
                                             spacing: 4
                                             Text { text: Theme.iconSnowflake; font.family: Theme.iconFont; font.pixelSize: 10; color: Theme.accent }
-                                            Text { id: freezeText; text: "Freeze"; font.family: Theme.fontFamily; font.pixelSize: 10; color: Theme.textMain }
+                                            Text { id: freezeText; text: root.armedAction === "freeze:" + modelData.pid ? "Confirm freeze?" : "Freeze"; font.family: Theme.fontFamily; font.pixelSize: 10; color: Theme.textMain }
                                         }
 
                                         MouseArea {
                                             id: freezeArea
                                             anchors.fill: parent
+                                            hoverEnabled: true
                                             cursorShape: Qt.PointingHandCursor
-                                            onClicked: root.freezePid(modelData.pid)
+                                            onClicked: {
+                                                var pid = modelData.pid;
+                                                root.confirmOrArm("freeze:" + pid, function() { root.freezePid(pid); });
+                                            }
                                         }
                                     }
 
@@ -690,14 +726,18 @@ Item {
                                             anchors.centerIn: parent
                                             spacing: 4
                                             Text { text: Theme.iconTrash; font.family: Theme.iconFont; font.pixelSize: 10; color: Theme.accentDanger }
-                                            Text { id: termText; text: "Kill"; font.family: Theme.fontFamily; font.pixelSize: 10; color: Theme.accentDanger }
+                                            Text { id: termText; text: root.armedAction === "kill:" + modelData.pid ? "Confirm kill?" : "Kill"; font.family: Theme.fontFamily; font.pixelSize: 10; color: Theme.accentDanger }
                                         }
 
                                         MouseArea {
                                             id: termArea
                                             anchors.fill: parent
+                                            hoverEnabled: true
                                             cursorShape: Qt.PointingHandCursor
-                                            onClicked: root.terminatePid(modelData.pid)
+                                            onClicked: {
+                                                var pid = modelData.pid;
+                                                root.confirmOrArm("kill:" + pid, function() { root.terminatePid(pid); });
+                                            }
                                         }
                                     }
                                 }
@@ -714,37 +754,15 @@ Item {
                         spacing: 6
                         model: (root.selectedModule && root.selectedModule.items) ? root.selectedModule.items : []
 
-                        delegate: Rectangle {
+                        // Plain rows: alerts/warnings are coloured, the rest reads as normal text
+                        delegate: Text {
                             width: itemsListView.width
-                            height: 36
-                            radius: Theme.radiusSm
-                            color: Theme.bgCard
-                            border.color: Theme.border
-                            border.width: 1
-
-                            RowLayout {
-                                anchors.fill: parent
-                                anchors.leftMargin: 12
-                                anchors.rightMargin: 12
-                                spacing: 8
-
-                                Text {
-                                    text: Theme.iconCheck
-                                    font.family: Theme.iconFont
-                                    font.pixelSize: 10
-                                    color: Theme.accent
-                                }
-
-                                Text {
-                                    Layout.fillWidth: true
-                                    textFormat: Text.PlainText
-                                    text: String(modelData || "")
-                                    font.family: Theme.monoFont
-                                    font.pixelSize: 11
-                                    color: Theme.textMain
-                                    elide: Text.ElideRight
-                                }
-                            }
+                            textFormat: Text.PlainText
+                            text: String(modelData || "")
+                            font.family: Theme.monoFont
+                            font.pixelSize: 11
+                            color: root.itemColor(modelData)
+                            wrapMode: Text.WrapAnywhere
                         }
                     }
                 }

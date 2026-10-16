@@ -8,7 +8,7 @@ ShellRoot {
 
     FloatingWindow {
         id: win
-        title: "Security Sentinel - Zero-Trust Security Center & Threat Shield"
+        title: "Security Sentinel"
         implicitWidth: 1140
         implicitHeight: 740
         color: Theme.bgBase

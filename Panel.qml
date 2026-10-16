@@ -27,7 +27,7 @@ Panel {
   property bool cursorActive: false
 
   readonly property string manifestPath: Qt.resolvedUrl("manifest.json").toString().replace(/^file:\/\//, "")
-  readonly property string manifestFallbackPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.config/omarchy/plugins/ozdil.security-sentinel/manifest.json"
+  readonly property string manifestFallbackPath: Quickshell.env("HOME") ? Quickshell.env("HOME") + "/.config/omarchy/plugins/ozdil.security-sentinel/manifest.json" : ""
 
   property string pluginName: "Security Sentinel"
   property string pluginVersion: "1.3.2"
@@ -132,10 +132,54 @@ Panel {
     actionProc.running = true
   }
 
-  function refresh() {
-    if (!stateProc.running) {
-      stateProc.running = true
+  // The engine daemon keeps this report fresh (and reacts to USB hot-plug
+  // within a second); a full --json scan only runs when the cache is stale.
+  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
+  readonly property string reportCachePath: runtimeDir !== "" ? runtimeDir + "/omarchy-security-sentinel/report.json" : ""
+  readonly property int reportMaxAgeSec: 60
+
+  function applyReport(d) {
+    root.overallStatus = String(d.overall_status || "ALL SYSTEMS SECURE")
+    root.threatLevel = String(d.threat_level || "ZERO")
+    root.activeCount = Number(d.active_modules) || 9
+    root.modules = d.modules || []
+    root.aiThreatScore = Number(d.ai_threat_score) || 0
+    root.aiAnomalies = d.ai_anomalies || []
+    root.kernelCapabilities = d.kernel_capabilities || []
+  }
+
+  // Returns true when the cached report was fresh enough to use
+  function loadCachedReport(raw) {
+    try {
+      var d = JSON.parse(String(raw || "").slice(0, 131072))
+      var age = Date.now() / 1000 - Number(d.generated_at || 0)
+      if (age < 0 || age > root.reportMaxAgeSec) return false
+      root.applyReport(d)
+      return true
+    } catch(e) {
+      return false
     }
+  }
+
+  // A scan requested while one runs (e.g. right after an action) is queued,
+  // otherwise the UI would keep showing the pre-action state.
+  property bool rescanPending: false
+
+  function scanNow() {
+    if (stateProc.running) {
+      root.rescanPending = true
+      return
+    }
+    stateProc.running = true
+  }
+
+  function refresh() {
+    if (root.reportCachePath === "") {
+      root.scanNow()
+      return
+    }
+    if (!daemonProc.running) daemonProc.running = true
+    reportView.reload()
   }
 
   function kernelFreezeProcess(pid) {
@@ -162,67 +206,79 @@ Panel {
     expandedId = (expandedId === id ? "" : id)
   }
 
-  function toggleGhostMac() {
-    var mods = root.modules
+  // Switches flip immediately; if the engine exits non-zero (nmcli/omarchy-dns
+  // failure, no Wi-Fi) the previous module state is restored at once instead of
+  // showing a state the system is not in until the next scan.
+  property var toggleSnapshots: ({})
+
+  function optimisticToggle(modId, onSummary, offSummary, proc) {
+    if (proc.running) return
+    var mods = root.modules.slice()
     for (var i = 0; i < mods.length; i++) {
-      if (mods[i].id === "ghost_mac") {
-        mods[i].toggle_state = !mods[i].toggle_state
-        if (mods[i].toggle_state) {
-          mods[i].status = "SECURE"
-          mods[i].summary = "Randomized (Assigning...)"
-        } else {
-          mods[i].status = "WARNING"
-          mods[i].summary = "Hardware MAC"
-        }
+      if (mods[i].id === modId) {
+        var snaps = root.toggleSnapshots
+        snaps[modId] = mods[i]
+        root.toggleSnapshots = snaps
+        var m = Object.assign({}, mods[i])
+        m.toggle_state = !m.toggle_state
+        m.status = m.toggle_state ? "SECURE" : "WARNING"
+        m.summary = m.toggle_state ? onSummary : offSummary
+        mods[i] = m
         break
       }
     }
-    root.modules = [].concat(mods)
-    if (!toggleGhostProc.running) {
-      toggleGhostProc.running = true
+    root.modules = mods
+    proc.running = true
+  }
+
+  function finishToggle(modId, code) {
+    var snaps = root.toggleSnapshots
+    var prev = snaps[modId]
+    delete snaps[modId]
+    root.toggleSnapshots = snaps
+    if (code !== 0 && prev) {
+      var mods = root.modules.slice()
+      for (var i = 0; i < mods.length; i++) {
+        if (mods[i].id === modId) {
+          mods[i] = prev
+          break
+        }
+      }
+      root.modules = mods
     }
+    root.scanNow()
+  }
+
+  function toggleGhostMac() {
+    root.optimisticToggle("ghost_mac", "Randomized (Assigning...)", "Hardware MAC", toggleGhostProc)
   }
 
   function toggleDns() {
-    var mods = root.modules
-    for (var i = 0; i < mods.length; i++) {
-      if (mods[i].id === "dns") {
-        mods[i].toggle_state = !mods[i].toggle_state
-        if (mods[i].toggle_state) {
-          mods[i].status = "SECURE"
-          mods[i].summary = "DoT Active (Cloudflare)"
-        } else {
-          mods[i].status = "WARNING"
-          mods[i].summary = "Unencrypted ISP DNS (DHCP)"
-        }
-        break
-      }
-    }
-    root.modules = [].concat(mods)
-    if (!toggleDnsProc.running) {
-      toggleDnsProc.running = true
-    }
+    root.optimisticToggle("dns", "DoT Active (Cloudflare)", "Unencrypted ISP DNS (DHCP)", toggleDnsProc)
   }
 
   function toggleUsbArmor() {
-    var mods = root.modules
-    for (var i = 0; i < mods.length; i++) {
-      if (mods[i].id === "badusb") {
-        mods[i].toggle_state = !mods[i].toggle_state
-        if (mods[i].toggle_state) {
-          mods[i].status = "SECURE"
-          mods[i].summary = "Armor Active"
-        } else {
-          mods[i].status = "WARNING"
-          mods[i].summary = "Armor Disabled"
-        }
-        break
-      }
+    root.optimisticToggle("badusb", "Armor Active", "Armor Disabled", toggleUsbArmorProc)
+  }
+
+  // Destructive actions need a second click within a few seconds
+  property string armedAction: ""
+
+  function confirmOrArm(key, action) {
+    if (root.armedAction === key) {
+      root.armedAction = ""
+      disarmTimer.stop()
+      action()
+    } else {
+      root.armedAction = key
+      disarmTimer.restart()
     }
-    root.modules = [].concat(mods)
-    if (!toggleUsbArmorProc.running) {
-      toggleUsbArmorProc.running = true
-    }
+  }
+
+  Timer {
+    id: disarmTimer
+    interval: 4000
+    onTriggered: root.armedAction = ""
   }
 
   function trustAllUsb() {
@@ -285,7 +341,7 @@ Panel {
     function open() { root.open() }
     function close() { root.close() }
     function toggle() { root.toggle() }
-    function refresh() { root.refresh() }
+    function refresh() { root.scanNow() }
     function toggleGhostMac() { root.toggleGhostMac() }
     function toggleDns() { root.toggleDns() }
     function expand(id: string) { root.toggleExpand(id) }
@@ -310,19 +366,17 @@ Panel {
   Process {
     id: stateProc
     command: [root.resolveEnginePath(), "--json"]
+    onExited: function(code) {
+      if (root.rescanPending) {
+        root.rescanPending = false
+        root.scanNow()
+      }
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         try {
-          var clean = String(text || "").slice(0, 131072)
-          var d = JSON.parse(clean)
-          root.overallStatus = String(d.overall_status || "ALL SYSTEMS SECURE")
-          root.threatLevel = String(d.threat_level || "ZERO")
-          root.activeCount = Number(d.active_modules) || 9
-          root.modules = d.modules || []
-          root.aiThreatScore = Number(d.ai_threat_score) || 0
-          root.aiAnomalies = d.ai_anomalies || []
-          root.kernelCapabilities = d.kernel_capabilities || []
+          root.applyReport(JSON.parse(String(text || "").slice(0, 131072)))
         } catch(e) {}
       }
     }
@@ -330,11 +384,30 @@ Panel {
 
 
 
+  // Single instance per session (flock); a second panel's copy exits at once.
+  // It dies with the shell via PR_SET_PDEATHSIG.
+  Process {
+    id: daemonProc
+    command: [root.resolveEnginePath(), "--daemon"]
+  }
+
+  FileView {
+    id: reportView
+    path: root.reportCachePath
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      if (!root.loadCachedReport(text())) root.scanNow()
+    }
+    onLoadFailed: root.scanNow()
+    onFileChanged: reload()
+  }
+
   Process {
     id: toggleGhostProc
     command: [root.resolveEnginePath(), "--toggle-ghost-mac"]
     onExited: function(code) {
-      root.refresh()
+      root.finishToggle("ghost_mac", code)
     }
   }
 
@@ -342,14 +415,14 @@ Panel {
     id: toggleDnsProc
     command: [root.resolveEnginePath(), "--toggle-dns"]
     onExited: function(code) {
-      root.refresh()
+      root.finishToggle("dns", code)
     }
   }
   Process {
     id: toggleUsbArmorProc
     command: [root.resolveEnginePath(), "--toggle-usb-armor"]
     onExited: function(code) {
-      root.refresh()
+      root.finishToggle("badusb", code)
     }
   }
 
@@ -358,7 +431,7 @@ Panel {
     id: trustUsbProc
     command: [root.resolveEnginePath(), "--trust-all-usb"]
     onExited: function(code) {
-      root.refresh()
+      root.scanNow()
     }
   }
 
@@ -366,14 +439,14 @@ Panel {
     id: resetCanariesProc
     command: [root.resolveEnginePath(), "--reset-canaries"]
     onExited: function(code) {
-      root.refresh()
+      root.scanNow()
     }
   }
 
   Process {
     id: actionProc
     onExited: function(code) {
-      root.refresh()
+      root.scanNow()
       root.startNextAction()
     }
   }
@@ -389,6 +462,7 @@ Panel {
   Component.onCompleted: refresh()
   Component.onDestruction: {
     if (stateProc.running) stateProc.running = false
+    if (daemonProc.running) daemonProc.running = false
     if (toggleGhostProc.running) toggleGhostProc.running = false
     if (toggleDnsProc.running) toggleDnsProc.running = false
     if (trustUsbProc.running) trustUsbProc.running = false
@@ -440,7 +514,7 @@ Panel {
       onActivateRequested: root.activateSelected()
       onTextKey: function(t) {
         if (t === "r" || t === "R") {
-          root.refresh()
+          root.scanNow()
         } else if (t === "a" || t === "A") {
           root.showAboutModal = !root.showAboutModal
         }
@@ -540,7 +614,7 @@ Panel {
 
           Text {
             textFormat: Text.PlainText
-            text: "Threat: " + root.threatLevel + " • " + root.activeCount + " Active Subsystems (Click to inspect)"
+            text: "threat " + root.threatLevel.toLowerCase() + " · " + root.activeCount + " modules"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption - 1
@@ -556,7 +630,7 @@ Panel {
         radius: Style.cornerRadius > 0 ? Style.space(6) : 0
         color: Style.selectedFillFor(root.foreground, root.accent)
         border.color: root.accent
-        border.width: 2
+        border.width: 1
 
         RowLayout {
           anchors.centerIn: parent
@@ -604,25 +678,18 @@ Panel {
               readonly property string modId: modData ? String(modData.id || "") : ""
               readonly property string modStatus: modData ? String(modData.status || "") : ""
               readonly property var modItems: modData && modData.items ? modData.items : []
-              readonly property bool isOpSec: modId === "opsec"
               readonly property bool isToggleable: modData ? Boolean(modData.is_toggleable) : false
-              readonly property bool isBadUsbAlert: modId === "badusb" && modStatus === "ALERT"
-              readonly property bool isTripwireAlert: modId === "tripwire" && modStatus === "ALERT"
               readonly property bool isAlert: modStatus === "ALERT"
               readonly property bool isWarning: modStatus === "WARNING"
               readonly property bool isExpanded: root.expandedId === modId
 
               readonly property bool isKeyboardFocused: root.cursorActive && (index === root.selectedIndex)
 
-              color: isAlert
-                     ? Qt.rgba(0.94, 0.27, 0.27, 0.12)
-                     : (isExpanded
-                        ? Qt.darker(Color.popups.background, 0.85)
-                        : (isKeyboardFocused
-                           ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.18)
-                           : Style.selectedFillFor(root.foreground, root.accent)))
-              border.color: isAlert ? Color.urgent : (isKeyboardFocused ? root.accent : (isExpanded ? root.accent : Style.controlBorder(false, false, root.foreground, root.accent)))
-              border.width: (isAlert || isExpanded || isKeyboardFocused) ? 1 : 1
+              // Flat list: only the focused or open row gets a frame; alerts are
+              // carried by the urgent colour of the icon, summary and status text.
+              color: (isExpanded || isKeyboardFocused) ? Style.selectedFillFor(root.foreground, root.accent) : "transparent"
+              border.color: (isExpanded || isKeyboardFocused) ? root.accent : "transparent"
+              border.width: 1
 
               Column {
                 id: contentCol
@@ -643,7 +710,7 @@ Panel {
                     anchors.left: parent.left
                     anchors.top: parent.top
                     anchors.bottom: parent.bottom
-                    width: Math.max(0, parent.width - (rowDelegate.isToggleable || rowDelegate.isOpSec ? Style.space(110) : Style.space(50)))
+                    width: Math.max(0, parent.width - (rowDelegate.isToggleable ? Style.space(110) : Style.space(50)))
                     cursorShape: Qt.PointingHandCursor
                     onClicked: root.toggleExpand(rowDelegate.modId)
                   }
@@ -695,13 +762,9 @@ Panel {
                     Loader {
                       id: headerLoader
                       Layout.alignment: Qt.AlignVCenter
-                      sourceComponent: {
-                        if (rowDelegate.isToggleable) return toggleComp
-                        if (rowDelegate.isOpSec) return opsecComp
-                        if (rowDelegate.isBadUsbAlert) return badUsbComp
-                        if (rowDelegate.isTripwireAlert) return tripwireComp
-                        return badgeComp
-                      }
+                      // Actions live in the expanded row and Quick Actions; the
+                      // header only shows the switch or the verdict.
+                      sourceComponent: rowDelegate.isToggleable ? toggleComp : badgeComp
                     }
 
                     // Expand / Collapse Chevron Indicator
@@ -751,8 +814,8 @@ Panel {
 
                       Text {
                         textFormat: Text.PlainText
-                        text: "•"
-                        color: root.accent
+                        text: "·"
+                        color: root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                         Layout.alignment: Qt.AlignTop
@@ -772,7 +835,7 @@ Panel {
 
                   // Contextual In-Card Actions
                   Item {
-                    visible: rowDelegate.modId === "badusb" || rowDelegate.modId === "tripwire" || rowDelegate.modId === "opsec" || rowDelegate.modId === "ai_behavior"
+                    visible: rowDelegate.modId === "badusb" || rowDelegate.modId === "tripwire" || (rowDelegate.modId === "ai_behavior" && root.aiAnomalies.length > 0)
                     width: parent.width
                     height: (visible ? Style.space(32) : 0)
 
@@ -781,36 +844,28 @@ Panel {
                       spacing: Style.space(8)
 
                       Button {
-                        visible: rowDelegate.modId === "ai_behavior"
-                        text: "AI Behavioral Scan"
-                        iconText: "󰚩"
-                        foreground: root.foreground
-                        accent: root.accent
-                        fontFamily: root.fontFamily
-                        fontSize: Style.font.caption
-                        bordered: true
-                        onClicked: root.refresh()
-                      }
-
-                      Button {
                         visible: rowDelegate.modId === "ai_behavior" && root.aiAnomalies.length > 0
-                        text: "Kernel Freeze PID " + (root.aiAnomalies.length > 0 ? root.aiAnomalies[0].pid : "")
+                        readonly property var freezeTarget: root.aiAnomalies.length > 0 ? root.aiAnomalies[0] : null
+                        readonly property bool freezeArmed: freezeTarget !== null && root.armedAction === "freeze:" + freezeTarget.pid
+                        text: !freezeTarget ? "" : (freezeArmed
+                          ? "Confirm: freeze " + String(freezeTarget.name || "process") + " (PID " + freezeTarget.pid + ")"
+                          : "Freeze PID " + freezeTarget.pid)
                         iconText: "󰟀"
-                        foreground: Color.urgent
-                        accent: Color.urgent
+                        foreground: freezeArmed ? Color.urgent : root.foreground
+                        accent: freezeArmed ? Color.urgent : root.accent
                         fontFamily: root.fontFamily
                         fontSize: Style.font.caption
                         bordered: true
                         onClicked: {
-                          if (root.aiAnomalies.length > 0) {
-                            root.kernelFreezeProcess(root.aiAnomalies[0].pid)
-                          }
+                          if (!freezeTarget) return
+                          var pid = freezeTarget.pid
+                          root.confirmOrArm("freeze:" + pid, function() { root.kernelFreezeProcess(pid) })
                         }
                       }
 
                       Button {
                         visible: rowDelegate.modId === "badusb"
-                        text: "Trust All Connected USBs"
+                        text: "Trust connected"
                         iconText: ""
                         foreground: root.foreground
                         accent: root.accent
@@ -822,7 +877,7 @@ Panel {
 
                       Button {
                         visible: rowDelegate.modId === "tripwire"
-                        text: "Reset Honey-token SHA-256"
+                        text: "Reset canaries"
                         iconText: ""
                         foreground: root.foreground
                         accent: root.accent
@@ -830,30 +885,6 @@ Panel {
                         fontSize: Style.font.caption
                         bordered: true
                         onClicked: root.resetCanaries()
-                      }
-
-                      Button {
-                        visible: rowDelegate.modId === "opsec"
-                        text: "Pick Files..."
-                        iconText: ""
-                        foreground: root.foreground
-                        accent: root.accent
-                        fontFamily: root.fontFamily
-                        fontSize: Style.font.caption
-                        bordered: true
-                        onClicked: root.openFilePicker()
-                      }
-
-                      Button {
-                        visible: rowDelegate.modId === "opsec"
-                        text: "Scrub Downloads"
-                        iconText: ""
-                        foreground: root.foreground
-                        accent: root.accent
-                        fontFamily: root.fontFamily
-                        fontSize: Style.font.caption
-                        bordered: true
-                        onClicked: root.scrubDownloads()
                       }
                     }
                   }
@@ -879,78 +910,14 @@ Panel {
               }
 
               Component {
-                id: opsecComp
-                Button {
-                  text: "Scrub..."
-                  iconText: ""
-                  foreground: root.foreground
-                  accent: root.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  iconSize: Style.font.bodySmall
-                  horizontalPadding: Style.space(8)
-                  verticalPadding: Style.space(4)
-                  bordered: true
-                  onClicked: root.openFilePicker()
-                }
-              }
-
-              Component {
-                id: badUsbComp
-                Button {
-                  text: "Trust All"
-                  foreground: Color.urgent
-                  accent: Color.urgent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  horizontalPadding: Style.space(8)
-                  verticalPadding: Style.space(4)
-                  bordered: true
-                  onClicked: root.trustAllUsb()
-                }
-              }
-
-              Component {
-                id: tripwireComp
-                Button {
-                  text: "Reset"
-                  foreground: Color.urgent
-                  accent: Color.urgent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  horizontalPadding: Style.space(8)
-                  verticalPadding: Style.space(4)
-                  bordered: true
-                  onClicked: root.resetCanaries()
-                }
-              }
-
-              Component {
                 id: badgeComp
-                Rectangle {
-                  implicitWidth: badgeText.implicitWidth + Style.space(12)
-                  implicitHeight: badgeText.implicitHeight + Style.space(6)
-                  radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                  color: rowDelegate.modStatus === "ALERT"
-                         ? Qt.rgba(0.94, 0.27, 0.27, 0.15)
-                         : (rowDelegate.modStatus === "SECURE"
-                            ? Style.selectedFillFor(root.foreground, root.accent)
-                            : Qt.rgba(0.5, 0.5, 0.5, 0.1))
-                  border.color: rowDelegate.modStatus === "ALERT"
-                                ? Color.urgent
-                                : (rowDelegate.modStatus === "SECURE" ? root.accent : root.dim)
-                  border.width: 1
-
-                  Text {
-                    id: badgeText
-                    anchors.centerIn: parent
-                    textFormat: Text.PlainText
-                    text: rowDelegate.modStatus
-                    color: parent.border.color
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption - 1
-                    font.bold: true
-                  }
+                Text {
+                  textFormat: Text.PlainText
+                  text: rowDelegate.modStatus.toLowerCase()
+                  color: (rowDelegate.isAlert || rowDelegate.isWarning) ? Color.urgent : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: rowDelegate.isAlert
                 }
               }
             }
@@ -1007,7 +974,7 @@ Panel {
             accent: root.accent
             fontFamily: root.fontFamily
             bordered: true
-            onClicked: root.refresh()
+            onClicked: root.scanNow()
           }
         }
       }
@@ -1018,74 +985,66 @@ Panel {
       id: aboutOverlay
       anchors.fill: parent
       visible: root.showAboutModal
-      color: Qt.rgba(0.05, 0.05, 0.07, 0.96)
+      color: Qt.rgba(0, 0, 0, 0.6)
       z: 99
 
       MouseArea {
         anchors.fill: parent
-        // Block underlying clicks
+        // Block underlying clicks; clicking the dimmed area closes the dialog
+        onClicked: root.showAboutModal = false
       }
 
-      Column {
+      // Opaque card: the overlay alone let the module list show through and the
+      // header row overflowed it on narrow panels.
+      Rectangle {
+        id: aboutCard
         anchors.centerIn: parent
-        width: parent.width - Style.space(40)
+        width: parent.width - Style.space(32)
+        height: aboutColumn.implicitHeight + Style.space(32)
+        color: Color.popups.background
+        border.color: root.dim
+        border.width: 1
+
+        MouseArea {
+          anchors.fill: parent
+          // Swallow clicks so only the dimmed area outside the card closes it
+        }
+
+      Column {
+        id: aboutColumn
+        anchors.centerIn: parent
+        width: parent.width - Style.space(32)
         spacing: Style.space(12)
 
-        Row {
+        RowLayout {
           width: parent.width
           spacing: Style.space(8)
 
-          Item {
-            width: parent.width - closeAboutBtn.implicitWidth - (root.pluginVerified ? verifiedBadge.implicitWidth + Style.space(8) : 0) - Style.space(8)
-            implicitHeight: aboutTitleText.implicitHeight
-
-            Text {
-              id: aboutTitleText
-              text: root.pluginName
-              color: root.foreground
-              font.family: root.fontFamily
-              font.pixelSize: Style.font.title
-              font.bold: true
-              elide: Text.ElideRight
-              width: parent.width
-            }
+          Text {
+            id: aboutTitleText
+            Layout.fillWidth: true
+            text: root.pluginName
+            textFormat: Text.PlainText
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.title
+            font.bold: true
+            elide: Text.ElideRight
           }
 
-          Rectangle {
-            id: verifiedBadge
+          // Plain text in theme colours instead of a green pill (Omarchy style)
+          Text {
             visible: root.pluginVerified
-            width: verifiedRow.implicitWidth + Style.space(10)
-            height: verifiedRow.implicitHeight + Style.space(4)
-            radius: 4
-            color: Qt.rgba(0.13, 0.77, 0.37, 0.2)
-            border.color: "#22c55e"
-            border.width: 1
-            anchors.verticalCenter: parent.verticalCenter
-
-            Row {
-              id: verifiedRow
-              anchors.centerIn: parent
-              spacing: 4
-
-              Text {
-                text: "󰄬"
-                color: "#22c55e"
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
-
-              Text {
-                text: "VERIFIED"
-                color: "#22c55e"
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption - 2
-                font.bold: true
-              }
-            }
+            Layout.alignment: Qt.AlignVCenter
+            text: "󰄬 verified"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
           }
 
           Button {
             id: closeAboutBtn
+            Layout.alignment: Qt.AlignVCenter
             text: "✕"
             bordered: true
             foreground: root.foreground
@@ -1126,14 +1085,15 @@ Panel {
         Button {
           width: parent.width
           text: "Buy Me a Coffee"
-          iconText: "󰅖"
+          iconText: "󰅶"
           bordered: true
-          foreground: "#000000"
-          color: "#FFDD00"
+          foreground: root.foreground
+          accent: root.accent
           fontFamily: root.fontFamily
           fontSize: Style.font.caption
           onClicked: Qt.openUrlExternally("https://buymeacoffee.com/ozdil")
         }
+      }
       }
     }
     }

@@ -616,6 +616,21 @@ pub fn kernel_sever_socket(target: &str) -> InterventionResult {
 /// De-authorizes a USB device at the kernel sysfs level, instantly severing hardware communication.
 /// Writes '0' to /sys/bus/usb/devices/{bus_id}/authorized.
 pub fn kernel_deauth_usb(bus_id: &str) -> InterventionResult {
+    kernel_set_usb_authorized(bus_id, false)
+}
+
+/// Re-authorizes a USB device that USB Armor blocked, once the user trusts it.
+/// Writes '1' to /sys/bus/usb/devices/{bus_id}/authorized.
+pub fn kernel_reauth_usb(bus_id: &str) -> InterventionResult {
+    kernel_set_usb_authorized(bus_id, true)
+}
+
+fn kernel_set_usb_authorized(bus_id: &str, authorize: bool) -> InterventionResult {
+    let (action, op, value, verb) = if authorize {
+        ("kernel_reauth_usb", "reauth-usb", b"1\n", "re-authorized")
+    } else {
+        ("kernel_deauth_usb", "deauth-usb", b"0\n", "de-authorized")
+    };
     let clean_id = bus_id.trim();
 
     // Strict validation: bus_id must only consist of alphanumeric characters, hyphens, and dots.
@@ -628,7 +643,7 @@ pub fn kernel_deauth_usb(bus_id: &str) -> InterventionResult {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == ':')
     {
-        return InterventionResult::err("kernel_deauth_usb", clean_id, "Invalid USB Bus ID format");
+        return InterventionResult::err(action, clean_id, "Invalid USB Bus ID format");
     }
 
     let auth_path = format!("/sys/bus/usb/devices/{}/authorized", clean_id);
@@ -640,19 +655,19 @@ pub fn kernel_deauth_usb(bus_id: &str) -> InterventionResult {
         .open(path)
     {
         Ok(mut file) => {
-            return match file.write_all(b"0\n") {
+            return match file.write_all(value) {
                 Ok(_) => InterventionResult::ok(
-                    "kernel_deauth_usb",
+                    action,
                     clean_id,
                     &format!(
-                        "USB device {} de-authorized at kernel hardware interface",
-                        clean_id
+                        "USB device {} {} at kernel hardware interface",
+                        clean_id, verb
                     ),
                 ),
                 Err(e) => InterventionResult::err(
-                    "kernel_deauth_usb",
+                    action,
                     clean_id,
-                    &format!("Failed to write deauthorization: {}", e),
+                    &format!("Failed to write USB authorized node: {}", e),
                 ),
             };
         }
@@ -660,30 +675,25 @@ pub fn kernel_deauth_usb(bus_id: &str) -> InterventionResult {
     };
 
     if !path.exists() {
-        return InterventionResult::err(
-            "kernel_deauth_usb",
-            clean_id,
-            "USB device not found in sysfs",
-        );
+        return InterventionResult::err(action, clean_id, "USB device not found in sysfs");
     }
-    if let Some(res) = escalate_via_helper(PRIVILEGED_INTERVENTION_FLAG, &["deauth-usb", clean_id])
-    {
+    if let Some(res) = escalate_via_helper(PRIVILEGED_INTERVENTION_FLAG, &[op, clean_id]) {
         return res;
     }
     // tee writes stdin to the validated path without a shell in between
-    if legacy_pkexec(&["/usr/bin/tee", &auth_path], Some(b"0\n")) {
+    if legacy_pkexec(&["/usr/bin/tee", &auth_path], Some(value)) {
         return InterventionResult::ok(
-            "kernel_deauth_usb",
+            action,
             clean_id,
             &format!(
-                "USB device {} de-authorized at kernel hardware interface via pkexec",
-                clean_id
+                "USB device {} {} at kernel hardware interface via pkexec",
+                clean_id, verb
             ),
         );
     }
 
     InterventionResult::err(
-        "kernel_deauth_usb",
+        action,
         clean_id,
         &format!("Failed to open USB authorized sysfs node: {}", open_err),
     )
@@ -1056,6 +1066,7 @@ pub fn run_privileged_operation(flag: &str, op: &str, arg: Option<&str>) -> Inte
             None => InterventionResult::err(&action, "", "Numeric PID required"),
         },
         (PRIVILEGED_INTERVENTION_FLAG, "deauth-usb") => kernel_deauth_usb(arg.unwrap_or("")),
+        (PRIVILEGED_INTERVENTION_FLAG, "reauth-usb") => kernel_reauth_usb(arg.unwrap_or("")),
         (PRIVILEGED_INTERVENTION_FLAG, "sever-socket") => kernel_sever_socket(arg.unwrap_or("")),
         (PRIVILEGED_NETWORK_FLAG, "quarantine") => kernel_quarantine_ip(arg.unwrap_or("")),
         (PRIVILEGED_NETWORK_FLAG, "blackout-apply") => kernel_apply_network_blackout(),
