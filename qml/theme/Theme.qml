@@ -31,9 +31,10 @@ QtObject {
     property color accentWarning: "#eed49f"
     property color accentDanger: "#ed8796"
 
-    readonly property int radiusSm: 4
-    readonly property int radiusMd: 8
-    readonly property int radiusLg: 12
+    // Square corners, like the rest of Omarchy
+    readonly property int radiusSm: 0
+    readonly property int radiusMd: 0
+    readonly property int radiusLg: 0
 
     readonly property string fontFamily: "JetBrainsMono Nerd Font, JetBrains Mono, monospace"
     readonly property string monoFont: "JetBrainsMono Nerd Font, JetBrains Mono, monospace"

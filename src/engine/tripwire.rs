@@ -99,9 +99,5 @@ pub(crate) fn reset_canaries() {
     let _ = write_secure_state_file(&token_path, token_data.as_bytes());
     let hash = sha256_hex(token_data.as_bytes());
     let _ = write_secure_state_file(&hash_path, hash.as_bytes());
-    notify_desktop(
-        "Tripwire Canaries",
-        "New canary honeypot token generated and SHA-256 hash sealed.",
-        false,
-    );
+    notify_desktop("Tripwire Canaries", "New canary token created.", false);
 }

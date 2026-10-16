@@ -10,24 +10,27 @@ pub(crate) fn check_ai_behavior() -> (ModuleStatus, u32, Vec<ai::ProcessAnomaly>
         (
             Status::Alert,
             format!(
-                "CRITICAL: {} suspicious behavioral anomalies detected (Highest Threat Score: {})",
+                "{} suspicious processes (top score {})",
                 anomalies.len(),
                 max_score
             ),
-            "Immediate kernel intervention recommended (freeze process / sever active socket)."
-                .to_string(),
+            "Review the processes below; freeze one if it is not yours.".to_string(),
         )
     } else if max_score >= 40 {
         (
             Status::Warning,
-            format!("ELEVATED: {} behavioral process anomalies flagged (Score: {})", anomalies.len(), max_score),
-            "Suspicious process behavior, commandline obfuscation, or untrusted filesystem execution detected.".to_string(),
+            format!(
+                "{} processes worth a look (top score {})",
+                anomalies.len(),
+                max_score
+            ),
+            "Unusual command lines or binaries running from untrusted paths.".to_string(),
         )
     } else {
         (
             Status::Secure,
-            "Zero process anomalies or covert shell behaviors detected".to_string(),
-            "Shannon entropy, memory injection, reverse shell heuristics, and execution paths verified normal.".to_string(),
+            "No suspicious processes".to_string(),
+            "Command lines, execution paths and reverse-shell patterns look normal.".to_string(),
         )
     };
 

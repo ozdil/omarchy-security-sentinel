@@ -73,7 +73,7 @@ pub(crate) fn toggle_dns() -> Result<bool, String> {
     notify_desktop(
         "DNS Leak Guard",
         if enable {
-            "Cloudflare DNS-over-TLS (DoT 1.1.1.1) encrypted tunnel enabled."
+            "DNS-over-TLS enabled (Cloudflare)."
         } else {
             "Switched to standard ISP DNS (DHCP) mode."
         },

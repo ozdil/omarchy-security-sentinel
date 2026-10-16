@@ -614,7 +614,7 @@ Panel {
 
           Text {
             textFormat: Text.PlainText
-            text: "Threat: " + root.threatLevel + " • " + root.activeCount + " Active Subsystems (Click to inspect)"
+            text: "threat " + root.threatLevel.toLowerCase() + " · " + root.activeCount + " modules"
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption - 1
@@ -630,7 +630,7 @@ Panel {
         radius: Style.cornerRadius > 0 ? Style.space(6) : 0
         color: Style.selectedFillFor(root.foreground, root.accent)
         border.color: root.accent
-        border.width: 2
+        border.width: 1
 
         RowLayout {
           anchors.centerIn: parent
@@ -678,25 +678,18 @@ Panel {
               readonly property string modId: modData ? String(modData.id || "") : ""
               readonly property string modStatus: modData ? String(modData.status || "") : ""
               readonly property var modItems: modData && modData.items ? modData.items : []
-              readonly property bool isOpSec: modId === "opsec"
               readonly property bool isToggleable: modData ? Boolean(modData.is_toggleable) : false
-              readonly property bool isBadUsbAlert: modId === "badusb" && modStatus === "ALERT"
-              readonly property bool isTripwireAlert: modId === "tripwire" && modStatus === "ALERT"
               readonly property bool isAlert: modStatus === "ALERT"
               readonly property bool isWarning: modStatus === "WARNING"
               readonly property bool isExpanded: root.expandedId === modId
 
               readonly property bool isKeyboardFocused: root.cursorActive && (index === root.selectedIndex)
 
-              color: isAlert
-                     ? Qt.rgba(0.94, 0.27, 0.27, 0.12)
-                     : (isExpanded
-                        ? Qt.darker(Color.popups.background, 0.85)
-                        : (isKeyboardFocused
-                           ? Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.18)
-                           : Style.selectedFillFor(root.foreground, root.accent)))
-              border.color: isAlert ? Color.urgent : (isKeyboardFocused ? root.accent : (isExpanded ? root.accent : Style.controlBorder(false, false, root.foreground, root.accent)))
-              border.width: (isAlert || isExpanded || isKeyboardFocused) ? 1 : 1
+              // Flat list: only the focused or open row gets a frame; alerts are
+              // carried by the urgent colour of the icon, summary and status text.
+              color: (isExpanded || isKeyboardFocused) ? Style.selectedFillFor(root.foreground, root.accent) : "transparent"
+              border.color: (isExpanded || isKeyboardFocused) ? root.accent : "transparent"
+              border.width: 1
 
               Column {
                 id: contentCol
@@ -717,7 +710,7 @@ Panel {
                     anchors.left: parent.left
                     anchors.top: parent.top
                     anchors.bottom: parent.bottom
-                    width: Math.max(0, parent.width - (rowDelegate.isToggleable || rowDelegate.isOpSec ? Style.space(110) : Style.space(50)))
+                    width: Math.max(0, parent.width - (rowDelegate.isToggleable ? Style.space(110) : Style.space(50)))
                     cursorShape: Qt.PointingHandCursor
                     onClicked: root.toggleExpand(rowDelegate.modId)
                   }
@@ -769,13 +762,9 @@ Panel {
                     Loader {
                       id: headerLoader
                       Layout.alignment: Qt.AlignVCenter
-                      sourceComponent: {
-                        if (rowDelegate.isToggleable) return toggleComp
-                        if (rowDelegate.isOpSec) return opsecComp
-                        if (rowDelegate.isBadUsbAlert) return badUsbComp
-                        if (rowDelegate.isTripwireAlert) return tripwireComp
-                        return badgeComp
-                      }
+                      // Actions live in the expanded row and Quick Actions; the
+                      // header only shows the switch or the verdict.
+                      sourceComponent: rowDelegate.isToggleable ? toggleComp : badgeComp
                     }
 
                     // Expand / Collapse Chevron Indicator
@@ -825,8 +814,8 @@ Panel {
 
                       Text {
                         textFormat: Text.PlainText
-                        text: "•"
-                        color: root.accent
+                        text: "·"
+                        color: root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                         Layout.alignment: Qt.AlignTop
@@ -846,7 +835,7 @@ Panel {
 
                   // Contextual In-Card Actions
                   Item {
-                    visible: rowDelegate.modId === "badusb" || rowDelegate.modId === "tripwire" || rowDelegate.modId === "opsec" || rowDelegate.modId === "ai_behavior"
+                    visible: rowDelegate.modId === "badusb" || rowDelegate.modId === "tripwire" || (rowDelegate.modId === "ai_behavior" && root.aiAnomalies.length > 0)
                     width: parent.width
                     height: (visible ? Style.space(32) : 0)
 
@@ -855,27 +844,15 @@ Panel {
                       spacing: Style.space(8)
 
                       Button {
-                        visible: rowDelegate.modId === "ai_behavior"
-                        text: "AI Behavioral Scan"
-                        iconText: "󰚩"
-                        foreground: root.foreground
-                        accent: root.accent
-                        fontFamily: root.fontFamily
-                        fontSize: Style.font.caption
-                        bordered: true
-                        onClicked: root.scanNow()
-                      }
-
-                      Button {
                         visible: rowDelegate.modId === "ai_behavior" && root.aiAnomalies.length > 0
                         readonly property var freezeTarget: root.aiAnomalies.length > 0 ? root.aiAnomalies[0] : null
                         readonly property bool freezeArmed: freezeTarget !== null && root.armedAction === "freeze:" + freezeTarget.pid
                         text: !freezeTarget ? "" : (freezeArmed
                           ? "Confirm: freeze " + String(freezeTarget.name || "process") + " (PID " + freezeTarget.pid + ")"
-                          : "Kernel Freeze PID " + freezeTarget.pid)
+                          : "Freeze PID " + freezeTarget.pid)
                         iconText: "󰟀"
-                        foreground: Color.urgent
-                        accent: Color.urgent
+                        foreground: freezeArmed ? Color.urgent : root.foreground
+                        accent: freezeArmed ? Color.urgent : root.accent
                         fontFamily: root.fontFamily
                         fontSize: Style.font.caption
                         bordered: true
@@ -888,7 +865,7 @@ Panel {
 
                       Button {
                         visible: rowDelegate.modId === "badusb"
-                        text: "Trust All Connected USBs"
+                        text: "Trust connected"
                         iconText: ""
                         foreground: root.foreground
                         accent: root.accent
@@ -900,7 +877,7 @@ Panel {
 
                       Button {
                         visible: rowDelegate.modId === "tripwire"
-                        text: "Reset Honey-token SHA-256"
+                        text: "Reset canaries"
                         iconText: ""
                         foreground: root.foreground
                         accent: root.accent
@@ -908,30 +885,6 @@ Panel {
                         fontSize: Style.font.caption
                         bordered: true
                         onClicked: root.resetCanaries()
-                      }
-
-                      Button {
-                        visible: rowDelegate.modId === "opsec"
-                        text: "Pick Files..."
-                        iconText: ""
-                        foreground: root.foreground
-                        accent: root.accent
-                        fontFamily: root.fontFamily
-                        fontSize: Style.font.caption
-                        bordered: true
-                        onClicked: root.openFilePicker()
-                      }
-
-                      Button {
-                        visible: rowDelegate.modId === "opsec"
-                        text: "Scrub Downloads"
-                        iconText: ""
-                        foreground: root.foreground
-                        accent: root.accent
-                        fontFamily: root.fontFamily
-                        fontSize: Style.font.caption
-                        bordered: true
-                        onClicked: root.scrubDownloads()
                       }
                     }
                   }
@@ -957,78 +910,14 @@ Panel {
               }
 
               Component {
-                id: opsecComp
-                Button {
-                  text: "Scrub..."
-                  iconText: ""
-                  foreground: root.foreground
-                  accent: root.accent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  iconSize: Style.font.bodySmall
-                  horizontalPadding: Style.space(8)
-                  verticalPadding: Style.space(4)
-                  bordered: true
-                  onClicked: root.openFilePicker()
-                }
-              }
-
-              Component {
-                id: badUsbComp
-                Button {
-                  text: "Trust All"
-                  foreground: Color.urgent
-                  accent: Color.urgent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  horizontalPadding: Style.space(8)
-                  verticalPadding: Style.space(4)
-                  bordered: true
-                  onClicked: root.trustAllUsb()
-                }
-              }
-
-              Component {
-                id: tripwireComp
-                Button {
-                  text: "Reset"
-                  foreground: Color.urgent
-                  accent: Color.urgent
-                  fontFamily: root.fontFamily
-                  fontSize: Style.font.caption
-                  horizontalPadding: Style.space(8)
-                  verticalPadding: Style.space(4)
-                  bordered: true
-                  onClicked: root.resetCanaries()
-                }
-              }
-
-              Component {
                 id: badgeComp
-                Rectangle {
-                  implicitWidth: badgeText.implicitWidth + Style.space(12)
-                  implicitHeight: badgeText.implicitHeight + Style.space(6)
-                  radius: Style.cornerRadius > 0 ? Style.space(4) : 0
-                  color: rowDelegate.modStatus === "ALERT"
-                         ? Qt.rgba(0.94, 0.27, 0.27, 0.15)
-                         : (rowDelegate.modStatus === "SECURE"
-                            ? Style.selectedFillFor(root.foreground, root.accent)
-                            : Qt.rgba(0.5, 0.5, 0.5, 0.1))
-                  border.color: rowDelegate.modStatus === "ALERT"
-                                ? Color.urgent
-                                : (rowDelegate.modStatus === "SECURE" ? root.accent : root.dim)
-                  border.width: 1
-
-                  Text {
-                    id: badgeText
-                    anchors.centerIn: parent
-                    textFormat: Text.PlainText
-                    text: rowDelegate.modStatus
-                    color: parent.border.color
-                    font.family: root.fontFamily
-                    font.pixelSize: Style.font.caption - 1
-                    font.bold: true
-                  }
+                Text {
+                  textFormat: Text.PlainText
+                  text: rowDelegate.modStatus.toLowerCase()
+                  color: (rowDelegate.isAlert || rowDelegate.isWarning) ? Color.urgent : root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: rowDelegate.isAlert
                 }
               }
             }

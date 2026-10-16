@@ -177,10 +177,7 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
         for b_id in &deauth_targets {
             let _ = kernel::kernel_deauth_usb(b_id);
         }
-        items.push(
-            "[ARMOR ENGAGED] Unauthorized USB hardware de-authorized at kernel interface"
-                .to_string(),
-        );
+        items.push("USB Armor: untrusted devices were de-authorized".to_string());
     }
 
     let legacy_left = store.devices.iter().filter(|d| d.is_legacy()).count();
@@ -224,22 +221,18 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
         status,
         summary: if untrusted_count > 0 {
             if armor_active {
-                format!(
-                    "[AUTO-BLOCKED] {} Untrusted USB Deauthorized",
-                    untrusted_count
-                )
+                format!("{} untrusted, blocked", untrusted_count)
             } else {
-                format!("[ALERT] {} UNTRUSTED USB DETECTED", untrusted_count)
+                format!("{} untrusted device(s)", untrusted_count)
             }
         } else {
-            format!("{} Devices ({} Trusted HID)", total_usb, hid_count)
+            format!("{} devices, {} HID, all trusted", total_usb, hid_count)
         },
         detail: if untrusted_count > 0 {
             if armor_active {
-                "Military USB Armor active: Unauthorized USB hardware automatically severed."
-                    .to_string()
+                "USB Armor blocked the untrusted devices. Trust them if they are yours.".to_string()
             } else {
-                "Unauthorized USB device attached! Click 'Trust Devices' or toggle 'USB Armor' to auto-quarantine.".to_string()
+                "Untrusted USB device attached. Trust it if it is yours, or turn on USB Armor to block it.".to_string()
             }
         } else {
             "All attached devices match their approved fingerprint (ID, serial, interface classes)"
