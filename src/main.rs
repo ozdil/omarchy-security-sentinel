@@ -451,14 +451,15 @@ fn is_usb_armor_enabled() -> bool {
     get_state_dir().join("usb_armor.enabled").exists()
 }
 
-fn toggle_usb_armor() -> bool {
+fn toggle_usb_armor() -> Result<bool, String> {
     let flag = get_state_dir().join("usb_armor.enabled");
     if flag.exists() {
-        let _ = fs::remove_file(&flag);
-        false
+        fs::remove_file(&flag).map_err(|e| format!("Cannot disable USB Armor: {}", e))?;
+        Ok(false)
     } else {
-        let _ = write_secure_state_file(&flag, b"1");
-        true
+        write_secure_state_file(&flag, b"1")
+            .map_err(|e| format!("Cannot enable USB Armor: {}", e))?;
+        Ok(true)
     }
 }
 
@@ -1599,132 +1600,112 @@ fn dirs_downloads() -> PathBuf {
     Path::new(&home).join("Downloads")
 }
 
-fn toggle_ghost_mac() -> bool {
+/// Runs a short configuration command and reports whether it exited 0
+fn run_ok(program: &str, args: &[&str], timeout: Duration) -> bool {
+    matches!(
+        run_cmd_bounded_status(program, args, &[], Instant::now() + timeout, 4096),
+        Some((0, _))
+    )
+}
+
+/// Toggles Wi-Fi MAC randomization on the active wireless connection.
+/// Returns the new state, or an error the UI uses to roll back its optimistic switch.
+fn toggle_ghost_mac() -> Result<bool, String> {
     let deadline = Instant::now() + Duration::from_millis(1500);
-    if let Some(out) = run_cmd_bounded(
+    let out = run_cmd_bounded(
         "nmcli",
         &["-t", "-f", "NAME,TYPE", "connection", "show", "--active"],
         &[],
         deadline,
         8192,
-    ) {
-        let text = String::from_utf8_lossy(&out);
-        for line in text.lines() {
-            let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() >= 2 && parts[1] == "802-11-wireless" {
-                let conn = parts[0];
-                let sub_deadline = Instant::now() + Duration::from_millis(1500);
-                let current_cloned = if let Some(c_out) = run_cmd_bounded(
-                    "nmcli",
-                    &[
-                        "-t",
-                        "-f",
-                        "802-11-wireless.cloned-mac-address",
-                        "connection",
-                        "show",
-                        conn,
-                    ],
-                    &[],
-                    sub_deadline,
-                    4096,
-                ) {
-                    String::from_utf8_lossy(&c_out).trim().to_string()
-                } else {
-                    String::new()
-                };
+    )
+    .ok_or("nmcli is unavailable or NetworkManager is not running")?;
+    let text = String::from_utf8_lossy(&out);
+    // nmcli -t escapes ':' inside names as '\:'; the type is always the last field
+    let conn = text
+        .lines()
+        .find_map(|line| {
+            let (name, ty) = line.rsplit_once(':')?;
+            (ty == "802-11-wireless").then(|| name.replace("\\:", ":"))
+        })
+        .ok_or("No active Wi-Fi connection to randomize")?;
 
-                if current_cloned.contains("random") {
-                    let mod_deadline = Instant::now() + Duration::from_millis(2000);
-                    let _ = run_cmd_bounded(
-                        "nmcli",
-                        &[
-                            "connection",
-                            "modify",
-                            conn,
-                            "802-11-wireless.cloned-mac-address",
-                            "permanent",
-                        ],
-                        &[],
-                        mod_deadline,
-                        4096,
-                    );
-                    let up_deadline = Instant::now() + Duration::from_millis(3000);
-                    let _ = run_cmd_bounded(
-                        "nmcli",
-                        &["connection", "up", conn],
-                        &[],
-                        up_deadline,
-                        4096,
-                    );
-                    notify_desktop(
-                        "Ghost MAC",
-                        "Reverted to Wi-Fi hardware (original) MAC address.",
-                        false,
-                    );
-                    return false;
-                } else {
-                    let mod_deadline = Instant::now() + Duration::from_millis(2000);
-                    let _ = run_cmd_bounded(
-                        "nmcli",
-                        &[
-                            "connection",
-                            "modify",
-                            conn,
-                            "802-11-wireless.cloned-mac-address",
-                            "random",
-                        ],
-                        &[],
-                        mod_deadline,
-                        4096,
-                    );
-                    let up_deadline = Instant::now() + Duration::from_millis(3000);
-                    let _ = run_cmd_bounded(
-                        "nmcli",
-                        &["connection", "up", conn],
-                        &[],
-                        up_deadline,
-                        4096,
-                    );
-                    notify_desktop(
-                        "Ghost MAC",
-                        "Wi-Fi MAC randomization enabled (random MAC per connection).",
-                        false,
-                    );
-                    return true;
-                }
-            }
-        }
+    let current_cloned = run_cmd_bounded(
+        "nmcli",
+        &[
+            "-t",
+            "-f",
+            "802-11-wireless.cloned-mac-address",
+            "connection",
+            "show",
+            &conn,
+        ],
+        &[],
+        Instant::now() + Duration::from_millis(1500),
+        4096,
+    )
+    .map(|o| String::from_utf8_lossy(&o).trim().to_string())
+    .unwrap_or_default();
+    let enable = !current_cloned.contains("random");
+    let value = if enable { "random" } else { "permanent" };
+
+    if !run_ok(
+        "nmcli",
+        &[
+            "connection",
+            "modify",
+            &conn,
+            "802-11-wireless.cloned-mac-address",
+            value,
+        ],
+        Duration::from_secs(3),
+    ) {
+        return Err(format!(
+            "nmcli could not change the MAC setting of '{}'",
+            conn
+        ));
     }
-    false
+    // Reconnecting applies the new MAC; Wi-Fi association can take several seconds
+    let reapplied = run_ok(
+        "nmcli",
+        &["connection", "up", &conn],
+        Duration::from_secs(15),
+    );
+    let what = if enable {
+        "Wi-Fi MAC randomization enabled (random MAC per connection)."
+    } else {
+        "Reverted to Wi-Fi hardware (original) MAC address."
+    };
+    let body = if reapplied {
+        what.to_string()
+    } else {
+        format!("{} It takes effect on the next reconnect.", what)
+    };
+    notify_desktop("Ghost MAC", &body, false);
+    Ok(enable)
 }
 
-fn toggle_dns() -> bool {
+fn toggle_dns() -> Result<bool, String> {
     let deadline = Instant::now() + Duration::from_millis(1500);
-    let current = if let Some(out) = run_cmd_bounded("omarchy-dns", &[], &[], deadline, 4096) {
-        String::from_utf8_lossy(&out).trim().to_string()
-    } else {
-        String::new()
-    };
+    let current = run_cmd_bounded("omarchy-dns", &[], &[], deadline, 4096)
+        .map(|o| String::from_utf8_lossy(&o).trim().to_string())
+        .ok_or("omarchy-dns is not available")?;
 
-    if current == "Cloudflare" || current == "Google" {
-        let deadline = Instant::now() + Duration::from_millis(2000);
-        let _ = run_cmd_bounded("omarchy-dns", &["DHCP"], &[], deadline, 4096);
-        notify_desktop(
-            "DNS Leak Guard",
-            "Switched to standard ISP DNS (DHCP) mode.",
-            false,
-        );
-        false
-    } else {
-        let deadline = Instant::now() + Duration::from_millis(2000);
-        let _ = run_cmd_bounded("omarchy-dns", &["Cloudflare"], &[], deadline, 4096);
-        notify_desktop(
-            "DNS Leak Guard",
-            "Cloudflare DNS-over-TLS (DoT 1.1.1.1) encrypted tunnel enabled.",
-            false,
-        );
-        true
+    let enable = !(current == "Cloudflare" || current == "Google");
+    let target = if enable { "Cloudflare" } else { "DHCP" };
+    if !run_ok("omarchy-dns", &[target], Duration::from_secs(5)) {
+        return Err(format!("omarchy-dns {} failed", target));
     }
+    notify_desktop(
+        "DNS Leak Guard",
+        if enable {
+            "Cloudflare DNS-over-TLS (DoT 1.1.1.1) encrypted tunnel enabled."
+        } else {
+            "Switched to standard ISP DNS (DHCP) mode."
+        },
+        false,
+    );
+    Ok(enable)
 }
 
 fn trust_all_usb() -> usize {
@@ -1895,6 +1876,22 @@ fn assemble_report(badusb_mod: ModuleStatus, self_integrity_hash: String) -> Sen
         modules,
         timestamp: "Live Defense".to_string(),
         generated_at: unix_now(),
+    }
+}
+
+/// Prints the new state; on failure notifies, prints the error and exits 1 so the
+/// UI can roll back the switch it flipped optimistically.
+fn exit_with_toggle_result(res: Result<bool, String>) -> ! {
+    match res {
+        Ok(state) => {
+            println!("{}", if state { "ENABLED" } else { "DISABLED" });
+            std::process::exit(0)
+        }
+        Err(e) => {
+            notify_desktop("Security Sentinel", &e, false);
+            eprintln!("{}", e);
+            std::process::exit(1)
+        }
     }
 }
 
@@ -2165,9 +2162,7 @@ fn main() {
     }
 
     if matches!(cmd, "--toggle-usb-armor") {
-        let state = toggle_usb_armor();
-        println!("{}", if state { "ENABLED" } else { "DISABLED" });
-        return;
+        exit_with_toggle_result(toggle_usb_armor());
     }
 
     // AI audit subcommand
@@ -2265,15 +2260,11 @@ fn main() {
     }
 
     if matches!(cmd, "--toggle-ghost-mac") {
-        let state = toggle_ghost_mac();
-        println!("{}", if state { "ENABLED" } else { "DISABLED" });
-        return;
+        exit_with_toggle_result(toggle_ghost_mac());
     }
 
     if matches!(cmd, "--toggle-dns" | "--toggle-dot") {
-        let state = toggle_dns();
-        println!("{}", if state { "ENABLED" } else { "DISABLED" });
-        return;
+        exit_with_toggle_result(toggle_dns());
     }
 
     if matches!(cmd, "--trust-all-usb") {

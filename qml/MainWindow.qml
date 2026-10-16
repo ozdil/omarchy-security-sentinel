@@ -72,6 +72,26 @@ Item {
         }
     }
 
+    // Destructive actions (blackout, freeze, kill) need a second click within a few seconds
+    property string armedAction: ""
+
+    function confirmOrArm(key, action) {
+        if (root.armedAction === key) {
+            root.armedAction = "";
+            disarmTimer.stop();
+            action();
+        } else {
+            root.armedAction = key;
+            disarmTimer.restart();
+        }
+    }
+
+    Timer {
+        id: disarmTimer
+        interval: 4000
+        onTriggered: root.armedAction = ""
+    }
+
     function toggleBlackout() {
         root.runAction([root.enginePath, root.networkBlackoutActive ? "--resume-network" : "--panic-blackout"]);
     }
@@ -267,7 +287,7 @@ Item {
                         }
 
                         Text {
-                            text: root.networkBlackoutActive ? "RESUME NETWORK" : "PANIC BLACKOUT"
+                            text: root.networkBlackoutActive ? "RESUME NETWORK" : (root.armedAction === "blackout" ? "CONFIRM: CUT ALL NETWORK" : "PANIC BLACKOUT")
                             font.family: Theme.fontFamily
                             font.pixelSize: 11
                             font.bold: true
@@ -280,7 +300,11 @@ Item {
                         anchors.fill: parent
                         hoverEnabled: true
                         cursorShape: Qt.PointingHandCursor
-                        onClicked: root.toggleBlackout()
+                        onClicked: {
+                            // Resuming is always safe; cutting the network asks first
+                            if (root.networkBlackoutActive) root.toggleBlackout();
+                            else root.confirmOrArm("blackout", root.toggleBlackout);
+                        }
                     }
                 }
 
@@ -712,14 +736,18 @@ Item {
                                             anchors.centerIn: parent
                                             spacing: 4
                                             Text { text: Theme.iconSnowflake; font.family: Theme.iconFont; font.pixelSize: 10; color: Theme.accent }
-                                            Text { id: freezeText; text: "Freeze"; font.family: Theme.fontFamily; font.pixelSize: 10; color: Theme.textMain }
+                                            Text { id: freezeText; text: root.armedAction === "freeze:" + modelData.pid ? "Confirm freeze?" : "Freeze"; font.family: Theme.fontFamily; font.pixelSize: 10; color: Theme.textMain }
                                         }
 
                                         MouseArea {
                                             id: freezeArea
                                             anchors.fill: parent
+                                            hoverEnabled: true
                                             cursorShape: Qt.PointingHandCursor
-                                            onClicked: root.freezePid(modelData.pid)
+                                            onClicked: {
+                                                var pid = modelData.pid;
+                                                root.confirmOrArm("freeze:" + pid, function() { root.freezePid(pid); });
+                                            }
                                         }
                                     }
 
@@ -736,14 +764,18 @@ Item {
                                             anchors.centerIn: parent
                                             spacing: 4
                                             Text { text: Theme.iconTrash; font.family: Theme.iconFont; font.pixelSize: 10; color: Theme.accentDanger }
-                                            Text { id: termText; text: "Kill"; font.family: Theme.fontFamily; font.pixelSize: 10; color: Theme.accentDanger }
+                                            Text { id: termText; text: root.armedAction === "kill:" + modelData.pid ? "Confirm kill?" : "Kill"; font.family: Theme.fontFamily; font.pixelSize: 10; color: Theme.accentDanger }
                                         }
 
                                         MouseArea {
                                             id: termArea
                                             anchors.fill: parent
+                                            hoverEnabled: true
                                             cursorShape: Qt.PointingHandCursor
-                                            onClicked: root.terminatePid(modelData.pid)
+                                            onClicked: {
+                                                var pid = modelData.pid;
+                                                root.confirmOrArm("kill:" + pid, function() { root.terminatePid(pid); });
+                                            }
                                         }
                                     }
                                 }

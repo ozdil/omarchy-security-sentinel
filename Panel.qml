@@ -27,7 +27,7 @@ Panel {
   property bool cursorActive: false
 
   readonly property string manifestPath: Qt.resolvedUrl("manifest.json").toString().replace(/^file:\/\//, "")
-  readonly property string manifestFallbackPath: (Quickshell.env("HOME") || "/home/ozdil") + "/.config/omarchy/plugins/ozdil.security-sentinel/manifest.json"
+  readonly property string manifestFallbackPath: Quickshell.env("HOME") ? Quickshell.env("HOME") + "/.config/omarchy/plugins/ozdil.security-sentinel/manifest.json" : ""
 
   property string pluginName: "Security Sentinel"
   property string pluginVersion: "1.3.2"
@@ -206,67 +206,79 @@ Panel {
     expandedId = (expandedId === id ? "" : id)
   }
 
-  function toggleGhostMac() {
-    var mods = root.modules
+  // Switches flip immediately; if the engine exits non-zero (nmcli/omarchy-dns
+  // failure, no Wi-Fi) the previous module state is restored at once instead of
+  // showing a state the system is not in until the next scan.
+  property var toggleSnapshots: ({})
+
+  function optimisticToggle(modId, onSummary, offSummary, proc) {
+    if (proc.running) return
+    var mods = root.modules.slice()
     for (var i = 0; i < mods.length; i++) {
-      if (mods[i].id === "ghost_mac") {
-        mods[i].toggle_state = !mods[i].toggle_state
-        if (mods[i].toggle_state) {
-          mods[i].status = "SECURE"
-          mods[i].summary = "Randomized (Assigning...)"
-        } else {
-          mods[i].status = "WARNING"
-          mods[i].summary = "Hardware MAC"
-        }
+      if (mods[i].id === modId) {
+        var snaps = root.toggleSnapshots
+        snaps[modId] = mods[i]
+        root.toggleSnapshots = snaps
+        var m = Object.assign({}, mods[i])
+        m.toggle_state = !m.toggle_state
+        m.status = m.toggle_state ? "SECURE" : "WARNING"
+        m.summary = m.toggle_state ? onSummary : offSummary
+        mods[i] = m
         break
       }
     }
-    root.modules = [].concat(mods)
-    if (!toggleGhostProc.running) {
-      toggleGhostProc.running = true
+    root.modules = mods
+    proc.running = true
+  }
+
+  function finishToggle(modId, code) {
+    var snaps = root.toggleSnapshots
+    var prev = snaps[modId]
+    delete snaps[modId]
+    root.toggleSnapshots = snaps
+    if (code !== 0 && prev) {
+      var mods = root.modules.slice()
+      for (var i = 0; i < mods.length; i++) {
+        if (mods[i].id === modId) {
+          mods[i] = prev
+          break
+        }
+      }
+      root.modules = mods
     }
+    root.scanNow()
+  }
+
+  function toggleGhostMac() {
+    root.optimisticToggle("ghost_mac", "Randomized (Assigning...)", "Hardware MAC", toggleGhostProc)
   }
 
   function toggleDns() {
-    var mods = root.modules
-    for (var i = 0; i < mods.length; i++) {
-      if (mods[i].id === "dns") {
-        mods[i].toggle_state = !mods[i].toggle_state
-        if (mods[i].toggle_state) {
-          mods[i].status = "SECURE"
-          mods[i].summary = "DoT Active (Cloudflare)"
-        } else {
-          mods[i].status = "WARNING"
-          mods[i].summary = "Unencrypted ISP DNS (DHCP)"
-        }
-        break
-      }
-    }
-    root.modules = [].concat(mods)
-    if (!toggleDnsProc.running) {
-      toggleDnsProc.running = true
-    }
+    root.optimisticToggle("dns", "DoT Active (Cloudflare)", "Unencrypted ISP DNS (DHCP)", toggleDnsProc)
   }
 
   function toggleUsbArmor() {
-    var mods = root.modules
-    for (var i = 0; i < mods.length; i++) {
-      if (mods[i].id === "badusb") {
-        mods[i].toggle_state = !mods[i].toggle_state
-        if (mods[i].toggle_state) {
-          mods[i].status = "SECURE"
-          mods[i].summary = "Armor Active"
-        } else {
-          mods[i].status = "WARNING"
-          mods[i].summary = "Armor Disabled"
-        }
-        break
-      }
+    root.optimisticToggle("badusb", "Armor Active", "Armor Disabled", toggleUsbArmorProc)
+  }
+
+  // Destructive actions need a second click within a few seconds
+  property string armedAction: ""
+
+  function confirmOrArm(key, action) {
+    if (root.armedAction === key) {
+      root.armedAction = ""
+      disarmTimer.stop()
+      action()
+    } else {
+      root.armedAction = key
+      disarmTimer.restart()
     }
-    root.modules = [].concat(mods)
-    if (!toggleUsbArmorProc.running) {
-      toggleUsbArmorProc.running = true
-    }
+  }
+
+  Timer {
+    id: disarmTimer
+    interval: 4000
+    onTriggered: root.armedAction = ""
   }
 
   function trustAllUsb() {
@@ -395,7 +407,7 @@ Panel {
     id: toggleGhostProc
     command: [root.resolveEnginePath(), "--toggle-ghost-mac"]
     onExited: function(code) {
-      root.scanNow()
+      root.finishToggle("ghost_mac", code)
     }
   }
 
@@ -403,14 +415,14 @@ Panel {
     id: toggleDnsProc
     command: [root.resolveEnginePath(), "--toggle-dns"]
     onExited: function(code) {
-      root.scanNow()
+      root.finishToggle("dns", code)
     }
   }
   Process {
     id: toggleUsbArmorProc
     command: [root.resolveEnginePath(), "--toggle-usb-armor"]
     onExited: function(code) {
-      root.scanNow()
+      root.finishToggle("badusb", code)
     }
   }
 
@@ -856,7 +868,11 @@ Panel {
 
                       Button {
                         visible: rowDelegate.modId === "ai_behavior" && root.aiAnomalies.length > 0
-                        text: "Kernel Freeze PID " + (root.aiAnomalies.length > 0 ? root.aiAnomalies[0].pid : "")
+                        readonly property var freezeTarget: root.aiAnomalies.length > 0 ? root.aiAnomalies[0] : null
+                        readonly property bool freezeArmed: freezeTarget !== null && root.armedAction === "freeze:" + freezeTarget.pid
+                        text: !freezeTarget ? "" : (freezeArmed
+                          ? "Confirm: freeze " + String(freezeTarget.name || "process") + " (PID " + freezeTarget.pid + ")"
+                          : "Kernel Freeze PID " + freezeTarget.pid)
                         iconText: "󰟀"
                         foreground: Color.urgent
                         accent: Color.urgent
@@ -864,9 +880,9 @@ Panel {
                         fontSize: Style.font.caption
                         bordered: true
                         onClicked: {
-                          if (root.aiAnomalies.length > 0) {
-                            root.kernelFreezeProcess(root.aiAnomalies[0].pid)
-                          }
+                          if (!freezeTarget) return
+                          var pid = freezeTarget.pid
+                          root.confirmOrArm("freeze:" + pid, function() { root.kernelFreezeProcess(pid) })
                         }
                       }
 
