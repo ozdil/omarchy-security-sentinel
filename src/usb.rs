@@ -133,8 +133,16 @@ impl TrustStore {
     /// Parses v2 files and legacy v1 `["vid:pid", ...]` arrays. Returns `None` for
     /// anything else, which callers must treat as a corrupt baseline.
     pub fn parse(bytes: &[u8]) -> Option<Self> {
-        if let Ok(store) = serde_json::from_slice::<TrustStore>(bytes) {
+        if let Ok(mut store) = serde_json::from_slice::<TrustStore>(bytes) {
             if store.version == TRUST_STORE_VERSION {
+                // A configured device always has at least one interface. An empty set
+                // was recorded from a blocked device by older releases and would never
+                // match the real one, so treat it as unknown and re-learn it.
+                for d in &mut store.devices {
+                    if d.interfaces.as_ref().is_some_and(|ifs| ifs.is_empty()) {
+                        d.interfaces = None;
+                    }
+                }
                 return Some(store);
             }
             return None;
@@ -388,6 +396,18 @@ mod tests {
         };
         let round = TrustStore::parse(&v2.to_json().unwrap()).unwrap();
         assert_eq!(round, v2);
+
+        // Empty interface sets recorded from blocked devices load as unknown
+        let poisoned = TrustStore::parse(
+            br#"{"version":2,"devices":[{"vid":"046d","pid":"c34a","serial":null,"interfaces":[],"product":null}]}"#,
+        )
+        .unwrap();
+        assert!(poisoned.devices[0].is_legacy());
+        let mut healed = poisoned.clone();
+        let keyboard = fp("046d", "c34a", None, &["03:01:01", "03:00:00"]);
+        assert_eq!(healed.verdict(&keyboard), TrustVerdict::Trusted);
+        assert!(healed.upgrade_legacy(&[&keyboard]));
+        assert_eq!(healed.devices, vec![keyboard]);
 
         assert!(TrustStore::parse(b"not json").is_none());
         assert!(TrustStore::parse(br#"["no-colon"]"#).is_none());
