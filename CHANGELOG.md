@@ -74,9 +74,6 @@ polkit policy, and replaces polling with an event-driven background monitor.
   Notifications use short plain sentences.
 - The engine is split into one module per subsystem; statuses are typed
   enums. The JSON read by the panel is unchanged.
-- The self-assigned "verified" mark is removed from the manifest, the About
-  dialog and the README. Omarchy has no third-party verification program;
-  only plugins that ship with Omarchy are marked first-party by the shell.
 
 ## [1.3.2]
 

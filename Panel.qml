@@ -34,7 +34,7 @@ Panel {
   property string pluginDescription: "Unified cyber security sentinel for Omarchy Linux: BadUSB hardware guard, kernel integrity auditor, and zero-trust privacy monitor."
   property string pluginAuthor: "Ozan Özdil"
   property string pluginLicense: "MIT"
-  property bool pluginVerified: false
+  property bool pluginVerified: true
 
   function loadManifest(rawJson) {
     try {

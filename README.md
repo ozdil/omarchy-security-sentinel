@@ -1,5 +1,6 @@
 # Security Sentinel Hub - Unified Cyber Defense and Privacy Sentinel for Omarchy Linux
 
+[![Omarchy Verified Plugin](https://img.shields.io/badge/Omarchy-Verified_Plugin-22c55e?style=for-the-badge)](https://github.com/omacom/omarchy-plugin-marketplace/issues/9531)
 [![Version](https://img.shields.io/github/v/release/ozdil/omarchy-security-sentinel?style=for-the-badge)](https://github.com/ozdil/omarchy-security-sentinel/releases)
 [![CI](https://img.shields.io/github/actions/workflow/status/ozdil/omarchy-security-sentinel/rust.yml?branch=master&style=for-the-badge&label=CI)](https://github.com/ozdil/omarchy-security-sentinel/actions/workflows/rust.yml)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-Support_Development-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ozdil)
