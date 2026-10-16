@@ -183,7 +183,11 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
 
     // The first baseline waits until no device is mid-enumeration; saving it early
     // would leave that device out and flag it as unapproved from then on.
-    let first_run_ready = !file_existed && !baseline_corrupt && !pending_enumeration;
+    // A blocked device (or hub, hiding everything behind it) cannot be fingerprinted
+    // either, so the first baseline also waits until nothing is de-authorized.
+    let any_blocked = devices.iter().any(|(_, path, _)| is_deauthorized(path));
+    let first_run_ready =
+        !file_existed && !baseline_corrupt && !pending_enumeration && !any_blocked;
     if (store_changed && file_existed) || first_run_ready {
         save_trusted_usb(&trusted_file, &store);
     }
@@ -357,39 +361,65 @@ fn save_deauth_declined(keys: &[String]) {
     let _ = write_secure_state_file(&deauth_declined_path(), keys.join("\n").as_bytes());
 }
 
+fn is_deauthorized(path: &Path) -> bool {
+    read_file_bounded(&path.join("authorized"), 16).is_ok_and(|a| a.trim() == "0")
+}
+
 pub(crate) fn trust_all_usb() -> usize {
-    let devices = connected_usb_devices();
-    let trusted_file = get_state_dir().join("trusted_usb.json");
-    // Merge with the existing baseline so devices that are approved but currently
-    // unplugged are not silently dropped. A corrupt baseline is rebuilt from scratch.
-    let mut store = load_trusted_usb(&trusted_file).unwrap_or_default();
-    let mut added = 0;
-    let mut blocked_ids = Vec::new();
-    for (bus_id, path, fp) in &devices {
-        // A device de-authorized by Armor has no active configuration, so its
-        // interfaces read as unknown (None) and the entry is completed the next
-        // time it is seen authorized. Only skip devices still enumerating.
-        let blocked = read_file_bounded(&path.join("authorized"), 16)
-            .map(|a| a.trim() == "0")
-            .unwrap_or(false);
-        if !blocked && usb::is_enumerating(path) {
-            continue;
-        }
-        if store.trust(fp) {
-            added += 1;
-        }
-        if blocked {
-            blocked_ids.push(bus_id.clone());
-        }
-    }
-    save_trusted_usb(&trusted_file, &store);
-    // Trusting a device Armor blocked must also give it back: until it is
-    // re-authorized it stays dead, and unplugging it is the only other way out.
+    // Give back every device Armor blocked first. A blocked device has no active
+    // configuration (its interfaces are unknown), and a blocked hub hides every
+    // device behind it, so trusting before re-authorizing would record an
+    // incomplete baseline that Armor then enforces against the user's own
+    // keyboard and mouse.
+    let blocked_ids: Vec<String> = connected_usb_devices()
+        .into_iter()
+        .filter(|(_, path, _)| is_deauthorized(path))
+        .map(|(bus_id, _, _)| bus_id)
+        .collect();
     let restored = blocked_ids
         .iter()
         .filter(|b| kernel::kernel_reauth_usb(b).success)
         .count();
     let failed = blocked_ids.len() - restored;
+    if restored > 0 {
+        // Wait for re-authorized devices (and those behind re-enabled hubs) to
+        // finish enumerating, so their full fingerprints are what gets trusted.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        std::thread::sleep(Duration::from_millis(500));
+        while Instant::now() < deadline
+            && connected_usb_devices()
+                .iter()
+                .any(|(_, path, _)| !is_deauthorized(path) && usb::is_enumerating(path))
+        {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    let devices = connected_usb_devices();
+    let trusted_file = get_state_dir().join("trusted_usb.json");
+    // Merge with the existing baseline so devices that are approved but currently
+    // unplugged are not silently dropped. A corrupt baseline is rebuilt from scratch.
+    let mut store = load_trusted_usb(&trusted_file).unwrap_or_default();
+    let settled: Vec<&UsbFingerprint> = devices
+        .iter()
+        .filter(|(_, path, _)| !usb::is_enumerating(path))
+        .map(|(_, _, fp)| fp)
+        .collect();
+    let mut added = usize::from(store.upgrade_legacy(&settled));
+    for (_, path, fp) in &devices {
+        // A device still blocked (re-authorization cancelled) is trusted with its
+        // interfaces unknown; the entry is completed the next time it is seen
+        // authorized. Only skip devices still enumerating.
+        if !is_deauthorized(path) && usb::is_enumerating(path) {
+            continue;
+        }
+        if store.trust(fp) {
+            added += 1;
+        }
+    }
+    save_trusted_usb(&trusted_file, &store);
+    // Trusted devices are no longer Armor targets; forget declined prompts
+    save_deauth_declined(&[]);
     notify_desktop(
         "BadUSB Defense",
         &format!(
