@@ -33,7 +33,7 @@ pub(crate) fn assemble_report(
     let threat_level = ThreatLevel::from_modules(&modules);
 
     let usb_armor_enabled = is_usb_armor_enabled();
-    let network_blackout_active = kernel::kernel_is_network_blackout_active();
+    let blackout = kernel::kernel_network_blackout_state();
 
     let kernel_capabilities = vec![
         "cgroups_v2_freeze".to_string(),
@@ -54,7 +54,8 @@ pub(crate) fn assemble_report(
         ghost_mac_enabled,
         dns_dot_enabled,
         usb_armor_enabled,
-        network_blackout_active,
+        network_blackout_active: blackout.active,
+        network_blackout_confirmed: blackout.confirmed,
         self_integrity_hash,
         ai_threat_score,
         ai_anomalies,

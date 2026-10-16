@@ -140,7 +140,11 @@ fn escalate_via_helper(flag: &str, args: &[&str]) -> Option<InterventionResult> 
         flag.trim_start_matches('-'),
         args.first().unwrap_or(&"")
     );
-    let target = args.get(1).copied().unwrap_or("");
+    // Report the PID alone, not the `<pid>:<starttime>` identity passed to the helper
+    let target = args
+        .get(1)
+        .map(|a| a.split(':').next().unwrap_or(a))
+        .unwrap_or("");
     match run_cmd_bounded_status(PKEXEC, &argv, &[], deadline, 16384) {
         Some((_, out)) => Some(
             serde_json::from_slice::<InterventionResult>(&out).unwrap_or_else(|_| {
@@ -236,43 +240,75 @@ impl Drop for ProcessHandle {
     }
 }
 
-/// Immune system critical process names
-const IMMUNE_PROCESSES: &[&str] = &[
-    "systemd",
-    "systemd-journal",
-    "systemd-logind",
-    "systemd-udevd",
-    "polkitd",
-    "dbus-daemon",
-    "dbus-broker",
-    "Hyprland",
-    "waybar",
-    "quickshell",
-    "sshd",
-    "sentinel-engine",
+/// Immune critical system processes: each `comm` name with the executables that may
+/// legitimately carry it. Paths are as /proc/<pid>/exe resolves them on Arch (where
+/// /bin, /sbin and /usr/sbin are symlinks into /usr/bin); the other spellings cover
+/// distributions that keep separate directories.
+const IMMUNE_PROCESSES: &[(&str, &[&str])] = &[
+    (
+        "systemd",
+        &["/usr/lib/systemd/systemd", "/lib/systemd/systemd"],
+    ),
+    (
+        "systemd-journal",
+        &[
+            "/usr/lib/systemd/systemd-journald",
+            "/lib/systemd/systemd-journald",
+        ],
+    ),
+    (
+        "systemd-logind",
+        &[
+            "/usr/lib/systemd/systemd-logind",
+            "/lib/systemd/systemd-logind",
+        ],
+    ),
+    (
+        "systemd-udevd",
+        &[
+            "/usr/lib/systemd/systemd-udevd",
+            "/lib/systemd/systemd-udevd",
+            // systemd-udevd is a symlink to udevadm, which /proc/<pid>/exe resolves
+            "/usr/bin/udevadm",
+            "/bin/udevadm",
+        ],
+    ),
+    (
+        "polkitd",
+        &["/usr/lib/polkit-1/polkitd", "/usr/libexec/polkitd"],
+    ),
+    ("dbus-daemon", &["/usr/bin/dbus-daemon", "/bin/dbus-daemon"]),
+    ("dbus-broker", &["/usr/bin/dbus-broker"]),
+    ("Hyprland", &["/usr/bin/Hyprland", "/usr/bin/hyprland"]),
+    ("waybar", &["/usr/bin/waybar"]),
+    ("quickshell", &["/usr/bin/quickshell", "/usr/bin/qs"]),
+    ("sshd", &["/usr/bin/sshd", "/usr/sbin/sshd"]),
+    ("sentinel-engine", &[PRIVILEGED_ENGINE]),
 ];
 
-/// Trusted install prefixes for immune system binaries.
-const TRUSTED_EXE_PREFIXES: &[&str] = &["/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/"];
+/// Executables allowed to carry an immune `comm` name, or `None` if it is not immune.
+fn immune_executables(comm: &str) -> Option<&'static [&'static str]> {
+    IMMUNE_PROCESSES
+        .iter()
+        .find(|(name, _)| *name == comm)
+        .map(|(_, exes)| *exes)
+}
 
 /// Returns the process name if the target is an immune critical system process.
 ///
 /// `comm` alone is attacker-controlled (any process can rename itself to "sshd" via
-/// prctl(PR_SET_NAME) or argv[0]), so a name match only grants immunity when the
-/// executable also lives under a trusted system prefix. If the exe link is unreadable
-/// (foreign-owned or root process), the name match is honoured conservatively.
+/// prctl(PR_SET_NAME) or argv[0]), and so is the interpreter it runs under
+/// (/usr/bin/python3 is a trusted system file too). A name match therefore only
+/// grants immunity when the executable is the one that daemon ships as. If the exe
+/// link is unreadable (foreign-owned or root process), the name match is honoured
+/// conservatively.
 fn immune_process_name(proc_dir: &Path) -> Option<String> {
     let comm_bytes = read_proc_bounded(&proc_dir.join("comm"), 256).ok()?;
     let comm = String::from_utf8_lossy(&comm_bytes).trim().to_string();
-    if !IMMUNE_PROCESSES.contains(&comm.as_str()) {
-        return None;
-    }
+    let expected = immune_executables(&comm)?;
     match std::fs::read_link(proc_dir.join("exe")) {
         Ok(exe) => {
-            let exe = exe.to_string_lossy();
-            let trusted = !exe.ends_with(" (deleted)")
-                && TRUSTED_EXE_PREFIXES.iter().any(|p| exe.starts_with(p));
-            if trusted {
+            if is_expected_executable(&exe.to_string_lossy(), expected) {
                 Some(comm)
             } else {
                 None
@@ -280,6 +316,16 @@ fn immune_process_name(proc_dir: &Path) -> Option<String> {
         }
         Err(_) => Some(comm),
     }
+}
+
+/// True when `exe` (as read from /proc/<pid>/exe) is one of `expected`.
+///
+/// A daemon still running from a binary that a package upgrade replaced reads as
+/// "<path> (deleted)". It keeps its immunity: only root can create or replace files
+/// at these system paths, so the original path still identifies the program.
+fn is_expected_executable(exe: &str, expected: &[&str]) -> bool {
+    let path = exe.strip_suffix(" (deleted)").unwrap_or(exe);
+    expected.contains(&path)
 }
 
 /// Shared safety gate for freeze/terminate: refuses init, kernel threads and immune
@@ -313,10 +359,63 @@ fn validate_signal_target(pid: i32, verb: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Kernel start time of a process (field 22 of /proc/<pid>/stat, in clock ticks since
+/// boot). A PID and its start time together identify one process: a recycled PID
+/// always has a later start time.
+fn proc_start_time(pid: i32) -> Option<u64> {
+    let stat = read_proc_bounded(Path::new(&format!("/proc/{}/stat", pid)), 4096).ok()?;
+    parse_start_time(&String::from_utf8_lossy(&stat))
+}
+
+/// Parses the start time out of a /proc/<pid>/stat line. `comm` (field 2) may contain
+/// spaces and parentheses, so fields are counted from its last closing parenthesis.
+fn parse_start_time(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    // Fields after comm start at field 3 (state); starttime is field 22
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// Encodes a process identity for the root-side helper as `<pid>:<starttime>`.
+fn identity_arg(pid: i32, start: u64) -> String {
+    format!("{}:{}", pid, start)
+}
+
+/// Parses a `<pid>:<starttime>` identity passed to the root-side helper.
+fn parse_identity_arg(arg: &str) -> Option<(i32, u64)> {
+    let (pid, start) = arg.trim().split_once(':')?;
+    Some((pid.parse().ok()?, start.parse().ok()?))
+}
+
+/// Opens the target, runs the safety gate and pins its identity. When `expected_start`
+/// is set (root-side helper), the PID must still belong to the process the user
+/// approved; a PID recycled during the password prompt is refused.
+fn pin_signal_target(
+    pid: i32,
+    verb: &str,
+    expected_start: Option<u64>,
+) -> Result<(ProcessHandle, u64), String> {
+    let handle = ProcessHandle::open(pid);
+    validate_signal_target(pid, verb)?;
+    let start = proc_start_time(pid).ok_or_else(|| "Target PID does not exist".to_string())?;
+    if let Some(expected) = expected_start {
+        if expected != start {
+            return Err(
+                "Target process changed while waiting for authentication; refusing to signal its replacement"
+                    .to_string(),
+            );
+        }
+    }
+    Ok((handle, start))
+}
+
 /// Freezes a suspect process at kernel level (SIGSTOP / 19).
 /// Unlike SIGKILL, freezing suspends execution immediately without destroying
 /// the memory state or socket descriptors, enabling forensic acquisition.
 pub fn kernel_freeze_process(pid: i32) -> InterventionResult {
+    freeze_process(pid, None)
+}
+
+fn freeze_process(pid: i32, expected_start: Option<u64>) -> InterventionResult {
     let pid_str = pid.to_string();
     if pid <= 2 {
         return InterventionResult::err(
@@ -325,10 +424,10 @@ pub fn kernel_freeze_process(pid: i32) -> InterventionResult {
             "Refusing to freeze system init or kernel thread manager (PID <= 2)",
         );
     }
-    let handle = ProcessHandle::open(pid);
-    if let Err(msg) = validate_signal_target(pid, "freeze") {
-        return InterventionResult::err("kernel_freeze", &pid_str, &msg);
-    }
+    let (handle, start) = match pin_signal_target(pid, "freeze", expected_start) {
+        Ok(pinned) => pinned,
+        Err(msg) => return InterventionResult::err("kernel_freeze", &pid_str, &msg),
+    };
 
     match handle.signal(SIGSTOP) {
         Ok(()) => {
@@ -353,7 +452,10 @@ pub fn kernel_freeze_process(pid: i32) -> InterventionResult {
     }
 
     // Permission denied: escalate
-    if let Some(res) = escalate_via_helper(PRIVILEGED_INTERVENTION_FLAG, &["stop", &pid_str]) {
+    if let Some(res) = escalate_via_helper(
+        PRIVILEGED_INTERVENTION_FLAG,
+        &["stop", &identity_arg(pid, start)],
+    ) {
         if res.success {
             capture_forensic_evidence(pid);
         }
@@ -381,6 +483,10 @@ pub fn kernel_freeze_process(pid: i32) -> InterventionResult {
 /// Terminates a malicious or uncooperative process at kernel level.
 /// Sends SIGTERM (15) first, followed by SIGKILL (9) to ensure full eradication.
 pub fn kernel_terminate_process(pid: i32) -> InterventionResult {
+    terminate_process(pid, None)
+}
+
+fn terminate_process(pid: i32, expected_start: Option<u64>) -> InterventionResult {
     let pid_str = pid.to_string();
     if pid <= 2 {
         return InterventionResult::err(
@@ -389,10 +495,10 @@ pub fn kernel_terminate_process(pid: i32) -> InterventionResult {
             "Refusing to terminate system init or kernel thread manager (PID <= 2)",
         );
     }
-    let handle = ProcessHandle::open(pid);
-    if let Err(msg) = validate_signal_target(pid, "terminate") {
-        return InterventionResult::err("kernel_terminate", &pid_str, &msg);
-    }
+    let (handle, start) = match pin_signal_target(pid, "terminate", expected_start) {
+        Ok(pinned) => pinned,
+        Err(msg) => return InterventionResult::err("kernel_terminate", &pid_str, &msg),
+    };
 
     match handle.signal(SIGTERM) {
         Ok(()) => {
@@ -426,7 +532,10 @@ pub fn kernel_terminate_process(pid: i32) -> InterventionResult {
         Err(_) => {}
     }
 
-    if let Some(res) = escalate_via_helper(PRIVILEGED_INTERVENTION_FLAG, &["terminate", &pid_str]) {
+    if let Some(res) = escalate_via_helper(
+        PRIVILEGED_INTERVENTION_FLAG,
+        &["terminate", &identity_arg(pid, start)],
+    ) {
         return res;
     }
     if legacy_pkexec(&["/usr/bin/kill", "-KILL", "--", &pid_str], None) {
@@ -446,12 +555,31 @@ pub fn kernel_terminate_process(pid: i32) -> InterventionResult {
 
 /// Thaws (resumes) a previously frozen process (SIGCONT / 18).
 pub fn kernel_thaw_process(pid: i32) -> InterventionResult {
+    thaw_process(pid, None)
+}
+
+fn thaw_process(pid: i32, expected_start: Option<u64>) -> InterventionResult {
     let pid_str = pid.to_string();
     if pid <= 2 {
         return InterventionResult::err("kernel_thaw", &pid_str, "Invalid PID (<= 2)");
     }
 
-    match ProcessHandle::open(pid).signal(SIGCONT) {
+    let handle = ProcessHandle::open(pid);
+    let start = match proc_start_time(pid) {
+        Some(start) => start,
+        None => {
+            return InterventionResult::err("kernel_thaw", &pid_str, "Target PID does not exist")
+        }
+    };
+    if expected_start.is_some_and(|expected| expected != start) {
+        return InterventionResult::err(
+            "kernel_thaw",
+            &pid_str,
+            "Target process changed while waiting for authentication; refusing to signal its replacement",
+        );
+    }
+
+    match handle.signal(SIGCONT) {
         Ok(()) => {
             return InterventionResult::ok(
                 "kernel_thaw",
@@ -466,7 +594,10 @@ pub fn kernel_thaw_process(pid: i32) -> InterventionResult {
     }
 
     // A process frozen through pkexec is root-owned or foreign; resuming needs the same rights
-    if let Some(res) = escalate_via_helper(PRIVILEGED_INTERVENTION_FLAG, &["continue", &pid_str]) {
+    if let Some(res) = escalate_via_helper(
+        PRIVILEGED_INTERVENTION_FLAG,
+        &["continue", &identity_arg(pid, start)],
+    ) {
         return res;
     }
     if legacy_pkexec(&["/usr/bin/kill", "-CONT", "--", &pid_str], None) {
@@ -874,19 +1005,57 @@ pub fn kernel_clear_network_blackout() -> InterventionResult {
     res
 }
 
-/// Checks if the emergency network blackout table is currently active in the kernel.
-pub fn kernel_is_network_blackout_active() -> bool {
+/// What is known about the emergency network blackout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlackoutState {
+    /// The blackout is (or may be) engaged
+    pub active: bool,
+    /// `active` was read from the kernel ruleset rather than inferred from our marker
+    pub confirmed: bool,
+}
+
+/// Reads the blackout state. Root can list the ruleset and gets a confirmed answer.
+/// Unprivileged callers cannot, and fall back to the per-boot marker written when the
+/// blackout was engaged. That marker is not proof: root may have cleared the table
+/// since (`--resume-network`, a firewall reload), so such an answer is unconfirmed.
+pub fn kernel_network_blackout_state() -> BlackoutState {
     let deadline = Instant::now() + Duration::from_secs(2);
-    let out = run_cmd_bounded(
+    let listed = run_cmd_bounded_status(
         NFT,
         &["list", "table", "inet", "sentinel_blackout"],
         &[],
         deadline,
         4096,
     );
-    // Root can query the ruleset directly; unprivileged callers fall back to the
-    // per-boot marker written when the blackout was engaged.
-    out.is_some() || blackout_marker_matches_boot()
+    match listed {
+        Some((0, _)) => BlackoutState {
+            active: true,
+            confirmed: true,
+        },
+        // nft could read the ruleset and the table is absent
+        Some((_, _)) if can_read_ruleset() => BlackoutState {
+            active: false,
+            confirmed: true,
+        },
+        _ => BlackoutState {
+            active: blackout_marker_matches_boot(),
+            confirmed: false,
+        },
+    }
+}
+
+/// True when this process may read the nftables ruleset (root, or CAP_NET_ADMIN).
+fn can_read_ruleset() -> bool {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    matches!(
+        run_cmd_bounded_status(NFT, &["list", "tables"], &[], deadline, 65536),
+        Some((0, _))
+    )
+}
+
+/// Checks if the emergency network blackout table is (or may be) active.
+pub fn kernel_is_network_blackout_active() -> bool {
+    kernel_network_blackout_state().active
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,19 +1220,22 @@ pub fn run_privileged_operation(flag: &str, op: &str, arg: Option<&str>) -> Inte
     }
     enter_privileged_mode();
 
-    let parse_pid = |a: Option<&str>| a.and_then(|s| s.trim().parse::<i32>().ok());
+    // Signals carry `<pid>:<starttime>` so the helper acts on the process the user
+    // approved, not on whatever reused its PID while the password prompt was open.
+    let identity = |a: Option<&str>| a.and_then(parse_identity_arg);
+    const IDENTITY_REQUIRED: &str = "Process identity (<pid>:<starttime>) required";
     match (flag, op) {
-        (PRIVILEGED_INTERVENTION_FLAG, "stop") => match parse_pid(arg) {
-            Some(pid) => kernel_freeze_process(pid),
-            None => InterventionResult::err(&action, "", "Numeric PID required"),
+        (PRIVILEGED_INTERVENTION_FLAG, "stop") => match identity(arg) {
+            Some((pid, start)) => freeze_process(pid, Some(start)),
+            None => InterventionResult::err(&action, arg.unwrap_or(""), IDENTITY_REQUIRED),
         },
-        (PRIVILEGED_INTERVENTION_FLAG, "terminate") => match parse_pid(arg) {
-            Some(pid) => kernel_terminate_process(pid),
-            None => InterventionResult::err(&action, "", "Numeric PID required"),
+        (PRIVILEGED_INTERVENTION_FLAG, "terminate") => match identity(arg) {
+            Some((pid, start)) => terminate_process(pid, Some(start)),
+            None => InterventionResult::err(&action, arg.unwrap_or(""), IDENTITY_REQUIRED),
         },
-        (PRIVILEGED_INTERVENTION_FLAG, "continue") => match parse_pid(arg) {
-            Some(pid) => kernel_thaw_process(pid),
-            None => InterventionResult::err(&action, "", "Numeric PID required"),
+        (PRIVILEGED_INTERVENTION_FLAG, "continue") => match identity(arg) {
+            Some((pid, start)) => thaw_process(pid, Some(start)),
+            None => InterventionResult::err(&action, arg.unwrap_or(""), IDENTITY_REQUIRED),
         },
         (PRIVILEGED_INTERVENTION_FLAG, "deauth-usb") => kernel_deauth_usb(arg.unwrap_or("")),
         (PRIVILEGED_INTERVENTION_FLAG, "reauth-usb") => kernel_reauth_usb(arg.unwrap_or("")),
@@ -1096,6 +1268,50 @@ mod tests {
     }
 
     #[test]
+    fn test_immune_names_require_their_own_executable() {
+        let sshd = immune_executables("sshd").unwrap();
+        assert!(is_expected_executable("/usr/bin/sshd", sshd));
+        // A daemon whose binary a package upgrade replaced stays immune
+        assert!(is_expected_executable("/usr/bin/sshd (deleted)", sshd));
+        // Renaming an interpreter or a binary in a writable path does not help
+        assert!(!is_expected_executable("/usr/bin/python3", sshd));
+        assert!(!is_expected_executable("/home/u/.local/bin/sshd", sshd));
+        assert!(!is_expected_executable("/tmp/usr/bin/sshd", sshd));
+        assert!(immune_executables("bash").is_none());
+    }
+
+    #[test]
+    fn test_start_time_parsing_and_identity_args() {
+        // comm may contain spaces and parentheses; fields are counted after the last ')'
+        let stat =
+            "4242 (evil) (x) S 1 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 10";
+        assert_eq!(parse_start_time(stat), Some(987654));
+        assert_eq!(parse_start_time("garbage"), None);
+
+        let me = std::process::id() as i32;
+        let start = proc_start_time(me).unwrap();
+        assert_eq!(
+            parse_identity_arg(&identity_arg(me, start)),
+            Some((me, start))
+        );
+        assert_eq!(parse_identity_arg("1234"), None);
+        assert_eq!(parse_identity_arg("x:1"), None);
+    }
+
+    #[test]
+    fn test_pinning_refuses_a_different_start_time() {
+        // Pinning only inspects the target, so the test process itself is a stable one
+        let pid = std::process::id() as i32;
+        let start = proc_start_time(pid).unwrap();
+        let pinned = pin_signal_target(pid, "freeze", Some(start));
+        assert!(pinned.is_ok(), "{:?}", pinned.err());
+        let err = pin_signal_target(pid, "freeze", Some(start + 1))
+            .err()
+            .unwrap();
+        assert!(err.contains("changed while waiting"));
+    }
+
+    #[test]
     fn test_privileged_operation_requires_root() {
         // SAFETY: getuid has no preconditions
         if unsafe { getuid() } == 0 {
@@ -1115,7 +1331,9 @@ mod tests {
         }
         let res = run_privileged_operation(PRIVILEGED_INTERVENTION_FLAG, "rm-rf", Some("/"));
         assert!(!res.success);
-        let res = run_privileged_operation(PRIVILEGED_INTERVENTION_FLAG, "stop", Some("1"));
+        let res = run_privileged_operation(PRIVILEGED_INTERVENTION_FLAG, "stop", Some("1:0"));
         assert!(!res.success && res.message.contains("PID <= 2"));
+        let res = run_privileged_operation(PRIVILEGED_INTERVENTION_FLAG, "stop", Some("1234"));
+        assert!(!res.success && res.message.contains("identity"));
     }
 }

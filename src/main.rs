@@ -85,8 +85,11 @@ fn main() {
     }
 
     if matches!(cmd, "--blackout-status" | "blackout-status") {
-        let active = kernel::kernel_is_network_blackout_active();
-        println!("{{\"blackout_active\": {}}}", active);
+        let state = kernel::kernel_network_blackout_state();
+        println!(
+            "{{\"blackout_active\": {}, \"confirmed\": {}}}",
+            state.active, state.confirmed
+        );
         return;
     }
 

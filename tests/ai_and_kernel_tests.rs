@@ -273,7 +273,19 @@ fn test_spoofed_immune_name_outside_system_paths_is_not_immune() {
     let fake = dir.join("sshd");
     std::fs::copy("/bin/sleep", &fake).unwrap();
 
-    let mut child = std::process::Command::new(&fake).arg("30").spawn().unwrap();
+    // A test running in parallel may fork while the copy's write handle is still open,
+    // so exec can briefly fail with ETXTBSY; retry instead of failing the test.
+    let mut spawned = std::process::Command::new(&fake).arg("30").spawn();
+    for _ in 0..50 {
+        match &spawned {
+            Err(e) if e.raw_os_error() == Some(26) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                spawned = std::process::Command::new(&fake).arg("30").spawn();
+            }
+            _ => break,
+        }
+    }
+    let mut child = spawned.unwrap();
     let pid = child.id() as i32;
     std::thread::sleep(std::time::Duration::from_millis(100));
 

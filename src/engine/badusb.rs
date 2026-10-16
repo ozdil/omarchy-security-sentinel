@@ -135,11 +135,7 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
             store_changed |= store.trust(fp);
         }
 
-        let verdict = if baseline_corrupt {
-            None
-        } else {
-            Some(store.verdict(fp))
-        };
+        let verdict = baseline_verdict(baseline_corrupt, &store, fp);
         let is_trusted = matches!(verdict, None | Some(TrustVerdict::Trusted));
 
         let tag = match &verdict {
@@ -169,11 +165,7 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
         items.push(format!("{} [{}]{} [{}]", prod, fp.id(), kind_tag, tag));
 
         if !is_trusted {
-            // Hubs (root hubs included) are never auto-severed: that would also cut
-            // off every trusted keyboard and mouse behind them, and each device on
-            // the hub is judged on its own anyway. Devices already de-authorized are
-            // skipped so each poll does not re-trigger sysfs writes or pkexec prompts.
-            if !already_blocked && !bus_id.starts_with("usb") && !fp.is_hub() {
+            if is_deauth_target(bus_id, fp, already_blocked) {
                 deauth_targets.push((bus_id.clone(), format!("{} {}", bus_id, fp.id())));
             }
             unapproved_bus_ids.push(bus_id.clone());
@@ -373,6 +365,61 @@ fn is_deauthorized(path: &Path) -> bool {
     read_file_bounded(&path.join("authorized"), 16).is_ok_and(|a| a.trim() == "0")
 }
 
+/// The baseline's verdict on a device, or `None` when the baseline is corrupt. An
+/// unreadable baseline must not mean "trust nothing": with USB Armor on that would
+/// de-authorize every device, keyboard and mouse included.
+fn baseline_verdict(
+    baseline_corrupt: bool,
+    store: &TrustStore,
+    fp: &UsbFingerprint,
+) -> Option<TrustVerdict> {
+    if baseline_corrupt {
+        None
+    } else {
+        Some(store.verdict(fp))
+    }
+}
+
+/// Whether USB Armor may de-authorize an untrusted device. Hubs (root hubs
+/// included) are never auto-severed: that would also cut off every trusted keyboard
+/// and mouse behind them, and each device on the hub is judged on its own anyway.
+/// Devices already de-authorized are skipped so each poll does not re-trigger sysfs
+/// writes or pkexec prompts.
+fn is_deauth_target(bus_id: &str, fp: &UsbFingerprint, already_blocked: bool) -> bool {
+    !already_blocked && !bus_id.starts_with("usb") && !fp.is_hub()
+}
+
+/// One connected device as "Trust Devices" sees it.
+struct ObservedDevice<'a> {
+    fp: &'a UsbFingerprint,
+    blocked: bool,
+    enumerating: bool,
+}
+
+/// Adds the connected devices to `store` and returns how many entries were added or
+/// updated. Existing entries are kept, so approved devices that are unplugged right
+/// now are not silently dropped.
+fn merge_into_baseline(store: &mut TrustStore, devices: &[ObservedDevice]) -> usize {
+    let settled: Vec<&UsbFingerprint> = devices
+        .iter()
+        .filter(|d| !d.enumerating)
+        .map(|d| d.fp)
+        .collect();
+    let mut added = usize::from(store.upgrade_legacy(&settled));
+    for d in devices {
+        // A device still blocked (re-authorization cancelled) is trusted with its
+        // interfaces unknown; the entry is completed the next time it is seen
+        // authorized. Only skip devices still enumerating.
+        if !d.blocked && d.enumerating {
+            continue;
+        }
+        if store.trust(d.fp) {
+            added += 1;
+        }
+    }
+    added
+}
+
 pub(crate) fn trust_all_usb() -> usize {
     // Hold off Armor until the restored devices are approved: a scan in between
     // would see them re-enabled but not yet trusted and block them again.
@@ -411,23 +458,15 @@ pub(crate) fn trust_all_usb() -> usize {
     // Merge with the existing baseline so devices that are approved but currently
     // unplugged are not silently dropped. A corrupt baseline is rebuilt from scratch.
     let mut store = load_trusted_usb(&trusted_file).unwrap_or_default();
-    let settled: Vec<&UsbFingerprint> = devices
+    let observed: Vec<ObservedDevice> = devices
         .iter()
-        .filter(|(_, path, _)| !usb::is_enumerating(path))
-        .map(|(_, _, fp)| fp)
+        .map(|(_, path, fp)| ObservedDevice {
+            fp,
+            blocked: is_deauthorized(path),
+            enumerating: usb::is_enumerating(path),
+        })
         .collect();
-    let mut added = usize::from(store.upgrade_legacy(&settled));
-    for (_, path, fp) in &devices {
-        // A device still blocked (re-authorization cancelled) is trusted with its
-        // interfaces unknown; the entry is completed the next time it is seen
-        // authorized. Only skip devices still enumerating.
-        if !is_deauthorized(path) && usb::is_enumerating(path) {
-            continue;
-        }
-        if store.trust(fp) {
-            added += 1;
-        }
-    }
+    let added = merge_into_baseline(&mut store, &observed);
     save_trusted_usb(&trusted_file, &store);
     // Trusted devices are no longer Armor targets; forget declined prompts
     save_deauth_declined(&[]);
@@ -448,4 +487,95 @@ pub(crate) fn trust_all_usb() -> usize {
         false,
     );
     devices.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fp(vid: &str, pid: &str, ifs: &[&str]) -> UsbFingerprint {
+        UsbFingerprint {
+            vid: vid.to_string(),
+            pid: pid.to_string(),
+            serial: None,
+            interfaces: Some(ifs.iter().map(|s| s.to_string()).collect()),
+            product: None,
+        }
+    }
+
+    const KEYBOARD: &[&str] = &["03:01:01"];
+    const HUB: &[&str] = &["09:00:00"];
+
+    #[test]
+    fn test_corrupt_baseline_produces_no_deauth_targets() {
+        let store = TrustStore::default();
+        let keyboard = fp("046d", "c31c", KEYBOARD);
+        let verdict = baseline_verdict(true, &store, &keyboard);
+        assert_eq!(verdict, None);
+        // The scan treats a missing verdict as trusted, so nothing is blocked
+        assert!(matches!(verdict, None | Some(TrustVerdict::Trusted)));
+        // With a readable but empty baseline the same device is unknown
+        assert_eq!(
+            baseline_verdict(false, &store, &keyboard),
+            Some(TrustVerdict::Unknown)
+        );
+    }
+
+    #[test]
+    fn test_hubs_and_blocked_devices_are_never_deauth_targets() {
+        let keyboard = fp("046d", "c31c", KEYBOARD);
+        let hub = fp("05e3", "0610", HUB);
+        assert!(is_deauth_target("1-2", &keyboard, false));
+        assert!(!is_deauth_target("1-2", &keyboard, true), "already blocked");
+        assert!(!is_deauth_target("1-1", &hub, false), "external hub");
+        assert!(
+            !is_deauth_target("usb1", &keyboard, false),
+            "root hub bus id"
+        );
+        assert!(!is_deauth_target("usb2", &hub, false), "root hub");
+    }
+
+    #[test]
+    fn test_trusting_keeps_unplugged_devices() {
+        let unplugged = fp("0781", "5567", &["08:06:50"]);
+        let keyboard = fp("046d", "c31c", KEYBOARD);
+        let mut store = TrustStore::default();
+        store.trust(&unplugged);
+
+        let added = merge_into_baseline(
+            &mut store,
+            &[ObservedDevice {
+                fp: &keyboard,
+                blocked: false,
+                enumerating: false,
+            }],
+        );
+        assert_eq!(added, 1);
+        assert_eq!(store.verdict(&unplugged), TrustVerdict::Trusted);
+        assert_eq!(store.verdict(&keyboard), TrustVerdict::Trusted);
+    }
+
+    #[test]
+    fn test_trusting_skips_enumerating_but_not_blocked_devices() {
+        let enumerating = fp("1234", "0001", KEYBOARD);
+        let blocked = fp("1234", "0002", KEYBOARD);
+        let mut store = TrustStore::default();
+        merge_into_baseline(
+            &mut store,
+            &[
+                ObservedDevice {
+                    fp: &enumerating,
+                    blocked: false,
+                    enumerating: true,
+                },
+                ObservedDevice {
+                    fp: &blocked,
+                    blocked: true,
+                    enumerating: true,
+                },
+            ],
+        );
+        assert_eq!(store.verdict(&enumerating), TrustVerdict::Unknown);
+        assert_eq!(store.verdict(&blocked), TrustVerdict::Trusted);
+    }
 }

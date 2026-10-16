@@ -3,6 +3,36 @@
 All notable changes to Security Sentinel are listed here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+Follow-ups to the review of the 1.4.0 hardening work.
+
+### Fixed
+
+- **Immune processes**: a protected name such as `sshd` now only counts when
+  the process runs the executable that daemon ships as. Before, any program
+  under `/usr/` qualified, so a script run by `/usr/bin/python3` that renamed
+  itself to `sshd` could not be frozen or terminated. Daemons still running
+  from a binary replaced by a package upgrade keep their immunity.
+- **Signals after a password prompt**: freeze, terminate and resume pass the
+  process start time to the root-side helper along with the PID. If the
+  process exits and its PID is reused while polkit asks for the password,
+  the helper refuses instead of signalling the unrelated new process.
+- **Blackout status**: the dashboard no longer presents the panic blackout as
+  engaged when that is only inferred from Sentinel's own marker file (for
+  example after root cleared the table). It shows "blackout unconfirmed".
+  The report and `--blackout-status` gained a `confirmed` field.
+- **Authentication Watch**: a journal query that fails or times out now
+  reports a warning ("Auth logs unavailable") instead of SECURE, and the
+  query no longer shares its deadline with the version probe.
+
+### Changed
+
+- CI actions are pinned to commit SHAs, with the Rust toolchains passed as
+  explicit inputs.
+- The USB Armor decisions (corrupt baseline, hubs, already-blocked devices,
+  keeping unplugged devices when trusting) are covered by unit tests.
+
 ## [1.4.0] - 2026-10-16
 
 This release comes out of a full-stack security audit of the engine, the
