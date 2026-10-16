@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // engine logic (and its SHA-256 implementation) is compiled and tested once.
 use sentinel_engine::subproc::{run_cmd_bounded, run_cmd_bounded_status};
 use sentinel_engine::usb::{self, TrustStore, TrustVerdict, UsbFingerprint};
-use sentinel_engine::{ai, kernel, sha256_hex};
+use sentinel_engine::{ai, kernel, net, sha256_hex};
 
 const O_NOFOLLOW: i32 = 0o400000;
 
@@ -299,136 +299,116 @@ pub fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<String, String
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-pub fn parse_ip_port(s: &str) -> Option<(String, u16)> {
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let port = u16::from_str_radix(parts[1], 16).ok()?;
-    let ip_hex = parts[0];
-    if ip_hex.len() == 8 {
-        let num = u32::from_str_radix(ip_hex, 16).ok()?;
-        let ip = format!(
-            "{}.{}.{}.{}",
-            num & 0xFF,
-            (num >> 8) & 0xFF,
-            (num >> 16) & 0xFF,
-            (num >> 24) & 0xFF
-        );
-        Some((ip, port))
-    } else {
-        Some(("IPv6".to_string(), port))
-    }
-}
-
-pub fn port_service_name(port: u16) -> &'static str {
-    match port {
-        21 => "FTP",
-        22 => "SSH",
-        23 => "Telnet",
-        25 => "SMTP",
-        53 => "DNS Resolver",
-        80 => "HTTP",
-        110 => "POP3",
-        143 => "IMAP",
-        443 => "HTTPS",
-        445 => "SMB",
-        631 => "CUPS Print",
-        853 => "DoT Encrypted",
-        993 => "IMAPS",
-        995 => "POP3S",
-        1337 => "Backdoor/C2",
-        1883 => "MQTT",
-        3000 => "Node/Web",
-        3306 => "MySQL/MariaDB",
-        4444 => "Metasploit C2",
-        5173 => "Vite Dev",
-        5432 => "PostgreSQL",
-        5555 => "ADB/Trojan",
-        6379 => "Redis Cache",
-        6666 | 6667 => "IRC Botnet",
-        8000 => "Dev Server",
-        8080 => "HTTP Proxy",
-        8443 => "HTTPS Alt",
-        8844 => "Local Service",
-        9001 => "Tor/Malware C2",
-        27017 => "MongoDB",
-        31337 => "Back Orifice",
-        _ => "System Port",
-    }
-}
-
-pub fn is_suspicious_port(port: u16) -> bool {
-    matches!(port, 1337 | 4444 | 5555 | 6666 | 6667 | 9001 | 31337)
-}
-
 // 1. Network Sockets Radar
 fn check_network_sockets() -> ModuleStatus {
     let mut total = 0;
     let mut listen = 0;
     let mut estab = 0;
     let mut flagged = 0;
+    let mut warned = 0;
     let mut alert_items = Vec::new();
     let mut listen_items = Vec::new();
     let mut estab_items = Vec::new();
 
-    let paths = [
-        "/proc/net/tcp",
-        "/proc/net/tcp6",
-        "/proc/net/udp",
-        "/proc/net/udp6",
-    ];
-    for p in &paths {
-        if let Ok(content) = read_file_bounded(Path::new(p), 1024 * 1024) {
-            for line in content.lines().skip(1) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() > 3 {
-                    total += 1;
-                    let st = parts[3];
-                    if st == "0A" {
-                        listen += 1;
-                        if let Some((ip, port)) = parse_ip_port(parts[1]) {
-                            if is_suspicious_port(port) {
-                                flagged += 1;
-                                alert_items.push(format!(
-                                    "[ALERT] Unauthorized listening backdoor on port {} ({}) [{}]",
-                                    port,
-                                    port_service_name(port),
-                                    ip
-                                ));
-                            }
-                            if listen_items.len() < 5 {
-                                listen_items.push(format!(
-                                    "LISTEN :{} ({}) [{}]",
-                                    port,
-                                    port_service_name(port),
-                                    ip
-                                ));
-                            }
-                        }
-                    } else if st == "01" {
-                        estab += 1;
-                        if let Some((rem_ip, rem_port)) = parse_ip_port(parts[2]) {
-                            if is_suspicious_port(rem_port) {
-                                flagged += 1;
-                                alert_items.push(format!(
-                                    "[ALERT] Outbound C2/Reverse Shell to {}:{} ({})",
-                                    rem_ip,
-                                    rem_port,
-                                    port_service_name(rem_port)
-                                ));
-                            }
-                            if estab_items.len() < 5 {
-                                estab_items.push(format!(
-                                    "ESTAB -> {}:{} ({})",
-                                    rem_ip,
-                                    rem_port,
-                                    port_service_name(rem_port)
-                                ));
-                            }
-                        }
-                    }
-                }
+    let mut sockets = Vec::new();
+    for (path, proto) in [
+        ("/proc/net/tcp", "tcp"),
+        ("/proc/net/tcp6", "tcp6"),
+        ("/proc/net/udp", "udp"),
+        ("/proc/net/udp6", "udp6"),
+    ] {
+        if let Ok(content) = read_file_bounded(Path::new(path), 1024 * 1024) {
+            sockets.extend(
+                content
+                    .lines()
+                    .skip(1)
+                    .filter_map(|l| net::parse_proc_net_line(l, proto)),
+            );
+        }
+    }
+    let owners = net::socket_owners();
+    let owner_label = |inode: u64| match owners.get(&inode) {
+        Some(o) => format!("{} pid {}", o.name, o.pid),
+        None => "other user".to_string(),
+    };
+
+    // Listeners go through the behavior analyzer, which needs the owning process
+    // name to tell e.g. sshd on :22 from an impostor.
+    let listeners: Vec<&net::SocketEntry> = sockets.iter().filter(|s| s.is_listener()).collect();
+    let analyzer_input: Vec<(&str, &str, u16, Option<i32>, &str)> = listeners
+        .iter()
+        .map(|s| {
+            let owner = owners.get(&s.inode);
+            (
+                s.proto,
+                s.local_ip.as_str(),
+                s.local_port,
+                owner.map(|o| o.pid),
+                owner.map_or("", |o| o.name.as_str()),
+            )
+        })
+        .collect();
+    for anomaly in ai::analyze_socket_anomalies(&analyzer_input) {
+        let severe = anomaly.severity >= ai::AnomalySeverity::High;
+        if severe {
+            flagged += 1;
+        } else {
+            warned += 1;
+        }
+        let who = match anomaly.pid {
+            Some(pid) => format!("{} pid {}", anomaly.process_name, pid),
+            None => "other user".to_string(),
+        };
+        alert_items.push(format!(
+            "[{}] {} :{} ({}) [{}] by {}: {}",
+            if severe { "ALERT" } else { "WARNING" },
+            anomaly.protocol.to_uppercase(),
+            anomaly.port,
+            net::port_service_name(anomaly.port),
+            anomaly.local_address,
+            who,
+            anomaly.reasons.join("; ")
+        ));
+    }
+
+    for s in &sockets {
+        total += 1;
+        if s.is_listener() {
+            // UDP "listeners" include every unconnected client socket; only TCP LISTEN
+            // is counted and listed, UDP still went through the analyzer above.
+            if !s.proto.starts_with("tcp") {
+                continue;
+            }
+            listen += 1;
+            if listen_items.len() < 5 {
+                listen_items.push(format!(
+                    "LISTEN :{} ({}) [{}] {}",
+                    s.local_port,
+                    net::port_service_name(s.local_port),
+                    s.local_ip,
+                    owner_label(s.inode)
+                ));
+            }
+        } else if s.is_established() {
+            estab += 1;
+            if net::is_suspicious_port(s.remote_port) {
+                flagged += 1;
+                alert_items.push(format!(
+                    "[ALERT] Outbound C2/Reverse Shell to {}:{} ({}) from {}",
+                    s.remote_ip,
+                    s.remote_port,
+                    net::port_service_name(s.remote_port),
+                    owner_label(s.inode)
+                ));
+            }
+            if estab_items.len() < 5 {
+                estab_items.push(format!(
+                    "ESTAB -> {}:{} ({}) {}",
+                    s.remote_ip,
+                    s.remote_port,
+                    net::port_service_name(s.remote_port),
+                    owner_label(s.inode)
+                ));
             }
         }
     }
@@ -441,7 +421,13 @@ fn check_network_sockets() -> ModuleStatus {
         items.push("No active listening sockets found".to_string());
     }
 
-    let status = if flagged > 0 { "ALERT" } else { "SECURE" };
+    let status = if flagged > 0 {
+        "ALERT"
+    } else if warned > 0 {
+        "WARNING"
+    } else {
+        "SECURE"
+    };
     ModuleStatus {
         id: "network".to_string(),
         name: "Network & Sockets Radar".to_string(),
@@ -449,6 +435,8 @@ fn check_network_sockets() -> ModuleStatus {
         summary: format!("{} Active ({} Listen, {} Estab)", total, listen, estab),
         detail: if flagged > 0 {
             format!("[ALERT] {} Suspicious connections detected!", flagged)
+        } else if warned > 0 {
+            format!("{} listener(s) worth a look; see the list", warned)
         } else {
             "All outbound connections verified".to_string()
         },
@@ -2551,37 +2539,37 @@ mod tests {
 
     #[test]
     fn test_suspicious_port_detection_and_service_mapping() {
-        assert!(is_suspicious_port(1337));
-        assert!(is_suspicious_port(4444));
-        assert!(is_suspicious_port(5555));
-        assert!(is_suspicious_port(6666));
-        assert!(is_suspicious_port(6667));
-        assert!(is_suspicious_port(9001));
-        assert!(is_suspicious_port(31337));
+        assert!(net::is_suspicious_port(1337));
+        assert!(net::is_suspicious_port(4444));
+        assert!(net::is_suspicious_port(5555));
+        assert!(net::is_suspicious_port(6666));
+        assert!(net::is_suspicious_port(6667));
+        assert!(net::is_suspicious_port(9001));
+        assert!(net::is_suspicious_port(31337));
 
-        assert!(!is_suspicious_port(22));
-        assert!(!is_suspicious_port(53));
-        assert!(!is_suspicious_port(80));
-        assert!(!is_suspicious_port(443));
-        assert!(!is_suspicious_port(853));
+        assert!(!net::is_suspicious_port(22));
+        assert!(!net::is_suspicious_port(53));
+        assert!(!net::is_suspicious_port(80));
+        assert!(!net::is_suspicious_port(443));
+        assert!(!net::is_suspicious_port(853));
 
-        assert_eq!(port_service_name(4444), "Metasploit C2");
-        assert_eq!(port_service_name(1337), "Backdoor/C2");
-        assert_eq!(port_service_name(31337), "Back Orifice");
-        assert_eq!(port_service_name(853), "DoT Encrypted");
-        assert_eq!(port_service_name(6379), "Redis Cache");
+        assert_eq!(net::port_service_name(4444), "Metasploit C2");
+        assert_eq!(net::port_service_name(1337), "Backdoor/C2");
+        assert_eq!(net::port_service_name(31337), "Back Orifice");
+        assert_eq!(net::port_service_name(853), "DoT Encrypted");
+        assert_eq!(net::port_service_name(6379), "Redis Cache");
     }
 
     #[test]
     fn test_parse_ip_port_ipv4() {
-        let parsed = parse_ip_port("0100007F:115C");
+        let parsed = net::parse_ip_port("0100007F:115C");
         assert!(parsed.is_some());
         let (ip, port) = parsed.unwrap();
         assert_eq!(ip, "127.0.0.1");
         assert_eq!(port, 4444);
 
-        assert!(parse_ip_port("invalid").is_none());
-        assert!(parse_ip_port("0100007F:GGGG").is_none());
+        assert!(net::parse_ip_port("invalid").is_none());
+        assert!(net::parse_ip_port("0100007F:GGGG").is_none());
     }
 
     #[test]

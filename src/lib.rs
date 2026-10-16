@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod kernel;
+pub mod net;
 pub mod subproc;
 pub mod uevent;
 pub mod usb;
