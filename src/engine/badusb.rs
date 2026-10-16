@@ -195,7 +195,7 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
     // Prune declined-prompt entries of unplugged devices on every pass, so a device
     // that comes back on the same port is judged (and blocked) afresh
     let connected: Vec<&str> = devices.iter().map(|(b, _, _)| b.as_str()).collect();
-    let mut declined = load_deauth_declined(&connected);
+    load_deauth_declined(&connected);
 
     let untrusted_count = unapproved_bus_ids.len();
     let armor_active = is_usb_armor_enabled();
@@ -204,7 +204,7 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
     // armor lock may raise a polkit prompt; the others skip blocking this pass, so
     // one hot-plug never opens several password dialogs at once.
     let armor_lock = if armor_active && !deauth_targets.is_empty() {
-        try_armor_lock()
+        armor_lock(false)
     } else {
         None
     };
@@ -212,6 +212,8 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
         // A cancelled or failed polkit prompt is remembered per device (bus id +
         // VID:PID) until it is unplugged; otherwise every scan from the daemon,
         // panel and dashboard would raise the password dialog again.
+        // Another scan may have recorded a cancelled prompt while we waited
+        let mut declined = load_deauth_declined(&connected);
         let mut declined_changed = false;
         let mut blocked_now = 0;
         for (b_id, key) in &deauth_targets {
@@ -315,8 +317,10 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
     }
 }
 
-/// Non-blocking exclusive lock held for the armor pass; released when dropped
-fn try_armor_lock() -> Option<fs::File> {
+/// Exclusive lock held for an armor pass, or while "Trust Devices" restores and
+/// approves devices; released when dropped. Scans never wait for it, they skip
+/// blocking for that pass instead.
+fn armor_lock(wait: bool) -> Option<fs::File> {
     let dir = get_runtime_dir().unwrap_or_else(get_state_dir);
     let file = OpenOptions::new()
         .read(true)
@@ -327,8 +331,9 @@ fn try_armor_lock() -> Option<fs::File> {
         .custom_flags(O_NOFOLLOW)
         .open(dir.join("usb_armor.lock"))
         .ok()?;
+    let op = if wait { LOCK_EX } else { LOCK_EX | LOCK_NB };
     // SAFETY: valid fd owned by `file`, which the caller keeps alive while locked
-    (unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0).then_some(file)
+    (unsafe { flock(file.as_raw_fd(), op) } == 0).then_some(file)
 }
 
 fn deauth_declined_path() -> PathBuf {
@@ -369,6 +374,9 @@ fn is_deauthorized(path: &Path) -> bool {
 }
 
 pub(crate) fn trust_all_usb() -> usize {
+    // Hold off Armor until the restored devices are approved: a scan in between
+    // would see them re-enabled but not yet trusted and block them again.
+    let _armor_guard = armor_lock(true);
     // Give back every device Armor blocked first. A blocked device has no active
     // configuration (its interfaces are unknown), and a blocked hub hides every
     // device behind it, so trusting before re-authorizing would record an
