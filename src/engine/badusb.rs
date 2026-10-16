@@ -104,6 +104,19 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
         if fp.is_hid() {
             hid_count += 1;
         }
+        let already_blocked = read_file_bounded(&path.join("authorized"), 16)
+            .map(|a| a.trim() == "0")
+            .unwrap_or(false);
+        // A half-enumerated device has an incomplete interface set: judging or
+        // trusting it now would record (or compare) the wrong fingerprint and get the
+        // finished device blocked on the next pass. Re-check once it settles.
+        if !already_blocked && usb::is_enumerating(path) {
+            let prod = sanitize_usb_product(fp.product.as_deref().unwrap_or("USB Device"));
+            items.push(format!("{} [{}] [ENUMERATING, re-checking]", prod, fp.id()));
+            pending_enumeration = true;
+            continue;
+        }
+
         // First run: the devices present now become the baseline (trust on first use).
         // Legacy VID:PID-only entries are upgraded to full fingerprints when seen.
         if !file_existed {
@@ -118,15 +131,6 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
             Some(store.verdict(fp))
         };
         let is_trusted = matches!(verdict, None | Some(TrustVerdict::Trusted));
-        let already_blocked = read_file_bounded(&path.join("authorized"), 16)
-            .map(|a| a.trim() == "0")
-            .unwrap_or(false);
-        if !already_blocked && usb::is_enumerating(path) {
-            let prod = sanitize_usb_product(fp.product.as_deref().unwrap_or("USB Device"));
-            items.push(format!("{} [{}] [ENUMERATING, re-checking]", prod, fp.id()));
-            pending_enumeration = true;
-            continue;
-        }
 
         let tag = match &verdict {
             None => "UNVERIFIED".to_string(),
@@ -159,14 +163,17 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
             // the bus. Devices already de-authorized are skipped so each 20 s poll
             // does not re-trigger sysfs writes or pkexec prompts.
             if !already_blocked && !bus_id.starts_with("usb") {
-                deauth_targets.push(bus_id.clone());
+                deauth_targets.push((bus_id.clone(), format!("{} {}", bus_id, fp.id())));
             }
             unapproved_bus_ids.push(bus_id.clone());
             untrusted.push(format!("{} {} {}", bus_id, fp.id(), prod));
         }
     }
 
-    if store_changed || (!file_existed && !baseline_corrupt) {
+    // The first baseline waits until no device is mid-enumeration; saving it early
+    // would leave that device out and flag it as unapproved from then on.
+    let first_run_ready = !file_existed && !baseline_corrupt && !pending_enumeration;
+    if (store_changed && file_existed) || first_run_ready {
         save_trusted_usb(&trusted_file, &store);
     }
 
@@ -174,10 +181,36 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
     let armor_active = is_usb_armor_enabled();
 
     if armor_active && untrusted_count > 0 {
-        for b_id in &deauth_targets {
-            let _ = kernel::kernel_deauth_usb(b_id);
+        // A cancelled or failed polkit prompt is remembered per device (bus id +
+        // VID:PID) until it is unplugged; otherwise every scan from the daemon,
+        // panel and dashboard would raise the password dialog again.
+        let connected: Vec<&str> = devices.iter().map(|(b, _, _)| b.as_str()).collect();
+        let mut declined = load_deauth_declined(&connected);
+        let mut declined_changed = false;
+        let mut blocked_now = 0;
+        for (b_id, key) in &deauth_targets {
+            if declined.contains(key) {
+                continue;
+            }
+            if kernel::kernel_deauth_usb(b_id).success {
+                blocked_now += 1;
+            } else {
+                declined.push(key.clone());
+                declined_changed = true;
+            }
         }
-        items.push("USB Armor: untrusted devices were de-authorized".to_string());
+        if declined_changed {
+            save_deauth_declined(&declined);
+        }
+        if blocked_now > 0 {
+            items.push("USB Armor: untrusted devices were de-authorized".to_string());
+        }
+        if !declined.is_empty() {
+            items.push(
+                "[WARNING] USB Armor could not block a device (authorization cancelled or failed); it will not ask again until the device is replugged"
+                    .to_string(),
+            );
+        }
     }
 
     let legacy_left = store.devices.iter().filter(|d| d.is_legacy()).count();
@@ -249,6 +282,39 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
     }
 }
 
+fn deauth_declined_path() -> PathBuf {
+    get_runtime_dir()
+        .unwrap_or_else(get_state_dir)
+        .join("usb_deauth_declined")
+}
+
+/// Devices whose de-authorization was declined, pruned to the ones still connected
+fn load_deauth_declined(connected: &[&str]) -> Vec<String> {
+    let path = deauth_declined_path();
+    let raw = read_secure_state_file(&path, 64 * 1024).unwrap_or_default();
+    let all: Vec<String> = String::from_utf8_lossy(&raw)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let kept: Vec<String> = all
+        .iter()
+        .filter(|k| {
+            k.split(' ')
+                .next()
+                .is_some_and(|bus| connected.contains(&bus))
+        })
+        .cloned()
+        .collect();
+    if kept.len() != all.len() {
+        save_deauth_declined(&kept);
+    }
+    kept
+}
+
+fn save_deauth_declined(keys: &[String]) {
+    let _ = write_secure_state_file(&deauth_declined_path(), keys.join("\n").as_bytes());
+}
+
 pub(crate) fn trust_all_usb() -> usize {
     let devices = connected_usb_devices();
     let trusted_file = get_state_dir().join("trusted_usb.json");
@@ -256,7 +322,16 @@ pub(crate) fn trust_all_usb() -> usize {
     // unplugged are not silently dropped. A corrupt baseline is rebuilt from scratch.
     let mut store = load_trusted_usb(&trusted_file).unwrap_or_default();
     let mut added = 0;
-    for (_, _, fp) in &devices {
+    for (_, path, fp) in &devices {
+        // A device de-authorized by Armor has no active configuration, so its
+        // interfaces read as unknown (None) and the entry is completed the next
+        // time it is seen authorized. Only skip devices still enumerating.
+        let blocked = read_file_bounded(&path.join("authorized"), 16)
+            .map(|a| a.trim() == "0")
+            .unwrap_or(false);
+        if !blocked && usb::is_enumerating(path) {
+            continue;
+        }
         if store.trust(fp) {
             added += 1;
         }

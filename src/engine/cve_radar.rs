@@ -15,6 +15,9 @@ pub(crate) struct CveCache {
 pub(crate) struct ArchAuditCache {
     timestamp: u64,
     installed: bool,
+    /// mtime of the pacman local database: an install, upgrade or removal changes it
+    #[serde(default)]
+    pkgdb_mtime: u64,
     failed: bool,
     advisories: Vec<Advisory>,
 }
@@ -35,6 +38,11 @@ pub(crate) fn arch_audit_advisories() -> AuditOutcome {
     let cache_file = get_state_dir().join("arch_audit_cache.json");
     let now = unix_now();
     let installed = Path::new(ARCH_AUDIT_BIN).exists();
+    // Advisories are matched against installed versions, so any package change
+    // must invalidate the cache, not only arch-audit itself appearing or vanishing
+    let pkgdb_mtime = fs::metadata("/var/lib/pacman/local")
+        .map(|m| m.mtime().max(0) as u64)
+        .unwrap_or(0);
 
     if let Some(cache) = read_secure_state_file(&cache_file, 512 * 1024)
         .ok()
@@ -46,7 +54,10 @@ pub(crate) fn arch_audit_advisories() -> AuditOutcome {
             TTL_SECS
         };
         // An install or removal of arch-audit invalidates the cache immediately
-        if cache.installed == installed && now.saturating_sub(cache.timestamp) < ttl {
+        if cache.installed == installed
+            && cache.pkgdb_mtime == pkgdb_mtime
+            && now.saturating_sub(cache.timestamp) < ttl
+        {
             return match (cache.installed, cache.failed) {
                 (false, _) => AuditOutcome::NotInstalled,
                 (true, true) => AuditOutcome::Failed,
@@ -76,6 +87,7 @@ pub(crate) fn arch_audit_advisories() -> AuditOutcome {
     let cache = ArchAuditCache {
         timestamp: now,
         installed,
+        pkgdb_mtime,
         failed,
         advisories,
     };
@@ -167,6 +179,7 @@ pub(crate) fn check_cve() -> ModuleStatus {
 
     let pending_count = pending_pkgs.len();
     let audit = arch_audit_advisories();
+    let audit_failed = matches!(audit, AuditOutcome::Failed);
 
     let mut items = Vec::new();
     items.push(format!(
@@ -229,7 +242,7 @@ pub(crate) fn check_cve() -> ModuleStatus {
     // A fixable critical advisory means a known hole that one `pacman -Syu` closes
     let status = if fixable_critical > 0 {
         Status::Alert
-    } else if fixable_high > 0 || check_failed || pending_count > 10 {
+    } else if fixable_high > 0 || check_failed || audit_failed || pending_count > 10 {
         Status::Warning
     } else {
         Status::Secure
@@ -240,6 +253,7 @@ pub(crate) fn check_cve() -> ModuleStatus {
             pkg_count, advisory_count, cve_count
         ),
         _ if check_failed => format!("{} Packages (Update Check Unavailable)", pkg_count),
+        AuditOutcome::Failed => format!("{} Packages (CVE Check Unavailable)", pkg_count),
         _ if pending_count > 0 => {
             format!("{} Packages ({} Updates Pending)", pkg_count, pending_count)
         }
@@ -251,6 +265,8 @@ pub(crate) fn check_cve() -> ModuleStatus {
             "{} critical / {} high severity vulnerabilities have fixes available: run a system update",
             fixable_critical, fixable_high
         )
+    } else if audit_failed {
+        "Could not reach the Arch Security Tracker; CVE status unknown".to_string()
     } else if check_failed {
         "Could not query pending updates; install pacman-contrib or check network".to_string()
     } else if pending_count > 0 {

@@ -183,13 +183,21 @@ Item {
         path: root.reportCachePath
         watchChanges: true
         printErrors: false
+        // A stale, missing or unreadable cache means the daemon is not keeping up:
+        // fall back to a direct scan so the dashboard never shows old data as live
         onLoaded: {
+            var fresh = false;
             try {
                 var d = JSON.parse(String(text() || "").slice(0, 131072));
                 var age = Date.now() / 1000 - Number(d.generated_at || 0);
-                if (age >= 0 && age <= 60) root.applyReport(d);
+                if (age >= 0 && age <= 60) {
+                    root.applyReport(d);
+                    fresh = true;
+                }
             } catch(e) {}
+            if (!fresh) root.refresh();
         }
+        onLoadFailed: root.refresh()
         onFileChanged: reload()
     }
 
@@ -197,7 +205,10 @@ Item {
         interval: 20000
         running: root.reportCachePath !== ""
         repeat: true
-        onTriggered: reportView.reload()
+        onTriggered: {
+            if (!daemonProc.running) daemonProc.running = true;
+            reportView.reload();
+        }
     }
 
     Component.onCompleted: refresh()

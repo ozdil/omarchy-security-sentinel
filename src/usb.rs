@@ -244,6 +244,20 @@ pub fn read_fingerprint(dev_dir: &Path) -> Option<UsbFingerprint> {
         .map(|s| clean_identifier(&s, 64))
         .filter(|s| !s.is_empty());
 
+    // Without an active configuration (never configured, or de-authorized by
+    // USB Armor) the kernel exposes no interfaces. Report them as unknown rather
+    // than as an empty set: trusting a blocked device must not pin it to "no
+    // interfaces", or the real device would mismatch and be blocked again.
+    if read_attr(&dev_dir.join("bConfigurationValue"), 16).is_none() {
+        return Some(UsbFingerprint {
+            vid,
+            pid,
+            serial,
+            interfaces: None,
+            product,
+        });
+    }
+
     // Interface directories are named "<bus_id>:<config>.<interface>"
     let bus_id = dev_dir.file_name()?.to_string_lossy().to_string();
     let prefix = format!("{}:", bus_id);
@@ -410,6 +424,10 @@ mod tests {
             fs::write(ifd.join("bInterfaceProtocol"), format!("{}\n", p)).unwrap();
         }
 
+        // Unconfigured (or de-authorized): interfaces are unknown, not empty
+        assert_eq!(read_fingerprint(&dev).unwrap().interfaces, None);
+
+        fs::write(dev.join("bConfigurationValue"), "1\n").unwrap();
         let got = read_fingerprint(&dev).unwrap();
         assert_eq!(got.id(), "0781:5567");
         assert_eq!(got.serial.as_deref(), Some("4C53[31mx"));
@@ -421,6 +439,7 @@ mod tests {
         assert!(got.is_hid_storage_composite());
 
         // Enumeration state: unconfigured, partially enumerated, complete
+        fs::remove_file(dev.join("bConfigurationValue")).unwrap();
         assert!(is_enumerating(&dev));
         fs::write(dev.join("bConfigurationValue"), "1\n").unwrap();
         fs::write(dev.join("bNumInterfaces"), " 3\n").unwrap();

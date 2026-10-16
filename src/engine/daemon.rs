@@ -71,8 +71,27 @@ pub(crate) fn run_daemon() -> i32 {
         }
     };
 
-    let mut integrity_hash = String::new();
-    let mut integrity_at: Option<Instant> = None;
+    // Report building runs on its own thread: checkupdates and arch-audit can take
+    // many seconds, and USB events must keep being handled meanwhile. Each job is the
+    // latest BadUSB module; the worker skips stale ones queued while it was busy.
+    let (report_tx, report_rx) = std::sync::mpsc::channel::<ModuleStatus>();
+    std::thread::spawn(move || {
+        let mut integrity_hash = String::new();
+        let mut integrity_at: Option<Instant> = None;
+        while let Ok(mut badusb) = report_rx.recv() {
+            while let Ok(newer) = report_rx.try_recv() {
+                badusb = newer;
+            }
+            let now = Instant::now();
+            if integrity_at.is_none_or(|t| now.duration_since(t) >= DAEMON_INTEGRITY_REFRESH) {
+                integrity_hash = kernel::calculate_self_exe_sha256()
+                    .unwrap_or_else(|_| "UNVERIFIED".to_string());
+                integrity_at = Some(now);
+            }
+            write_report_cache(&assemble_report(badusb, integrity_hash.clone()));
+        }
+    });
+
     let mut next_report = Instant::now();
     let mut usb_check_at: Option<Instant> = None;
     let mut enumeration_rechecks = 0u32;
@@ -83,11 +102,6 @@ pub(crate) fn run_daemon() -> i32 {
         let now = Instant::now();
         let usb_due = usb_check_at.is_some_and(|t| t <= now);
         if usb_due || next_report <= now {
-            if integrity_at.is_none_or(|t| now.duration_since(t) >= DAEMON_INTEGRITY_REFRESH) {
-                integrity_hash = kernel::calculate_self_exe_sha256()
-                    .unwrap_or_else(|_| "UNVERIFIED".to_string());
-                integrity_at = Some(now);
-            }
             let scan = scan_badusb();
             notify_new_untrusted_usb(&scan.untrusted, &mut notified);
             usb_check_at = if scan.pending_enumeration
@@ -99,8 +113,10 @@ pub(crate) fn run_daemon() -> i32 {
                 enumeration_rechecks = 0;
                 None
             };
-            let report = assemble_report(scan.module, integrity_hash.clone());
-            write_report_cache(&report);
+            if report_tx.send(scan.module).is_err() {
+                eprintln!("sentinel daemon: report worker stopped");
+                return 1;
+            }
             next_report = Instant::now() + DAEMON_REPORT_INTERVAL;
             continue;
         }
