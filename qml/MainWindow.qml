@@ -13,6 +13,8 @@ Item {
     property var anomalousProcesses: []
     property var selectedModule: null
     property bool networkBlackoutActive: false
+    // False when the engine could only infer the blackout from its own marker
+    property bool networkBlackoutConfirmed: true
     property bool usbArmorEnabled: false
     property string selfIntegrityHash: ""
 
@@ -71,6 +73,7 @@ Item {
         root.modules = data.modules || [];
         root.anomalousProcesses = data.ai_anomalies || data.anomalous_processes || [];
         root.networkBlackoutActive = !!data.network_blackout_active;
+        root.networkBlackoutConfirmed = data.network_blackout_confirmed !== false;
         root.usbArmorEnabled = !!data.usb_armor_enabled;
         root.selfIntegrityHash = data.self_integrity_hash || "";
 
@@ -281,7 +284,9 @@ Item {
                         }
 
                         Text {
-                            text: root.networkBlackoutActive ? "Resume network" : (root.armedAction === "blackout" ? "Click again to cut all network" : "Panic blackout")
+                            text: root.networkBlackoutActive
+                                  ? (root.networkBlackoutConfirmed ? "Resume network" : "Resume network (blackout unconfirmed)")
+                                  : (root.armedAction === "blackout" ? "Click again to cut all network" : "Panic blackout")
                             font.family: Theme.fontFamily
                             font.pixelSize: 11
                             color: (root.networkBlackoutActive || root.armedAction === "blackout") ? Theme.accentDanger : Theme.textMain

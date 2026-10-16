@@ -91,6 +91,9 @@ pub(crate) struct SentinelReport {
     pub dns_dot_enabled: bool,
     pub usb_armor_enabled: bool,
     pub network_blackout_active: bool,
+    /// False when `network_blackout_active` comes from our own marker rather than the
+    /// kernel ruleset (unprivileged runs), so the UI must not present it as fact
+    pub network_blackout_confirmed: bool,
     pub self_integrity_hash: String,
     pub ai_threat_score: u32,
     pub ai_anomalies: Vec<ai::ProcessAnomaly>,
