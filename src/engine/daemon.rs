@@ -17,7 +17,7 @@ pub(crate) const PR_SET_PDEATHSIG: i32 = 1;
 pub(crate) const SIGTERM: u64 = 15;
 
 extern "C" {
-    fn flock(fd: i32, operation: i32) -> i32;
+    pub(crate) fn flock(fd: i32, operation: i32) -> i32;
     fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
     fn getppid() -> i32;
 }

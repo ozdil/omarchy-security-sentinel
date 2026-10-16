@@ -24,6 +24,8 @@ pub const TRUST_STORE_VERSION: u32 = 2;
 
 /// USB interface class code for Human Interface Devices (keyboards, mice, ...)
 const HID_CLASS: &str = "03";
+/// USB interface class code for hubs
+const HUB_CLASS: &str = "09";
 /// USB interface class code for Mass Storage
 const MASS_STORAGE_CLASS: &str = "08";
 
@@ -73,6 +75,14 @@ impl UsbFingerprint {
 
     pub fn is_hid(&self) -> bool {
         self.has_class(HID_CLASS)
+    }
+
+    /// Only hub interfaces: forwards traffic for the devices behind it, which are
+    /// fingerprinted on their own, and exposes no function of its own.
+    pub fn is_hub(&self) -> bool {
+        self.interfaces.as_ref().is_some_and(|ifs| {
+            !ifs.is_empty() && ifs.iter().all(|i| i.split(':').next() == Some(HUB_CLASS))
+        })
     }
 
     /// HID + mass storage on one device is the typical "USB stick that types" profile.
@@ -167,34 +177,49 @@ impl TrustStore {
         TrustVerdict::FingerprintMismatch { gained_hid }
     }
 
-    /// Replaces a legacy (VID:PID-only) entry with the full fingerprint of a
-    /// connected device it vouches for. Returns true when the store changed.
+    /// Replaces each legacy (VID:PID-only) entry with the full fingerprints of the
+    /// connected devices it vouches for. Returns true when the store changed.
     ///
-    /// Only the first connected device per legacy entry upgrades it, and only when
-    /// no full entry already covers that device, so the migration never widens trust.
-    pub fn upgrade_legacy(&mut self, device: &UsbFingerprint) -> bool {
-        if device.is_legacy()
-            || self
-                .devices
-                .iter()
-                .any(|e| !e.is_legacy() && e.matches(device))
-        {
-            return false;
+    /// All devices present during the migration pass are carried over, so two
+    /// identical units (same VID:PID, e.g. a pair of hubs or receivers) both stay
+    /// trusted. Once an entry is upgraded, a unit seen later has to match a full
+    /// fingerprint, so the migration never widens trust beyond what was connected.
+    pub fn upgrade_legacy(&mut self, connected: &[&UsbFingerprint]) -> bool {
+        let mut changed = false;
+        let mut i = 0;
+        while i < self.devices.len() {
+            if !self.devices[i].is_legacy() {
+                i += 1;
+                continue;
+            }
+            let mut upgraded: Vec<UsbFingerprint> = Vec::new();
+            for &device in connected {
+                let covered = device.is_legacy()
+                    || !self.devices[i].matches(device)
+                    || self
+                        .devices
+                        .iter()
+                        .chain(upgraded.iter())
+                        .any(|e| !e.is_legacy() && e.matches(device));
+                if !covered {
+                    upgraded.push(device.clone());
+                }
+            }
+            if upgraded.is_empty() {
+                i += 1;
+                continue;
+            }
+            self.devices.remove(i);
+            self.devices.extend(upgraded);
+            changed = true;
         }
-        if let Some(entry) = self
-            .devices
-            .iter_mut()
-            .find(|e| e.is_legacy() && e.matches(device))
-        {
-            *entry = device.clone();
-            return true;
-        }
-        false
+        changed
     }
 
     /// Adds `device` unless an entry already vouches for it. Returns true when added.
+    /// A legacy entry covering the device is upgraded to its full fingerprint.
     pub fn trust(&mut self, device: &UsbFingerprint) -> bool {
-        if self.upgrade_legacy(device) {
+        if self.upgrade_legacy(&[device]) {
             return true;
         }
         if self.devices.iter().any(|e| e.matches(device)) {
@@ -386,15 +411,30 @@ mod tests {
         let mut store = TrustStore::parse(br#"["046d:c52b"]"#).unwrap();
         let receiver = fp("046d", "c52b", None, &["03:01:01", "03:01:02"]);
         assert_eq!(store.verdict(&receiver), TrustVerdict::Trusted);
-        assert!(store.upgrade_legacy(&receiver));
+        assert!(store.upgrade_legacy(&[&receiver]));
         assert_eq!(store.devices, vec![receiver.clone()]);
         // A second unit with a different interface set is no longer covered
         let other = fp("046d", "c52b", None, &["03:01:01", "03:01:02", "08:06:50"]);
-        assert!(!store.upgrade_legacy(&other));
+        assert!(!store.upgrade_legacy(&[&other]));
         assert!(matches!(
             store.verdict(&other),
             TrustVerdict::FingerprintMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn test_legacy_upgrade_keeps_identical_units_connected_together() {
+        let mut store = TrustStore::parse(br#"["05e3:0610"]"#).unwrap();
+        let hub_a = fp("05e3", "0610", None, &["09:00:01"]);
+        let hub_b = fp("05e3", "0610", None, &["09:00:02"]);
+        let unconfigured = UsbFingerprint {
+            interfaces: None,
+            ..fp("05e3", "0610", None, &[])
+        };
+        assert!(store.upgrade_legacy(&[&hub_a, &hub_b, &hub_a, &unconfigured]));
+        assert_eq!(store.devices, vec![hub_a.clone(), hub_b.clone()]);
+        assert_eq!(store.verdict(&hub_a), TrustVerdict::Trusted);
+        assert_eq!(store.verdict(&hub_b), TrustVerdict::Trusted);
     }
 
     #[test]
@@ -437,6 +477,8 @@ mod tests {
             Some(vec!["03:01:01".to_string(), "08:06:50".to_string()])
         );
         assert!(got.is_hid_storage_composite());
+        assert!(!got.is_hub());
+        assert!(fp("05e3", "0610", None, &["09:00:01", "09:00:02"]).is_hub());
 
         // Enumeration state: unconfigured, partially enumerated, complete
         fs::remove_file(dev.join("bConfigurationValue")).unwrap();

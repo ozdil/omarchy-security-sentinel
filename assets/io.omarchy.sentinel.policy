@@ -8,7 +8,7 @@
 
   <action id="io.omarchy.sentinel.intervention">
     <description>Perform kernel-level security interventions</description>
-    <message>Authentication is required to execute kernel security interventions (process freeze/terminate/resume, socket sever, or USB deauthorization).</message>
+    <message>Authentication is required to execute kernel security interventions (process freeze/terminate/resume, socket sever, or USB de-authorization and re-authorization).</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>

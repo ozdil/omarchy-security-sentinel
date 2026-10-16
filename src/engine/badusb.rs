@@ -100,6 +100,19 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
     let devices = connected_usb_devices();
     let total_usb = devices.len();
 
+    // Legacy VID:PID-only entries are upgraded to full fingerprints from every
+    // settled device at once, so identical units connected together all keep
+    // their trust. Blocked or enumerating devices have no complete interface set
+    // yet and are left for a later pass.
+    if file_existed && !baseline_corrupt {
+        let settled: Vec<&UsbFingerprint> = devices
+            .iter()
+            .filter(|(_, path, _)| !usb::is_enumerating(path))
+            .map(|(_, _, fp)| fp)
+            .collect();
+        store_changed |= store.upgrade_legacy(&settled);
+    }
+
     for (bus_id, path, fp) in &devices {
         if fp.is_hid() {
             hid_count += 1;
@@ -117,12 +130,9 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
             continue;
         }
 
-        // First run: the devices present now become the baseline (trust on first use).
-        // Legacy VID:PID-only entries are upgraded to full fingerprints when seen.
+        // First run: the devices present now become the baseline (trust on first use)
         if !file_existed {
             store_changed |= store.trust(fp);
-        } else if !baseline_corrupt {
-            store_changed |= store.upgrade_legacy(fp);
         }
 
         let verdict = if baseline_corrupt {
@@ -159,10 +169,11 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
         items.push(format!("{} [{}]{} [{}]", prod, fp.id(), kind_tag, tag));
 
         if !is_trusted {
-            // Root hubs (usbN) are never auto-severed: that would drop every port on
-            // the bus. Devices already de-authorized are skipped so each 20 s poll
-            // does not re-trigger sysfs writes or pkexec prompts.
-            if !already_blocked && !bus_id.starts_with("usb") {
+            // Hubs (root hubs included) are never auto-severed: that would also cut
+            // off every trusted keyboard and mouse behind them, and each device on
+            // the hub is judged on its own anyway. Devices already de-authorized are
+            // skipped so each poll does not re-trigger sysfs writes or pkexec prompts.
+            if !already_blocked && !bus_id.starts_with("usb") && !fp.is_hub() {
                 deauth_targets.push((bus_id.clone(), format!("{} {}", bus_id, fp.id())));
             }
             unapproved_bus_ids.push(bus_id.clone());
@@ -180,7 +191,15 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
     let untrusted_count = unapproved_bus_ids.len();
     let armor_active = is_usb_armor_enabled();
 
-    if armor_active && untrusted_count > 0 {
+    // The daemon, panel and dashboard scan independently. Only the one holding the
+    // armor lock may raise a polkit prompt; the others skip blocking this pass, so
+    // one hot-plug never opens several password dialogs at once.
+    let armor_lock = if armor_active && !deauth_targets.is_empty() {
+        try_armor_lock()
+    } else {
+        None
+    };
+    if armor_active && untrusted_count > 0 && armor_lock.is_some() {
         // A cancelled or failed polkit prompt is remembered per device (bus id +
         // VID:PID) until it is unplugged; otherwise every scan from the daemon,
         // panel and dashboard would raise the password dialog again.
@@ -190,6 +209,13 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
         let mut blocked_now = 0;
         for (b_id, key) in &deauth_targets {
             if declined.contains(key) {
+                continue;
+            }
+            // Another scan may have blocked it while we waited for the lock
+            let auth = Path::new("/sys/bus/usb/devices")
+                .join(b_id)
+                .join("authorized");
+            if read_file_bounded(&auth, 16).is_ok_and(|a| a.trim() == "0") {
                 continue;
             }
             if kernel::kernel_deauth_usb(b_id).success {
@@ -282,6 +308,22 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
     }
 }
 
+/// Non-blocking exclusive lock held for the armor pass; released when dropped
+fn try_armor_lock() -> Option<fs::File> {
+    let dir = get_runtime_dir().unwrap_or_else(get_state_dir);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW)
+        .open(dir.join("usb_armor.lock"))
+        .ok()?;
+    // SAFETY: valid fd owned by `file`, which the caller keeps alive while locked
+    (unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0).then_some(file)
+}
+
 fn deauth_declined_path() -> PathBuf {
     get_runtime_dir()
         .unwrap_or_else(get_state_dir)
@@ -322,7 +364,8 @@ pub(crate) fn trust_all_usb() -> usize {
     // unplugged are not silently dropped. A corrupt baseline is rebuilt from scratch.
     let mut store = load_trusted_usb(&trusted_file).unwrap_or_default();
     let mut added = 0;
-    for (_, path, fp) in &devices {
+    let mut blocked_ids = Vec::new();
+    for (bus_id, path, fp) in &devices {
         // A device de-authorized by Armor has no active configuration, so its
         // interfaces read as unknown (None) and the entry is completed the next
         // time it is seen authorized. Only skip devices still enumerating.
@@ -335,14 +378,31 @@ pub(crate) fn trust_all_usb() -> usize {
         if store.trust(fp) {
             added += 1;
         }
+        if blocked {
+            blocked_ids.push(bus_id.clone());
+        }
     }
     save_trusted_usb(&trusted_file, &store);
+    // Trusting a device Armor blocked must also give it back: until it is
+    // re-authorized it stays dead, and unplugging it is the only other way out.
+    let restored = blocked_ids
+        .iter()
+        .filter(|b| kernel::kernel_reauth_usb(b).success)
+        .count();
+    let failed = blocked_ids.len() - restored;
     notify_desktop(
         "BadUSB Defense",
         &format!(
-            "Trusted {} connected USB devices ({} new or updated fingerprints).",
+            "Trusted {} connected USB devices ({} new or updated fingerprints){}.",
             devices.len(),
-            added
+            added,
+            if failed > 0 {
+                format!("; {} blocked device(s) need a replug to work again", failed)
+            } else if restored > 0 {
+                format!("; {} blocked device(s) re-enabled", restored)
+            } else {
+                String::new()
+            }
         ),
         false,
     );
