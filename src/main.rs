@@ -1441,6 +1441,14 @@ fn main() {
     // trigger an unrelated, possibly destructive subcommand.
     let cmd = args.get(1).map(String::as_str).unwrap_or("");
 
+    // Root-side polkit helper: `pkexec /usr/bin/sentinel-engine --privileged-* <op> [arg]`
+    if matches!(cmd, kernel::PRIVILEGED_INTERVENTION_FLAG | kernel::PRIVILEGED_NETWORK_FLAG) {
+        let op = args.get(2).map(String::as_str).unwrap_or("");
+        let res = kernel::run_privileged_operation(cmd, op, args.get(3).map(String::as_str));
+        println!("{}", serde_json::to_string(&res).unwrap());
+        std::process::exit(if res.success { 0 } else { 1 });
+    }
+
     // Verify self-integrity
     if matches!(cmd, "--verify-integrity" | "verify-integrity") {
         match kernel::calculate_self_exe_sha256() {

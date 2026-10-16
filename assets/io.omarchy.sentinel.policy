@@ -8,23 +8,25 @@
 
   <action id="io.omarchy.sentinel.intervention">
     <description>Perform kernel-level security interventions</description>
-    <message>Authentication is required to execute kernel security interventions (process freeze, socket sever, USB deauth, or netfilter quarantine).</message>
+    <message>Authentication is required to execute kernel security interventions (process freeze/terminate/resume, socket sever, or USB deauthorization).</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/sentinel-engine</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">--privileged-intervention</annotate>
   </action>
 
   <action id="io.omarchy.sentinel.network">
-    <description>Manage network privacy and DoT settings</description>
-    <message>Authentication is required to configure privacy network settings.</message>
+    <description>Manage the network killswitch and IP quarantine</description>
+    <message>Authentication is required to engage or clear the network blackout, or to quarantine an IP address.</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/sentinel-engine</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">--privileged-network</annotate>
   </action>
 </policyconfig>
