@@ -192,6 +192,11 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
         save_trusted_usb(&trusted_file, &store);
     }
 
+    // Prune declined-prompt entries of unplugged devices on every pass, so a device
+    // that comes back on the same port is judged (and blocked) afresh
+    let connected: Vec<&str> = devices.iter().map(|(b, _, _)| b.as_str()).collect();
+    let mut declined = load_deauth_declined(&connected);
+
     let untrusted_count = unapproved_bus_ids.len();
     let armor_active = is_usb_armor_enabled();
 
@@ -207,8 +212,6 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
         // A cancelled or failed polkit prompt is remembered per device (bus id +
         // VID:PID) until it is unplugged; otherwise every scan from the daemon,
         // panel and dashboard would raise the password dialog again.
-        let connected: Vec<&str> = devices.iter().map(|(b, _, _)| b.as_str()).collect();
-        let mut declined = load_deauth_declined(&connected);
         let mut declined_changed = false;
         let mut blocked_now = 0;
         for (b_id, key) in &deauth_targets {

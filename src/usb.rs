@@ -193,19 +193,25 @@ impl TrustStore {
                 continue;
             }
             let mut upgraded: Vec<UsbFingerprint> = Vec::new();
+            let mut seen = false;
             for &device in connected {
-                let covered = device.is_legacy()
-                    || !self.devices[i].matches(device)
-                    || self
-                        .devices
-                        .iter()
-                        .chain(upgraded.iter())
-                        .any(|e| !e.is_legacy() && e.matches(device));
+                if device.is_legacy() || !self.devices[i].matches(device) {
+                    continue;
+                }
+                seen = true;
+                let covered = self
+                    .devices
+                    .iter()
+                    .chain(upgraded.iter())
+                    .any(|e| !e.is_legacy() && e.matches(device));
                 if !covered {
                     upgraded.push(device.clone());
                 }
             }
-            if upgraded.is_empty() {
+            // An entry whose devices are all covered by full fingerprints already
+            // (a duplicate VID:PID from the v1 format) is dropped too; left in place
+            // it would keep vouching for any clone of that model.
+            if !seen {
                 i += 1;
                 continue;
             }
@@ -435,6 +441,16 @@ mod tests {
         assert_eq!(store.devices, vec![hub_a.clone(), hub_b.clone()]);
         assert_eq!(store.verdict(&hub_a), TrustVerdict::Trusted);
         assert_eq!(store.verdict(&hub_b), TrustVerdict::Trusted);
+
+        // v1 files list one VID:PID per connected device, so duplicates occur
+        let mut dup = TrustStore::parse(br#"["05e3:0610","05e3:0610"]"#).unwrap();
+        assert!(dup.upgrade_legacy(&[&hub_a, &hub_b]));
+        assert_eq!(dup.devices, vec![hub_a.clone(), hub_b.clone()]);
+        let clone = fp("05e3", "0610", None, &["03:01:01", "09:00:01"]);
+        assert!(matches!(
+            dup.verdict(&clone),
+            TrustVerdict::FingerprintMismatch { gained_hid: true }
+        ));
     }
 
     #[test]
