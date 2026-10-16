@@ -132,10 +132,54 @@ Panel {
     actionProc.running = true
   }
 
-  function refresh() {
-    if (!stateProc.running) {
-      stateProc.running = true
+  // The engine daemon keeps this report fresh (and reacts to USB hot-plug
+  // within a second); a full --json scan only runs when the cache is stale.
+  readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
+  readonly property string reportCachePath: runtimeDir !== "" ? runtimeDir + "/omarchy-security-sentinel/report.json" : ""
+  readonly property int reportMaxAgeSec: 60
+
+  function applyReport(d) {
+    root.overallStatus = String(d.overall_status || "ALL SYSTEMS SECURE")
+    root.threatLevel = String(d.threat_level || "ZERO")
+    root.activeCount = Number(d.active_modules) || 9
+    root.modules = d.modules || []
+    root.aiThreatScore = Number(d.ai_threat_score) || 0
+    root.aiAnomalies = d.ai_anomalies || []
+    root.kernelCapabilities = d.kernel_capabilities || []
+  }
+
+  // Returns true when the cached report was fresh enough to use
+  function loadCachedReport(raw) {
+    try {
+      var d = JSON.parse(String(raw || "").slice(0, 131072))
+      var age = Date.now() / 1000 - Number(d.generated_at || 0)
+      if (age < 0 || age > root.reportMaxAgeSec) return false
+      root.applyReport(d)
+      return true
+    } catch(e) {
+      return false
     }
+  }
+
+  // A scan requested while one runs (e.g. right after an action) is queued,
+  // otherwise the UI would keep showing the pre-action state.
+  property bool rescanPending: false
+
+  function scanNow() {
+    if (stateProc.running) {
+      root.rescanPending = true
+      return
+    }
+    stateProc.running = true
+  }
+
+  function refresh() {
+    if (root.reportCachePath === "") {
+      root.scanNow()
+      return
+    }
+    if (!daemonProc.running) daemonProc.running = true
+    reportView.reload()
   }
 
   function kernelFreezeProcess(pid) {
@@ -285,7 +329,7 @@ Panel {
     function open() { root.open() }
     function close() { root.close() }
     function toggle() { root.toggle() }
-    function refresh() { root.refresh() }
+    function refresh() { root.scanNow() }
     function toggleGhostMac() { root.toggleGhostMac() }
     function toggleDns() { root.toggleDns() }
     function expand(id: string) { root.toggleExpand(id) }
@@ -310,19 +354,17 @@ Panel {
   Process {
     id: stateProc
     command: [root.resolveEnginePath(), "--json"]
+    onExited: function(code) {
+      if (root.rescanPending) {
+        root.rescanPending = false
+        root.scanNow()
+      }
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         try {
-          var clean = String(text || "").slice(0, 131072)
-          var d = JSON.parse(clean)
-          root.overallStatus = String(d.overall_status || "ALL SYSTEMS SECURE")
-          root.threatLevel = String(d.threat_level || "ZERO")
-          root.activeCount = Number(d.active_modules) || 9
-          root.modules = d.modules || []
-          root.aiThreatScore = Number(d.ai_threat_score) || 0
-          root.aiAnomalies = d.ai_anomalies || []
-          root.kernelCapabilities = d.kernel_capabilities || []
+          root.applyReport(JSON.parse(String(text || "").slice(0, 131072)))
         } catch(e) {}
       }
     }
@@ -330,11 +372,30 @@ Panel {
 
 
 
+  // Single instance per session (flock); a second panel's copy exits at once.
+  // It dies with the shell via PR_SET_PDEATHSIG.
+  Process {
+    id: daemonProc
+    command: [root.resolveEnginePath(), "--daemon"]
+  }
+
+  FileView {
+    id: reportView
+    path: root.reportCachePath
+    watchChanges: true
+    printErrors: false
+    onLoaded: {
+      if (!root.loadCachedReport(text())) root.scanNow()
+    }
+    onLoadFailed: root.scanNow()
+    onFileChanged: reload()
+  }
+
   Process {
     id: toggleGhostProc
     command: [root.resolveEnginePath(), "--toggle-ghost-mac"]
     onExited: function(code) {
-      root.refresh()
+      root.scanNow()
     }
   }
 
@@ -342,14 +403,14 @@ Panel {
     id: toggleDnsProc
     command: [root.resolveEnginePath(), "--toggle-dns"]
     onExited: function(code) {
-      root.refresh()
+      root.scanNow()
     }
   }
   Process {
     id: toggleUsbArmorProc
     command: [root.resolveEnginePath(), "--toggle-usb-armor"]
     onExited: function(code) {
-      root.refresh()
+      root.scanNow()
     }
   }
 
@@ -358,7 +419,7 @@ Panel {
     id: trustUsbProc
     command: [root.resolveEnginePath(), "--trust-all-usb"]
     onExited: function(code) {
-      root.refresh()
+      root.scanNow()
     }
   }
 
@@ -366,14 +427,14 @@ Panel {
     id: resetCanariesProc
     command: [root.resolveEnginePath(), "--reset-canaries"]
     onExited: function(code) {
-      root.refresh()
+      root.scanNow()
     }
   }
 
   Process {
     id: actionProc
     onExited: function(code) {
-      root.refresh()
+      root.scanNow()
       root.startNextAction()
     }
   }
@@ -389,6 +450,7 @@ Panel {
   Component.onCompleted: refresh()
   Component.onDestruction: {
     if (stateProc.running) stateProc.running = false
+    if (daemonProc.running) daemonProc.running = false
     if (toggleGhostProc.running) toggleGhostProc.running = false
     if (toggleDnsProc.running) toggleDnsProc.running = false
     if (trustUsbProc.running) trustUsbProc.running = false
@@ -440,7 +502,7 @@ Panel {
       onActivateRequested: root.activateSelected()
       onTextKey: function(t) {
         if (t === "r" || t === "R") {
-          root.refresh()
+          root.scanNow()
         } else if (t === "a" || t === "A") {
           root.showAboutModal = !root.showAboutModal
         }
@@ -789,7 +851,7 @@ Panel {
                         fontFamily: root.fontFamily
                         fontSize: Style.font.caption
                         bordered: true
-                        onClicked: root.refresh()
+                        onClicked: root.scanNow()
                       }
 
                       Button {
@@ -1007,7 +1069,7 @@ Panel {
             accent: root.accent
             fontFamily: root.fontFamily
             bordered: true
-            onClicked: root.refresh()
+            onClicked: root.scanNow()
           }
         }
       }

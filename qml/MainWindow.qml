@@ -38,9 +38,37 @@ Item {
         actionProc.running = true;
     }
 
+    property bool rescanPending: false
+
     function refresh() {
-        if (!sentinelProc.running) {
-            sentinelProc.running = true;
+        if (sentinelProc.running) {
+            root.rescanPending = true;
+            return;
+        }
+        sentinelProc.running = true;
+    }
+
+    // Live updates (USB hot-plug, 20 s cycle) come from the engine daemon's cache
+    readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
+    readonly property string reportCachePath: runtimeDir !== "" ? runtimeDir + "/omarchy-security-sentinel/report.json" : ""
+
+    function applyReport(data) {
+        root.threatLevel = data.threat_level || "ZERO";
+        root.modules = data.modules || [];
+        root.anomalousProcesses = data.ai_anomalies || data.anomalous_processes || [];
+        root.networkBlackoutActive = !!data.network_blackout_active;
+        root.usbArmorEnabled = !!data.usb_armor_enabled;
+        root.selfIntegrityHash = data.self_integrity_hash || "";
+
+        if (!root.selectedModule && root.modules.length > 0) {
+            root.selectedModule = root.modules[0];
+        } else if (root.selectedModule) {
+            for (var i = 0; i < root.modules.length; i++) {
+                if (root.modules[i].id === root.selectedModule.id) {
+                    root.selectedModule = root.modules[i];
+                    break;
+                }
+            }
         }
     }
 
@@ -83,28 +111,17 @@ Item {
     Process {
         id: sentinelProc
         command: [root.enginePath, "--json"]
+        onExited: {
+            if (root.rescanPending) {
+                root.rescanPending = false;
+                root.refresh();
+            }
+        }
         stdout: StdioCollector {
             waitForEnd: true
             onStreamFinished: {
                 try {
-                    var data = JSON.parse(text || "{}");
-                    root.threatLevel = data.threat_level || "ZERO";
-                    root.modules = data.modules || [];
-                    root.anomalousProcesses = data.ai_anomalies || data.anomalous_processes || [];
-                    root.networkBlackoutActive = !!data.network_blackout_active;
-                    root.usbArmorEnabled = !!data.usb_armor_enabled;
-                    root.selfIntegrityHash = data.self_integrity_hash || "";
-
-                    if (!root.selectedModule && root.modules.length > 0) {
-                        root.selectedModule = root.modules[0];
-                    } else if (root.selectedModule) {
-                        for (var i = 0; i < root.modules.length; i++) {
-                            if (root.modules[i].id === root.selectedModule.id) {
-                                root.selectedModule = root.modules[i];
-                                break;
-                            }
-                        }
-                    }
+                    root.applyReport(JSON.parse(String(text || "{}").slice(0, 131072)));
                 } catch(e) {
                     console.warn("Failed to parse sentinel json:", e);
                 }
@@ -118,6 +135,35 @@ Item {
             root.refresh();
             root.startNextAction();
         }
+    }
+
+    // Shares the panel's daemon when one already runs (flock single instance)
+    Process {
+        id: daemonProc
+        command: [root.enginePath, "--daemon"]
+        running: root.reportCachePath !== ""
+    }
+
+    FileView {
+        id: reportView
+        path: root.reportCachePath
+        watchChanges: true
+        printErrors: false
+        onLoaded: {
+            try {
+                var d = JSON.parse(String(text() || "").slice(0, 131072));
+                var age = Date.now() / 1000 - Number(d.generated_at || 0);
+                if (age >= 0 && age <= 60) root.applyReport(d);
+            } catch(e) {}
+        }
+        onFileChanged: reload()
+    }
+
+    Timer {
+        interval: 20000
+        running: root.reportCachePath !== ""
+        repeat: true
+        onTriggered: reportView.reload()
     }
 
     Component.onCompleted: refresh()

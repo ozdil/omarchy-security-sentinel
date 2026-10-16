@@ -275,6 +275,37 @@ pub fn read_fingerprint(dev_dir: &Path) -> Option<UsbFingerprint> {
     })
 }
 
+/// True while the device is still enumerating: no active configuration yet, or
+/// fewer interface directories than the active configuration declares. Judging a
+/// half-enumerated device would compare an incomplete interface set against the
+/// baseline and could de-authorize a trusted keyboard right after it is plugged in.
+/// An unconfigured device has no bound interfaces, so it cannot inject input meanwhile.
+pub fn is_enumerating(dev_dir: &Path) -> bool {
+    let configured = read_attr(&dev_dir.join("bConfigurationValue"), 16).is_some();
+    if !configured {
+        return true;
+    }
+    let Some(declared) =
+        read_attr(&dev_dir.join("bNumInterfaces"), 16).and_then(|n| n.trim().parse::<usize>().ok())
+    else {
+        return false;
+    };
+    let Some(bus_id) = dev_dir.file_name().map(|n| n.to_string_lossy().to_string()) else {
+        return false;
+    };
+    let prefix = format!("{}:", bus_id);
+    let present = fs::read_dir(dev_dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+                .filter(|e| e.path().join("bInterfaceClass").is_file())
+                .count()
+        })
+        .unwrap_or(0);
+    present < declared
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +419,14 @@ mod tests {
             Some(vec!["03:01:01".to_string(), "08:06:50".to_string()])
         );
         assert!(got.is_hid_storage_composite());
+
+        // Enumeration state: unconfigured, partially enumerated, complete
+        assert!(is_enumerating(&dev));
+        fs::write(dev.join("bConfigurationValue"), "1\n").unwrap();
+        fs::write(dev.join("bNumInterfaces"), " 3\n").unwrap();
+        assert!(is_enumerating(&dev));
+        fs::write(dev.join("bNumInterfaces"), " 2\n").unwrap();
+        assert!(!is_enumerating(&dev));
 
         // Interface directories are not devices
         assert!(read_fingerprint(&dev.join("1-2:1.0")).is_none());

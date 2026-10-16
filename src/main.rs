@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -46,6 +48,9 @@ pub struct SentinelReport {
     pub kernel_capabilities: Vec<String>,
     pub modules: Vec<ModuleStatus>,
     pub timestamp: String,
+    /// Unix time the report was built; lets the UI tell a fresh daemon cache from a stale one
+    #[serde(default)]
+    pub generated_at: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -514,7 +519,20 @@ fn connected_usb_devices() -> Vec<(String, PathBuf, UsbFingerprint)> {
 }
 
 // 2. BadUSB Defense
+/// Result of one BadUSB pass. The daemon uses the extra fields to re-check devices
+/// that were still enumerating and to notify only about newly seen untrusted ones.
+struct BadUsbScan {
+    module: ModuleStatus,
+    pending_enumeration: bool,
+    /// Stable identity (bus id + fingerprint id) of every untrusted device
+    untrusted: Vec<String>,
+}
+
 fn check_badusb() -> ModuleStatus {
+    scan_badusb().module
+}
+
+fn scan_badusb() -> BadUsbScan {
     let mut hid_count = 0;
     let mut unapproved_bus_ids = Vec::new();
     let mut deauth_targets = Vec::new();
@@ -532,6 +550,8 @@ fn check_badusb() -> ModuleStatus {
     let baseline_corrupt = file_existed && loaded.is_none();
     let mut store = loaded.unwrap_or_default();
     let mut store_changed = false;
+    let mut pending_enumeration = false;
+    let mut untrusted = Vec::new();
 
     let devices = connected_usb_devices();
     let total_usb = devices.len();
@@ -557,6 +577,12 @@ fn check_badusb() -> ModuleStatus {
         let already_blocked = read_file_bounded(&path.join("authorized"), 16)
             .map(|a| a.trim() == "0")
             .unwrap_or(false);
+        if !already_blocked && usb::is_enumerating(path) {
+            let prod = sanitize_usb_product(fp.product.as_deref().unwrap_or("USB Device"));
+            items.push(format!("{} [{}] [ENUMERATING, re-checking]", prod, fp.id()));
+            pending_enumeration = true;
+            continue;
+        }
 
         let tag = match &verdict {
             None => "UNVERIFIED".to_string(),
@@ -592,6 +618,7 @@ fn check_badusb() -> ModuleStatus {
                 deauth_targets.push(bus_id.clone());
             }
             unapproved_bus_ids.push(bus_id.clone());
+            untrusted.push(format!("{} {} {}", bus_id, fp.id(), prod));
         }
     }
 
@@ -625,7 +652,7 @@ fn check_badusb() -> ModuleStatus {
             "[WARNING] Trusted baseline {} is unreadable or corrupt; auto-blocking suspended. Use 'Trust Devices' to rebuild it.",
             trusted_file.display()
         ));
-        return ModuleStatus {
+        let module = ModuleStatus {
             id: "badusb".to_string(),
             name: "BadUSB Defense".to_string(),
             status: "WARNING".to_string(),
@@ -635,6 +662,11 @@ fn check_badusb() -> ModuleStatus {
             toggle_state: armor_active,
             items,
         };
+        return BadUsbScan {
+            module,
+            pending_enumeration,
+            untrusted,
+        };
     }
 
     let status = if untrusted_count > 0 {
@@ -642,7 +674,7 @@ fn check_badusb() -> ModuleStatus {
     } else {
         "SECURE"
     };
-    ModuleStatus {
+    let module = ModuleStatus {
         id: "badusb".to_string(),
         name: "BadUSB Defense".to_string(),
         status: status.to_string(),
@@ -672,6 +704,11 @@ fn check_badusb() -> ModuleStatus {
         is_toggleable: true,
         toggle_state: armor_active,
         items,
+    };
+    BadUsbScan {
+        module,
+        pending_enumeration,
+        untrusted,
     }
 }
 
@@ -1664,6 +1701,14 @@ fn check_ai_behavior() -> (ModuleStatus, u32, Vec<ai::ProcessAnomaly>) {
 }
 
 fn build_report() -> SentinelReport {
+    // BadUSB runs first so an armored de-authorization is not delayed by the slower modules
+    let badusb_mod = check_badusb();
+    let self_integrity_hash =
+        kernel::calculate_self_exe_sha256().unwrap_or_else(|_| "UNVERIFIED".to_string());
+    assemble_report(badusb_mod, self_integrity_hash)
+}
+
+fn assemble_report(badusb_mod: ModuleStatus, self_integrity_hash: String) -> SentinelReport {
     let (ai_mod, ai_threat_score, ai_anomalies) = check_ai_behavior();
     let (dns_mod, dns_dot_enabled) = check_dns_leak();
     let (ghost_mac_mod, ghost_mac_enabled) = check_ghost_mac();
@@ -1671,7 +1716,7 @@ fn build_report() -> SentinelReport {
     let modules = vec![
         ai_mod,
         check_network_sockets(),
-        check_badusb(),
+        badusb_mod,
         check_cve(),
         check_auth_watch(),
         check_tripwire(),
@@ -1693,8 +1738,6 @@ fn build_report() -> SentinelReport {
 
     let usb_armor_enabled = is_usb_armor_enabled();
     let network_blackout_active = kernel::kernel_is_network_blackout_active();
-    let self_integrity_hash =
-        kernel::calculate_self_exe_sha256().unwrap_or_else(|_| "UNVERIFIED".to_string());
 
     let kernel_capabilities = vec![
         "cgroups_v2_freeze".to_string(),
@@ -1722,6 +1765,209 @@ fn build_report() -> SentinelReport {
         kernel_capabilities,
         modules,
         timestamp: "Live Defense".to_string(),
+        generated_at: unix_now(),
+    }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Per-session runtime directory for the cached report and the daemon lock.
+/// `$XDG_RUNTIME_DIR` is a per-user tmpfs (0700) that logind removes at logout.
+fn get_runtime_dir() -> Option<PathBuf> {
+    let base = env::var("XDG_RUNTIME_DIR").ok()?;
+    if !base.starts_with('/') {
+        return None;
+    }
+    let dir = Path::new(&base).join("omarchy-security-sentinel");
+    let _ = fs::create_dir(&dir);
+    // Refuse a symlink or a directory planted by another user
+    let meta = fs::symlink_metadata(&dir).ok()?;
+    // SAFETY: getuid has no preconditions
+    if !meta.file_type().is_dir() || meta.uid() != unsafe { getuid() } {
+        return None;
+    }
+    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+    Some(dir)
+}
+
+fn report_cache_path() -> Option<PathBuf> {
+    get_runtime_dir().map(|d| d.join("report.json"))
+}
+
+/// Publishes the report for the panel and dashboard (atomic rename, 0600)
+fn write_report_cache(report: &SentinelReport) {
+    if let (Some(path), Ok(json)) = (report_cache_path(), serde_json::to_vec(report)) {
+        let _ = write_secure_state_file(&path, &json);
+    }
+}
+
+const DAEMON_REPORT_INTERVAL: Duration = Duration::from_secs(20);
+/// Hot-plug produces a burst of uevents (device, then each interface); wait for quiet
+const DAEMON_USB_SETTLE: Duration = Duration::from_millis(750);
+const DAEMON_ENUMERATION_RECHECK: Duration = Duration::from_secs(1);
+const DAEMON_MAX_ENUMERATION_RECHECKS: u32 = 15;
+const DAEMON_INTEGRITY_REFRESH: Duration = Duration::from_secs(300);
+/// Without a uevent socket, poll the USB device list this often instead
+const DAEMON_USB_POLL_FALLBACK: Duration = Duration::from_secs(2);
+
+const LOCK_EX: i32 = 2;
+const LOCK_NB: i32 = 4;
+const PR_SET_PDEATHSIG: i32 = 1;
+const SIGTERM: u64 = 15;
+
+extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+    fn prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i32;
+    fn getppid() -> i32;
+}
+
+/// Long-running monitor started by the panel: reacts to USB hot-plug within a second
+/// and keeps `report.json` fresh so the UI does not spawn a full scan every 20 s.
+/// Runs inside the graphical session (not as a systemd service) so polkit's
+/// `allow_active` still applies to the pkexec prompts armor de-authorization needs.
+fn run_daemon() -> i32 {
+    let Some(runtime_dir) = get_runtime_dir() else {
+        eprintln!("sentinel daemon: XDG_RUNTIME_DIR is unavailable");
+        return 1;
+    };
+    let lock_path = runtime_dir.join("daemon.lock");
+    let lock_file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("sentinel daemon: cannot open lock: {}", e);
+            return 1;
+        }
+    };
+    // SAFETY: valid fd owned by lock_file, which lives until the function returns
+    if unsafe { flock(lock_file.as_raw_fd(), LOCK_EX | LOCK_NB) } != 0 {
+        // Another panel or dashboard already runs the daemon; its cache serves us too
+        return 0;
+    }
+    // Exit with the panel that started us instead of lingering after a shell restart.
+    // SAFETY: PR_SET_PDEATHSIG with a valid signal number has no memory effects
+    unsafe { prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0) };
+    // SAFETY: getppid has no preconditions
+    if unsafe { getppid() } == 1 {
+        return 0; // parent already gone before PDEATHSIG was armed
+    }
+
+    let uevents = match sentinel_engine::uevent::UEventSocket::open() {
+        Ok(sock) => Some(sock),
+        Err(e) => {
+            eprintln!(
+                "sentinel daemon: uevent socket unavailable ({}), polling USB every {:?}",
+                e, DAEMON_USB_POLL_FALLBACK
+            );
+            None
+        }
+    };
+
+    let mut integrity_hash = String::new();
+    let mut integrity_at: Option<Instant> = None;
+    let mut next_report = Instant::now();
+    let mut usb_check_at: Option<Instant> = None;
+    let mut enumeration_rechecks = 0u32;
+    let mut notified: HashSet<String> = HashSet::new();
+    let mut usb_signature = usb_device_signature();
+
+    loop {
+        let now = Instant::now();
+        let usb_due = usb_check_at.is_some_and(|t| t <= now);
+        if usb_due || next_report <= now {
+            if integrity_at.is_none_or(|t| now.duration_since(t) >= DAEMON_INTEGRITY_REFRESH) {
+                integrity_hash = kernel::calculate_self_exe_sha256()
+                    .unwrap_or_else(|_| "UNVERIFIED".to_string());
+                integrity_at = Some(now);
+            }
+            let scan = scan_badusb();
+            notify_new_untrusted_usb(&scan.untrusted, &mut notified);
+            usb_check_at = if scan.pending_enumeration
+                && enumeration_rechecks < DAEMON_MAX_ENUMERATION_RECHECKS
+            {
+                enumeration_rechecks += 1;
+                Some(Instant::now() + DAEMON_ENUMERATION_RECHECK)
+            } else {
+                enumeration_rechecks = 0;
+                None
+            };
+            let report = assemble_report(scan.module, integrity_hash.clone());
+            write_report_cache(&report);
+            next_report = Instant::now() + DAEMON_REPORT_INTERVAL;
+            continue;
+        }
+
+        let deadline = usb_check_at.map_or(next_report, |t| t.min(next_report));
+        let wait = deadline.saturating_duration_since(now);
+        let usb_changed = match &uevents {
+            Some(sock) => sock
+                .wait(wait)
+                .iter()
+                .any(|ev| ev.is_usb_arrival() || ev.is_usb_removal()),
+            None => {
+                std::thread::sleep(wait.min(DAEMON_USB_POLL_FALLBACK));
+                let sig = usb_device_signature();
+                let changed = sig != usb_signature;
+                usb_signature = sig;
+                changed
+            }
+        };
+        if usb_changed {
+            usb_check_at = Some(Instant::now() + DAEMON_USB_SETTLE);
+            enumeration_rechecks = 0;
+        }
+    }
+}
+
+/// Cheap change detector for the polling fallback: the sorted list of USB bus ids
+fn usb_device_signature() -> Vec<String> {
+    let mut ids: Vec<String> = fs::read_dir("/sys/bus/usb/devices")
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids
+}
+
+/// Raises one critical notification per untrusted device while it stays connected
+fn notify_new_untrusted_usb(untrusted: &[String], notified: &mut HashSet<String>) {
+    notified.retain(|id| untrusted.contains(id));
+    let fresh: Vec<&String> = untrusted
+        .iter()
+        .filter(|id| !notified.contains(*id))
+        .collect();
+    if fresh.is_empty() {
+        return;
+    }
+    let armor = is_usb_armor_enabled();
+    let body = format!(
+        "{} untrusted USB device(s) connected{}: {}",
+        fresh.len(),
+        if armor { " and de-authorized" } else { "" },
+        fresh
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    notify_desktop("BadUSB Defense", &body, true);
+    for id in fresh {
+        notified.insert(id.clone());
     }
 }
 
@@ -1744,6 +1990,10 @@ fn main() {
         let res = kernel::run_privileged_operation(cmd, op, args.get(3).map(String::as_str));
         println!("{}", serde_json::to_string(&res).unwrap());
         std::process::exit(if res.success { 0 } else { 1 });
+    }
+
+    if matches!(cmd, "--daemon") {
+        std::process::exit(run_daemon());
     }
 
     // Verify self-integrity
@@ -1977,6 +2227,7 @@ fn main() {
     }
 
     if matches!(cmd, "--json") {
+        write_report_cache(&report);
         println!("{}", serde_json::to_string(&report).unwrap());
         return;
     }

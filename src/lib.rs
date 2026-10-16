@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod kernel;
 pub mod subproc;
+pub mod uevent;
 pub mod usb;
 
 pub use ai::{

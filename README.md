@@ -25,7 +25,7 @@ Fully hardened with HANCORE Military-Grade Security Standards, providing kernel-
 Each subsystem features an interactive inspection menu:
 
 1. Network and Sockets Radar: Real-time socket monitoring (`/proc/net/tcp*`, `/proc/net/udp*`) reporting Listening versus Established sockets and detecting suspicious ports. Expands to display individual listening ports (`LISTEN :53`, `LISTEN :631`) and active sockets.
-2. BadUSB Defense & Hardware Armor: Hardware HID device monitoring (`/sys/bus/usb/devices`), maintaining a local device-fingerprint baseline (`trusted_usb.json`, mode 0600: VID:PID, serial number and interface classes) so a device that clones a trusted ID but adds a keyboard interface is flagged to alert against unauthorized Rubber Ducky and BadUSB keystroke injectors. Features an instant UI killswitch to toggle USB Armor lockdown.
+2. BadUSB Defense & Hardware Armor: Hardware HID device monitoring (`/sys/bus/usb/devices`), maintaining a local device-fingerprint baseline (`trusted_usb.json`, mode 0600: VID:PID, serial number and interface classes) so a device that clones a trusted ID but adds a keyboard interface is flagged the moment it is plugged in (kernel uevent, no 20 s polling gap) to alert against unauthorized Rubber Ducky and BadUSB keystroke injectors. Features an instant UI killswitch to toggle USB Armor lockdown.
 3. CVE Vulnerability Radar: Pending package updates across installed packages via `checkupdates` (pacman-contrib). It does not query the Arch Security Tracker for CVE IDs yet.
 4. Authentication Watch: Systemd journald and PAM audit monitoring unauthorized login and SSH authentication failures over a rolling 24-hour window.
 5. Tripwire Canaries & Self-Defense: Honey-token canary files with SHA-256 baseline verification for ransomware and tampering early warning. Includes active self-integrity verification (Self-Exe SHA-256 hash checks) and Panic Blackout triggers.
@@ -90,6 +90,10 @@ sentinel-engine --status
 
 # Output machine-readable JSON telemetry
 sentinel-engine --json
+
+# Background monitor (started by the panel): reacts to USB hot-plug via kernel
+# uevents within a second and keeps $XDG_RUNTIME_DIR/omarchy-security-sentinel/report.json fresh
+sentinel-engine --daemon
 ```
 
 ---
