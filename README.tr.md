@@ -1,6 +1,7 @@
 # Security Sentinel Hub - Omarchy Linux İçin Bütünleşik Siber Savunma ve Gizlilik Merkezi
 
-[![Omarchy Verified Plugin](https://img.shields.io/badge/Omarchy-Verified_Plugin-22c55e?style=for-the-badge&logo=omarchy)](https://github.com/ozdil)
+[![Version](https://img.shields.io/github/v/release/ozdil/omarchy-security-sentinel?style=for-the-badge)](https://github.com/ozdil/omarchy-security-sentinel/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/ozdil/omarchy-security-sentinel/rust.yml?branch=master&style=for-the-badge&label=CI)](https://github.com/ozdil/omarchy-security-sentinel/actions/workflows/rust.yml)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-Support_Development-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/ozdil)
 
 ![Security Sentinel Preview](preview.png)
@@ -10,6 +11,7 @@ Omarchy Linux için hepsi bir arada yerel siber savunma, donanım bütünlüğü
 Geliştirici: Ozan Özdil (ozdil)  
 Lisans: MIT  
 Eklenti Kimliği: ozdil.security-sentinel  
+Sürüm: 1.4.0 ([değişiklik günlüğü](CHANGELOG.md))
 
 ---
 
@@ -17,6 +19,21 @@ Eklenti Kimliği: ozdil.security-sentinel
 
 Security Sentinel Hub, 8 temel Linux savunma ve gizlilik alt sistemini tek bir yüksek başarımlı yerel Rust servisinde (`sentinel-engine`) ve temayla uyumlu Quickshell arayüzünde birleştirir.
 HANCORE Kurumsal Askeri Güvenlik Standartları, çekirdek seviyesinde sıfır güven politikaları, sınırlandırılmış IPC süreçleri ve gerçek zamanlı donanım bütünlüğü doğrulaması sunar.
+
+---
+
+## 1.4.0 ile Gelenler
+
+Kapsamlı bir güvenlik denetiminden çıkan sürüm. Öne çıkanlar (tam liste: [CHANGELOG.md](CHANGELOG.md)):
+
+- Olay tabanlı arka plan servisi: takılan USB cihazı 20 sn beklemeden, bir saniye içinde denetlenir.
+- BadUSB parmak izi seri numarası ve arayüz sınıflarını da içerir; VID:PID kopyalayıp klavye ekleyen cihaz yakalanır.
+- `arch-audit` ile Arch Security Tracker'dan gerçek CVE verisi.
+- Her soket süreç adı ve PID ile gösterilir; soket anomali analizi artık çalışıyor.
+- Yetki gerektiren işlemler paketle gelen polkit politikasından geçer; süreçlere pidfd ile sinyal gönderilir.
+- "Trust Devices" sonrası USB Armor artık kendi klavye ve farenizi kilitlemiyor.
+- Başarısız anahtarlar geri alınır; yıkıcı işlemler ikinci tıklamayla onaylanır.
+- Daha sade, düz Omarchy tarzı panel ve gösterge paneli.
 
 ---
 
