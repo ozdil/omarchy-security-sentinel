@@ -1,6 +1,7 @@
 pub mod ai;
 pub mod kernel;
 pub mod subproc;
+pub mod usb;
 
 pub use ai::{
     analyze_all_processes, analyze_socket_anomalies, AnomalySeverity, BehaviorAnalyzer,

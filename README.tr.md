@@ -23,7 +23,7 @@ HANCORE Kurumsal Askeri Güvenlik Standartları, çekirdek seviyesinde sıfır g
 ## Alt Sistemler ve Yetenekler
 
 1. Ağ ve Soket Radarı: Gerçek zamanlı soket izleme (`/proc/net/tcp*`, `/proc/net/udp*`), şüpheli port tespiti ve dinleme yapan servislerin anlık dökümü.
-2. BadUSB Koruması & Donanım Zırhı: Donanım HID cihaz izleme (`/sys/bus/usb/devices`), yerel VID:PID izin listesi (`trusted_usb.json`, 0600 izinli) ve Rubber Ducky saldırılarına karşı anlık donanım zırhı kilitlemesi.
+2. BadUSB Koruması & Donanım Zırhı: Donanım HID cihaz izleme (`/sys/bus/usb/devices`), yerel cihaz parmak izi listesi (`trusted_usb.json`, 0600 izinli: VID:PID, seri numarası ve arayüz sınıfları; güvenilir bir kimliği kopyalayıp klavye arayüzü ekleyen cihaz yakalanır) ve Rubber Ducky saldırılarına karşı anlık donanım zırhı kilitlemesi.
 3. CVE Zafiyet Radarı: `checkupdates` (pacman-contrib) ile bekleyen paket güncellemeleri. Henüz Arch Security Tracker'dan CVE kimliği sorgulamıyor.
 4. Kimlik Doğrulama Nöbetçisi: Systemd journald ve PAM üzerinden son 24 saatteki başarısız giriş ve yetkisiz SSH denemelerini izleme.
 5. Tuzak Dosyalar (Tripwire Canaries) & Öz Savunma: Fidye yazılımlarına karşı bal küpü dosyaları, SHA-256 bütünlük kontrolü ve `prctl(PR_SET_DUMPABLE, 0)` ile süreç döküm koruması.

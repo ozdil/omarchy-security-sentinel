@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // The binary links the library crate instead of re-declaring its modules, so the
 // engine logic (and its SHA-256 implementation) is compiled and tested once.
 use sentinel_engine::subproc::{run_cmd_bounded, run_cmd_bounded_status};
+use sentinel_engine::usb::{self, TrustStore, TrustVerdict, UsbFingerprint};
 use sentinel_engine::{ai, kernel, sha256_hex};
 
 const O_NOFOLLOW: i32 = 0o400000;
@@ -486,17 +487,37 @@ pub fn sanitize_usb_product(raw: &str) -> String {
     }
 }
 
-fn load_trusted_usb(path: &Path) -> Option<Vec<String>> {
-    let bytes = read_secure_state_file(path, 65536).ok()?;
-    serde_json::from_slice(&bytes).ok()
+fn load_trusted_usb(path: &Path) -> Option<TrustStore> {
+    let bytes = read_secure_state_file(path, 256 * 1024).ok()?;
+    TrustStore::parse(&bytes)
+}
+
+fn save_trusted_usb(path: &Path, store: &TrustStore) {
+    if let Some(data) = store.to_json() {
+        let _ = write_secure_state_file(path, &data);
+    }
+}
+
+/// Connected USB devices as (bus id, sysfs dir, fingerprint)
+fn connected_usb_devices() -> Vec<(String, PathBuf, UsbFingerprint)> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir("/sys/bus/usb/devices") {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if let Some(fp) = usb::read_fingerprint(&p) {
+                out.push((entry.file_name().to_string_lossy().to_string(), p, fp));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 // 2. BadUSB Defense
 fn check_badusb() -> ModuleStatus {
-    let mut total_usb = 0;
     let mut hid_count = 0;
-    let mut current_ids = Vec::new();
     let mut unapproved_bus_ids = Vec::new();
+    let mut deauth_targets = Vec::new();
     let mut items = Vec::new();
 
     let trusted_file = get_state_dir().join("trusted_usb.json");
@@ -509,81 +530,73 @@ fn check_badusb() -> ModuleStatus {
         None
     };
     let baseline_corrupt = file_existed && loaded.is_none();
-    let mut trusted: Vec<String> = loaded.unwrap_or_default();
-    let mut deauth_targets = Vec::new();
+    let mut store = loaded.unwrap_or_default();
+    let mut store_changed = false;
 
-    if let Ok(entries) = fs::read_dir("/sys/bus/usb/devices") {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.join("idVendor").is_file() {
-                total_usb += 1;
-                let v = read_file_bounded(&p.join("idVendor"), 512)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                let pr = read_file_bounded(&p.join("idProduct"), 512)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                let dev_id = format!("{}:{}", v, pr);
-                let bus_id = entry.file_name().to_string_lossy().to_string();
-                current_ids.push(dev_id.clone());
+    let devices = connected_usb_devices();
+    let total_usb = devices.len();
 
-                let mut is_hid = false;
-                if let Ok(sub) = fs::read_dir(&p) {
-                    for s in sub.flatten() {
-                        let name = s.file_name().to_string_lossy().to_string();
-                        if name.contains(":1.") {
-                            let driver = s.path().join("driver");
-                            if driver.exists()
-                                && driver
-                                    .read_link()
-                                    .map(|l| l.to_string_lossy().contains("hid"))
-                                    .unwrap_or(false)
-                            {
-                                hid_count += 1;
-                                is_hid = true;
-                            }
-                        }
-                    }
-                }
+    for (bus_id, path, fp) in &devices {
+        if fp.is_hid() {
+            hid_count += 1;
+        }
+        // First run: the devices present now become the baseline (trust on first use).
+        // Legacy VID:PID-only entries are upgraded to full fingerprints when seen.
+        if !file_existed {
+            store_changed |= store.trust(fp);
+        } else if !baseline_corrupt {
+            store_changed |= store.upgrade_legacy(fp);
+        }
 
-                let raw_prod = read_file_bounded(&p.join("product"), 512)
-                    .unwrap_or_else(|_| "USB Device".to_string());
-                let prod = sanitize_usb_product(&raw_prod);
-                let is_trusted = !file_existed || baseline_corrupt || trusted.contains(&dev_id);
-                let already_blocked = read_file_bounded(&p.join("authorized"), 16)
-                    .map(|a| a.trim() == "0")
-                    .unwrap_or(false);
-                let tag = if baseline_corrupt {
-                    "UNVERIFIED"
-                } else if is_trusted {
-                    "Approved"
-                } else if already_blocked {
-                    "UNAPPROVED, BLOCKED"
-                } else {
-                    "UNAPPROVED"
-                };
-                let hid_tag = if is_hid { " (HID)" } else { "" };
-                items.push(format!("{} [{}]{} [{}]", prod, dev_id, hid_tag, tag));
-                if !is_trusted {
-                    // Root hubs (usbN) are never auto-severed: that would drop every port on
-                    // the bus. Devices already de-authorized are skipped so each 20 s poll
-                    // does not re-trigger sysfs writes or pkexec prompts.
-                    if !already_blocked && !bus_id.starts_with("usb") {
-                        deauth_targets.push(bus_id.clone());
-                    }
-                    unapproved_bus_ids.push(bus_id);
-                }
+        let verdict = if baseline_corrupt {
+            None
+        } else {
+            Some(store.verdict(fp))
+        };
+        let is_trusted = matches!(verdict, None | Some(TrustVerdict::Trusted));
+        let already_blocked = read_file_bounded(&path.join("authorized"), 16)
+            .map(|a| a.trim() == "0")
+            .unwrap_or(false);
+
+        let tag = match &verdict {
+            None => "UNVERIFIED".to_string(),
+            Some(TrustVerdict::Trusted) => "Approved".to_string(),
+            Some(TrustVerdict::Unknown) => "UNAPPROVED".to_string(),
+            Some(TrustVerdict::FingerprintMismatch { gained_hid: true }) => {
+                "UNAPPROVED, CLONED ID WITH NEW KEYBOARD/HID INTERFACE".to_string()
             }
+            Some(TrustVerdict::FingerprintMismatch { gained_hid: false }) => {
+                "UNAPPROVED, FINGERPRINT MISMATCH".to_string()
+            }
+        };
+        let tag = if !is_trusted && already_blocked {
+            format!("{}, BLOCKED", tag)
+        } else {
+            tag
+        };
+        let kind_tag = if fp.is_hid_storage_composite() {
+            " (HID + Storage)"
+        } else if fp.is_hid() {
+            " (HID)"
+        } else {
+            ""
+        };
+        let prod = sanitize_usb_product(fp.product.as_deref().unwrap_or("USB Device"));
+        items.push(format!("{} [{}]{} [{}]", prod, fp.id(), kind_tag, tag));
+
+        if !is_trusted {
+            // Root hubs (usbN) are never auto-severed: that would drop every port on
+            // the bus. Devices already de-authorized are skipped so each 20 s poll
+            // does not re-trigger sysfs writes or pkexec prompts.
+            if !already_blocked && !bus_id.starts_with("usb") {
+                deauth_targets.push(bus_id.clone());
+            }
+            unapproved_bus_ids.push(bus_id.clone());
         }
     }
 
-    if !file_existed {
-        trusted = current_ids.clone();
-        if let Ok(data) = serde_json::to_vec(&trusted) {
-            let _ = write_secure_state_file(&trusted_file, &data);
-        }
+    if store_changed || (!file_existed && !baseline_corrupt) {
+        save_trusted_usb(&trusted_file, &store);
     }
 
     let untrusted_count = unapproved_bus_ids.len();
@@ -597,6 +610,14 @@ fn check_badusb() -> ModuleStatus {
             "[ARMOR ENGAGED] Unauthorized USB hardware de-authorized at kernel interface"
                 .to_string(),
         );
+    }
+
+    let legacy_left = store.devices.iter().filter(|d| d.is_legacy()).count();
+    if legacy_left > 0 && !baseline_corrupt {
+        items.push(format!(
+            "Baseline: {} legacy VID:PID-only entries will be upgraded to full fingerprints when those devices are next connected",
+            legacy_left
+        ));
     }
 
     if baseline_corrupt {
@@ -645,7 +666,8 @@ fn check_badusb() -> ModuleStatus {
                 "Unauthorized USB device attached! Click 'Trust Devices' or toggle 'USB Armor' to auto-quarantine.".to_string()
             }
         } else {
-            "All attached HID devices match approved hardware baseline".to_string()
+            "All attached devices match their approved fingerprint (ID, serial, interface classes)"
+                .to_string()
         },
         is_toggleable: true,
         toggle_state: armor_active,
@@ -1540,45 +1562,28 @@ fn toggle_dns() -> bool {
 }
 
 fn trust_all_usb() -> usize {
-    let mut ids = Vec::new();
-    if let Ok(entries) = fs::read_dir("/sys/bus/usb/devices") {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.join("idVendor").is_file() {
-                let v = read_file_bounded(&p.join("idVendor"), 512)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                let pr = read_file_bounded(&p.join("idProduct"), 512)
-                    .unwrap_or_default()
-                    .trim()
-                    .to_string();
-                ids.push(format!("{}:{}", v, pr));
-            }
-        }
-    }
-    let count = ids.len();
+    let devices = connected_usb_devices();
     let trusted_file = get_state_dir().join("trusted_usb.json");
     // Merge with the existing baseline so devices that are approved but currently
-    // unplugged are not silently dropped from the whitelist.
-    let mut merged = load_trusted_usb(&trusted_file).unwrap_or_default();
-    for id in ids {
-        if !merged.contains(&id) {
-            merged.push(id);
+    // unplugged are not silently dropped. A corrupt baseline is rebuilt from scratch.
+    let mut store = load_trusted_usb(&trusted_file).unwrap_or_default();
+    let mut added = 0;
+    for (_, _, fp) in &devices {
+        if store.trust(fp) {
+            added += 1;
         }
     }
-    if let Ok(data) = serde_json::to_vec(&merged) {
-        let _ = write_secure_state_file(&trusted_file, &data);
-    }
+    save_trusted_usb(&trusted_file, &store);
     notify_desktop(
         "BadUSB Defense",
         &format!(
-            "Added {} connected USB devices to trusted whitelist.",
-            count
+            "Trusted {} connected USB devices ({} new or updated fingerprints).",
+            devices.len(),
+            added
         ),
         false,
     );
-    count
+    devices.len()
 }
 
 fn reset_canaries() {
