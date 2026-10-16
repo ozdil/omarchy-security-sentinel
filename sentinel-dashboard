@@ -50,6 +50,10 @@ if [[ "${1:-}" != "--cli" && -n "${QUICKSHELL_BIN}" ]]; then
         exit 0
     fi
     QML_SHELL="${DIR}/qml/shell.qml"
+    # Packaged installs put this script in /usr/bin and the QML next to the plugin
+    if [[ ! -f "${QML_SHELL}" ]]; then
+        QML_SHELL="/usr/share/omarchy/plugins/security-sentinel/qml/shell.qml"
+    fi
     if [[ -f "${QML_SHELL}" ]]; then
         exec "${QUICKSHELL_BIN}" -p "${QML_SHELL}"
     fi
@@ -62,6 +66,9 @@ fi
 BIN="${DIR}/sentinel-engine"
 if [[ -x "${BIN}" ]]; then
     "${BIN}" "$@"
+elif [[ ! -f "${DIR}/Cargo.toml" ]]; then
+    echo "Error: sentinel-engine not found next to ${BASH_SOURCE[0]} and no source tree to build from" >&2
+    exit 1
 else
     echo "Building sentinel-engine from source..." >&2
     (cd "${DIR}" && cargo build --release --locked && install -m 755 "${DIR}/target/release/sentinel-engine" "${BIN}")

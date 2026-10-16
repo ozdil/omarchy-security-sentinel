@@ -82,6 +82,8 @@ impl<'a> Drop for ProcessGroupGuard<'a> {
 /// - Monotonic deadline enforcement
 /// - Maximum output buffer caps
 /// - Clean environment with whitelisted variables
+///
+/// Returns stdout only when the command exits successfully (status 0).
 pub fn run_cmd_bounded(
     cmd_path: &str,
     args: &[&str],
@@ -89,6 +91,23 @@ pub fn run_cmd_bounded(
     deadline: Instant,
     max_output_bytes: usize,
 ) -> Option<Vec<u8>> {
+    match run_cmd_bounded_status(cmd_path, args, extra_envs, deadline, max_output_bytes) {
+        Some((0, out)) => Some(out),
+        _ => None,
+    }
+}
+
+/// Same isolation guarantees as [`run_cmd_bounded`], but also returns the exit code
+/// so callers can distinguish "ran and reported a condition" (e.g. `checkupdates`
+/// exiting 2 for "no updates") from spawn failures, timeouts, or output overruns,
+/// which all yield `None`. A process killed by a signal reports exit code -1.
+pub fn run_cmd_bounded_status(
+    cmd_path: &str,
+    args: &[&str],
+    extra_envs: &[(&str, &str)],
+    deadline: Instant,
+    max_output_bytes: usize,
+) -> Option<(i32, Vec<u8>)> {
     if Instant::now() >= deadline {
         return None;
     }
@@ -131,7 +150,7 @@ pub fn run_cmd_bounded(
     let mut chunk = [0u8; 4096];
     let mut stdout_closed = false;
     let mut direct_child_exited = false;
-    let mut direct_child_success = false;
+    let mut exit_code = -1;
     let mut overrun = false;
     let mut failed = false;
 
@@ -144,7 +163,7 @@ pub fn run_cmd_bounded(
             match guard.child.try_wait() {
                 Ok(Some(status)) => {
                     direct_child_exited = true;
-                    direct_child_success = status.success();
+                    exit_code = status.code().unwrap_or(-1);
                 }
                 Ok(None) => {}
                 Err(_) => {
@@ -254,18 +273,17 @@ pub fn run_cmd_bounded(
         }
     }
 
-    if overrun || failed || !direct_child_success || Instant::now() >= deadline {
+    if overrun || failed || !direct_child_exited || Instant::now() >= deadline {
         return None;
     }
 
     guard.active = false;
     reap_process_group(guard.child, guard.pid);
 
-    Some(buffer)
+    Some((exit_code, buffer))
 }
 
-/// Safely pipes data to stdin of a process (e.g. wl-copy) with deadline and process group isolation
-#[allow(dead_code)]
+/// Safely pipes data to stdin of a process (e.g. `nft -f -`) with deadline and process group isolation
 pub fn run_cmd_write_stdin_bounded(
     cmd_path: &str,
     args: &[&str],
@@ -341,5 +359,15 @@ mod tests {
         let deadline = Instant::now() + Duration::from_millis(1000);
         let out = run_cmd_bounded("/bin/sh", &["-c", "yes | head -n 10000"], &[], deadline, 64);
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn test_status_variant_reports_nonzero_exit_code() {
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        let out = run_cmd_bounded_status("/bin/sh", &["-c", "echo hi; exit 2"], &[], deadline, 1024);
+        assert_eq!(out, Some((2, b"hi\n".to_vec())));
+        // The success-only wrapper still rejects non-zero exits
+        let deadline = Instant::now() + Duration::from_millis(2000);
+        assert!(run_cmd_bounded("/bin/sh", &["-c", "exit 2"], &[], deadline, 1024).is_none());
     }
 }

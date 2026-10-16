@@ -240,8 +240,10 @@ Panel {
     if (fileList && fileList.length > 0) {
       var cmd = [root.resolveEnginePath(), "--clean-files"]
       for (var i = 0; i < fileList.length; i++) {
-        var f = String(fileList[i] || "").trim().replace(/^file:\/\//, "")
-        f = decodeURIComponent(f)
+        // Entries are already plain filesystem paths (decoded by the drop handler or
+        // printed by zenity). Decoding again would corrupt names containing "%" and
+        // throw URIError on names like "100%.png", aborting the whole batch.
+        var f = String(fileList[i] || "")
         if (f.length > 0) {
           cmd.push(f)
         }
@@ -281,13 +283,14 @@ Panel {
 
   Process {
     id: pickFileProc
-    command: ["zenity", "--file-selection", "--multiple", "--file-filter=Images | *.jpg *.jpeg *.png *.JPG *.PNG *.webp", "--title=OpSec: Select Images to Scrub EXIF"]
+    command: ["zenity", "--file-selection", "--multiple", "--separator=\n", "--file-filter=Images | *.jpg *.jpeg *.png *.JPG *.JPEG *.PNG", "--title=OpSec: Select Images to Scrub EXIF"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         var raw = String(text || "").trim()
         if (raw.length > 0) {
-          var files = raw.split("|")
+          // Newline separator: "|" is a legal character in file names
+          var files = raw.split("\n")
           root.cleanFiles(files)
         }
       }
@@ -443,8 +446,12 @@ Panel {
             var files = []
             for (var i = 0; i < drop.urls.length; i++) {
               var urlStr = drop.urls[i].toString()
-              var localPath = urlStr.replace(/^file:\/\//, "")
-              files.push(decodeURIComponent(localPath))
+              if (urlStr.indexOf("file://") !== 0) continue
+              try {
+                files.push(decodeURIComponent(urlStr.replace(/^file:\/\//, "")))
+              } catch (e) {
+                console.warn("Security Sentinel: skipping undecodable drop URL", urlStr)
+              }
             }
             if (files.length > 0) {
               root.cleanFiles(files)

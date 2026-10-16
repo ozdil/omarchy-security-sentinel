@@ -116,8 +116,9 @@ impl BehaviorAnalyzer {
             || (lower_cmd.contains("bash -i") && lower_cmd.contains("&> /dev/"))
             || (lower_cmd.contains("sh -i") && lower_cmd.contains(">&"))
             || (lower_cmd.contains("python") && lower_cmd.contains("socket.connect"))
-            || (lower_cmd.contains("perl") && lower_cmd.contains("Socket;") && lower_cmd.contains("connect("))
-            || (lower_cmd.contains("ruby") && lower_cmd.contains("TCPSocket.open"));
+            // Needles must be lowercase: they are matched against the lowercased cmdline
+            || (lower_cmd.contains("perl") && lower_cmd.contains("socket;") && lower_cmd.contains("connect("))
+            || (lower_cmd.contains("ruby") && lower_cmd.contains("tcpsocket.open"));
 
         if is_reverse_shell {
             score += 65;

@@ -6,7 +6,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::subproc::run_cmd_bounded;
+use crate::subproc::{run_cmd_bounded, run_cmd_write_stdin_bounded};
 
 const O_NOFOLLOW: i32 = 0o400000;
 
@@ -80,6 +80,36 @@ const IMMUNE_PROCESSES: &[&str] = &[
     "sentinel-engine",
 ];
 
+/// Trusted install prefixes for immune system binaries.
+const TRUSTED_EXE_PREFIXES: &[&str] = &["/usr/", "/bin/", "/sbin/", "/lib/", "/lib64/"];
+
+/// Returns the process name if the target is an immune critical system process.
+///
+/// `comm` alone is attacker-controlled (any process can rename itself to "sshd" via
+/// prctl(PR_SET_NAME) or argv[0]), so a name match only grants immunity when the
+/// executable also lives under a trusted system prefix. If the exe link is unreadable
+/// (foreign-owned or root process), the name match is honoured conservatively.
+fn immune_process_name(proc_dir: &Path) -> Option<String> {
+    let comm_bytes = read_proc_bounded(&proc_dir.join("comm"), 256).ok()?;
+    let comm = String::from_utf8_lossy(&comm_bytes).trim().to_string();
+    if !IMMUNE_PROCESSES.contains(&comm.as_str()) {
+        return None;
+    }
+    match std::fs::read_link(proc_dir.join("exe")) {
+        Ok(exe) => {
+            let exe = exe.to_string_lossy();
+            let trusted = !exe.ends_with(" (deleted)")
+                && TRUSTED_EXE_PREFIXES.iter().any(|p| exe.starts_with(p));
+            if trusted {
+                Some(comm)
+            } else {
+                None
+            }
+        }
+        Err(_) => Some(comm),
+    }
+}
+
 /// Freezes a suspect process at kernel level (SIGSTOP / 19).
 /// Unlike SIGKILL, freezing suspends execution immediately without destroying
 /// the memory state or socket descriptors, enabling forensic acquisition.
@@ -111,15 +141,12 @@ pub fn kernel_freeze_process(pid: i32) -> InterventionResult {
     }
 
     // Check immune critical processes with bounded read
-    if let Ok(comm_bytes) = read_proc_bounded(&proc_dir.join("comm"), 256) {
-        let comm = String::from_utf8_lossy(&comm_bytes).trim().to_string();
-        if IMMUNE_PROCESSES.contains(&comm.as_str()) {
-            return InterventionResult::err(
-                "kernel_freeze",
-                &pid.to_string(),
-                &format!("Refusing to freeze immune critical system process '{}'", comm),
-            );
-        }
+    if let Some(comm) = immune_process_name(proc_dir) {
+        return InterventionResult::err(
+            "kernel_freeze",
+            &pid.to_string(),
+            &format!("Refusing to freeze immune critical system process '{}'", comm),
+        );
     }
 
     // Attempt direct POSIX SIGSTOP
@@ -208,15 +235,12 @@ pub fn kernel_terminate_process(pid: i32) -> InterventionResult {
         }
     }
 
-    if let Ok(comm_bytes) = read_proc_bounded(&proc_dir.join("comm"), 256) {
-        let comm = String::from_utf8_lossy(&comm_bytes).trim().to_string();
-        if IMMUNE_PROCESSES.contains(&comm.as_str()) {
-            return InterventionResult::err(
-                "kernel_terminate",
-                &pid.to_string(),
-                &format!("Refusing to terminate immune critical system process '{}'", comm),
-            );
-        }
+    if let Some(comm) = immune_process_name(proc_dir) {
+        return InterventionResult::err(
+            "kernel_terminate",
+            &pid.to_string(),
+            &format!("Refusing to terminate immune critical system process '{}'", comm),
+        );
     }
 
     let pid_str = pid.to_string();
@@ -498,8 +522,6 @@ pub fn kernel_quarantine_ip(ip_str: &str) -> InterventionResult {
         );
     }
 
-    let deadline = Instant::now() + Duration::from_secs(3);
-
     // Check if nft is installed
     if !Path::new("/usr/bin/nft").exists() {
         return InterventionResult::err(
@@ -509,63 +531,63 @@ pub fn kernel_quarantine_ip(ip_str: &str) -> InterventionResult {
         );
     }
 
-    // Create table & chain if not exist
-    let _ = run_cmd_bounded(
-        "/usr/bin/nft",
-        &["add", "table", "inet", "sentinel_quarantine"],
-        &[],
-        deadline,
-        4096,
-    );
-
-    let _ = run_cmd_bounded(
-        "/usr/bin/nft",
-        &[
-            "add",
-            "chain",
-            "inet",
-            "sentinel_quarantine",
-            "quarantine_out",
-            "{ type filter hook output priority 0; policy accept; }",
-        ],
-        &[],
-        deadline,
-        4096,
-    );
-
-    let proto = if ip.is_ipv6() { "ip6" } else { "ip" };
-
-    // Add drop rule with specific IP protocol
-    let out = run_cmd_bounded(
-        "/usr/bin/nft",
-        &[
-            "add",
-            "rule",
-            "inet",
-            "sentinel_quarantine",
-            "quarantine_out",
-            proto,
-            "daddr",
-            clean_ip,
-            "drop",
-        ],
-        &[],
-        deadline,
-        4096,
-    );
-
-    match out {
-        Some(_) => InterventionResult::ok(
+    // One atomic, idempotent nft transaction fed through stdin: the table, sets and
+    // set-based chains are (re)declared, the chains are flushed and refilled with a
+    // single rule per family, and the address is added as a set element. Repeated
+    // quarantines therefore never stack duplicate rules, and both directions are dropped.
+    let script = quarantine_script(ip);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    if run_cmd_write_stdin_bounded("/usr/bin/nft", &["-f", "-"], &[], script.as_bytes(), deadline) {
+        return InterventionResult::ok(
             "kernel_quarantine_ip",
             clean_ip,
-            &format!("IP {} successfully quarantined in kernel nftables drop chain", clean_ip),
-        ),
-        None => InterventionResult::err(
-            "kernel_quarantine_ip",
-            clean_ip,
-            "Failed to inject drop rule into nftables (requires root/CAP_NET_ADMIN)",
-        ),
+            &format!("IP {} successfully quarantined in kernel nftables drop set", clean_ip),
+        );
     }
+
+    if Path::new("/usr/bin/pkexec").exists() {
+        let pk_deadline = Instant::now() + Duration::from_secs(30);
+        if run_cmd_write_stdin_bounded(
+            "/usr/bin/pkexec",
+            &["/usr/bin/nft", "-f", "-"],
+            &[],
+            script.as_bytes(),
+            pk_deadline,
+        ) {
+            return InterventionResult::ok(
+                "kernel_quarantine_ip",
+                clean_ip,
+                &format!("IP {} quarantined in kernel nftables drop set via pkexec", clean_ip),
+            );
+        }
+    }
+
+    InterventionResult::err(
+        "kernel_quarantine_ip",
+        clean_ip,
+        "Failed to inject drop rule into nftables (requires root/CAP_NET_ADMIN)",
+    )
+}
+
+/// Builds the nftables transaction used by [`kernel_quarantine_ip`].
+pub fn quarantine_script(ip: IpAddr) -> String {
+    let set = if ip.is_ipv6() { "blocked6" } else { "blocked4" };
+    format!(
+        "table inet sentinel_quarantine {{\n\
+         \x20   set blocked4 {{ type ipv4_addr; }}\n\
+         \x20   set blocked6 {{ type ipv6_addr; }}\n\
+         \x20   chain quarantine_set_out {{ type filter hook output priority 0; policy accept; }}\n\
+         \x20   chain quarantine_set_in {{ type filter hook input priority 0; policy accept; }}\n\
+         }}\n\
+         flush chain inet sentinel_quarantine quarantine_set_out\n\
+         flush chain inet sentinel_quarantine quarantine_set_in\n\
+         add rule inet sentinel_quarantine quarantine_set_out ip daddr @blocked4 drop\n\
+         add rule inet sentinel_quarantine quarantine_set_out ip6 daddr @blocked6 drop\n\
+         add rule inet sentinel_quarantine quarantine_set_in ip saddr @blocked4 drop\n\
+         add rule inet sentinel_quarantine quarantine_set_in ip6 saddr @blocked6 drop\n\
+         add element inet sentinel_quarantine {} {{ {} }}\n",
+        set, ip
+    )
 }
 
 /// Retrieves and verifies the secure private state directory (~/.local/state/omarchy/sentinel),
@@ -641,14 +663,18 @@ fn capture_forensic_evidence(pid: i32) {
         .unwrap_or_default()
         .as_secs();
     let evidence_file = state_dir.join(format!("forensics_{}_{}.json", pid, timestamp));
-    let json = format!(
-        "{{\n  \"pid\": {},\n  \"comm\": \"{}\",\n  \"cmdline\": \"{}\",\n  \"exe_sha256\": \"{}\",\n  \"timestamp\": {}\n}}\n",
-        pid,
-        comm.replace('"', "\\\""),
-        cmdline.replace('"', "\\\""),
-        exe_hash,
-        timestamp
-    );
+    // serde_json escapes backslashes and control characters too; cmdline/comm are
+    // attacker-controlled and must never be spliced into JSON by hand.
+    let json = match serde_json::to_string_pretty(&serde_json::json!({
+        "pid": pid,
+        "comm": comm,
+        "cmdline": cmdline,
+        "exe_sha256": exe_hash,
+        "timestamp": timestamp,
+    })) {
+        Ok(j) => j + "\n",
+        Err(_) => return,
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -801,7 +827,56 @@ pub fn kernel_apply_network_blackout() -> InterventionResult {
     };
 
     let _ = std::fs::remove_file(&rule_file_path);
+    if res.success {
+        record_blackout_marker(&state_dir);
+    }
     res
+}
+
+const BLACKOUT_MARKER: &str = "network_blackout.active";
+
+/// Current kernel boot id, used to invalidate the blackout marker after a reboot
+/// (nftables rulesets are not persistent across boots).
+fn current_boot_id() -> Option<String> {
+    read_proc_bounded(Path::new("/proc/sys/kernel/random/boot_id"), 128)
+        .ok()
+        .map(|b| String::from_utf8_lossy(&b).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Records that a blackout was engaged during this boot. Unprivileged users cannot
+/// `nft list` the ruleset, so without this marker the UI would always report the
+/// killswitch as inactive after a pkexec-elevated blackout.
+fn record_blackout_marker(state_dir: &Path) {
+    let Some(boot_id) = current_boot_id() else { return };
+    let mut opts = OpenOptions::new();
+    opts.write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(O_NOFOLLOW)
+        .mode(0o600);
+    if let Ok(mut file) = opts.open(state_dir.join(BLACKOUT_MARKER)) {
+        let _ = file.write_all(boot_id.as_bytes());
+    }
+}
+
+fn clear_blackout_marker() {
+    if let Ok(dir) = get_private_state_dir() {
+        let _ = std::fs::remove_file(dir.join(BLACKOUT_MARKER));
+    }
+}
+
+fn blackout_marker_matches_boot() -> bool {
+    let Ok(dir) = get_private_state_dir() else { return false };
+    let marker = dir.join(BLACKOUT_MARKER);
+    match std::fs::symlink_metadata(&marker) {
+        Ok(meta) if meta.is_file() => {}
+        _ => return false,
+    }
+    match (read_proc_bounded(&marker, 128), current_boot_id()) {
+        (Ok(bytes), Some(boot_id)) => String::from_utf8_lossy(&bytes).trim() == boot_id,
+        _ => false,
+    }
 }
 
 /// Clears the emergency network blackout, restoring normal networking.
@@ -826,6 +901,7 @@ pub fn kernel_clear_network_blackout() -> InterventionResult {
             4096,
         );
         if pk_out.is_some() {
+            clear_blackout_marker();
             return InterventionResult::ok(
                 "network_blackout",
                 "all_interfaces",
@@ -835,11 +911,14 @@ pub fn kernel_clear_network_blackout() -> InterventionResult {
     }
 
     match out {
-        Some(_) => InterventionResult::ok(
+        Some(_) => {
+            clear_blackout_marker();
+            InterventionResult::ok(
             "network_blackout",
             "all_interfaces",
             "Emergency network blackout cleared: Normal network connectivity restored",
-        ),
+            )
+        }
         None => InterventionResult::err(
             "network_blackout",
             "all_interfaces",
@@ -858,5 +937,7 @@ pub fn kernel_is_network_blackout_active() -> bool {
         deadline,
         4096,
     );
-    out.is_some()
+    // Root can query the ruleset directly; unprivileged callers fall back to the
+    // per-boot marker written when the blackout was engaged.
+    out.is_some() || blackout_marker_matches_boot()
 }
