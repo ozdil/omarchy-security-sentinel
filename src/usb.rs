@@ -263,6 +263,17 @@ fn clean_identifier(raw: &str, max_len: usize) -> String {
         .to_string()
 }
 
+/// Interface directories are named "<bus_id>:<config>.<interface>", except on root
+/// hubs: `usbN` names its interfaces "N-0:<config>.<interface>".
+fn interface_prefix(bus_id: &str) -> String {
+    match bus_id.strip_prefix("usb") {
+        Some(bus) if !bus.is_empty() && bus.bytes().all(|b| b.is_ascii_digit()) => {
+            format!("{}-0:", bus)
+        }
+        _ => format!("{}:", bus_id),
+    }
+}
+
 /// Reads a device fingerprint from its sysfs directory (`/sys/bus/usb/devices/<bus_id>`).
 /// Returns `None` for interface directories and other non-device entries.
 pub fn read_fingerprint(dev_dir: &Path) -> Option<UsbFingerprint> {
@@ -291,7 +302,7 @@ pub fn read_fingerprint(dev_dir: &Path) -> Option<UsbFingerprint> {
 
     // Interface directories are named "<bus_id>:<config>.<interface>"
     let bus_id = dev_dir.file_name()?.to_string_lossy().to_string();
-    let prefix = format!("{}:", bus_id);
+    let prefix = interface_prefix(&bus_id);
     let mut interfaces = Vec::new();
     if let Ok(entries) = fs::read_dir(dev_dir) {
         for entry in entries.flatten() {
@@ -338,7 +349,7 @@ pub fn is_enumerating(dev_dir: &Path) -> bool {
     let Some(bus_id) = dev_dir.file_name().map(|n| n.to_string_lossy().to_string()) else {
         return false;
     };
-    let prefix = format!("{}:", bus_id);
+    let prefix = interface_prefix(&bus_id);
     let present = fs::read_dir(dev_dir)
         .map(|entries| {
             entries
@@ -494,6 +505,8 @@ mod tests {
         );
         assert!(got.is_hid_storage_composite());
         assert!(!got.is_hub());
+        assert_eq!(interface_prefix("usb3"), "3-0:");
+        assert_eq!(interface_prefix("3-6.2"), "3-6.2:");
         assert!(fp("05e3", "0610", None, &["09:00:01", "09:00:02"]).is_hub());
 
         // Enumeration state: unconfigured, partially enumerated, complete
