@@ -116,6 +116,22 @@ Panel {
     return Qt.resolvedUrl("sentinel-engine").toString().replace(/^file:\/\//, "")
   }
 
+  // Actions share one Process; queue them so a second click while the first
+  // (e.g. a pkexec prompt) is still running is not silently dropped.
+  property var actionQueue: []
+
+  function runAction(cmd) {
+    root.actionQueue = root.actionQueue.concat([cmd])
+    root.startNextAction()
+  }
+
+  function startNextAction() {
+    if (actionProc.running || root.actionQueue.length === 0) return
+    actionProc.command = root.actionQueue[0]
+    root.actionQueue = root.actionQueue.slice(1)
+    actionProc.running = true
+  }
+
   function refresh() {
     if (!stateProc.running) {
       stateProc.running = true
@@ -124,26 +140,22 @@ Panel {
 
   function kernelFreezeProcess(pid) {
     if (!pid) return
-    actionProc.command = [root.resolveEnginePath(), "--kernel-freeze", String(pid)]
-    actionProc.running = true
+    root.runAction([root.resolveEnginePath(), "--kernel-freeze", String(pid)])
   }
 
   function kernelSeverSocket(target) {
     if (!target) return
-    actionProc.command = [root.resolveEnginePath(), "--kernel-sever-socket", String(target)]
-    actionProc.running = true
+    root.runAction([root.resolveEnginePath(), "--kernel-sever-socket", String(target)])
   }
 
   function kernelDeauthUsb(busId) {
     if (!busId) return
-    actionProc.command = [root.resolveEnginePath(), "--kernel-deauth-usb", String(busId)]
-    actionProc.running = true
+    root.runAction([root.resolveEnginePath(), "--kernel-deauth-usb", String(busId)])
   }
 
   function kernelQuarantineIp(ip) {
     if (!ip) return
-    actionProc.command = [root.resolveEnginePath(), "--kernel-quarantine-ip", String(ip)]
-    actionProc.running = true
+    root.runAction([root.resolveEnginePath(), "--kernel-quarantine-ip", String(ip)])
   }
 
   function toggleExpand(id) {
@@ -226,8 +238,7 @@ Panel {
   }
 
   function scrubDownloads() {
-    actionProc.command = [root.resolveEnginePath(), "--scrub-downloads"]
-    actionProc.running = true
+    root.runAction([root.resolveEnginePath(), "--scrub-downloads"])
   }
 
   function openFilePicker() {
@@ -240,15 +251,16 @@ Panel {
     if (fileList && fileList.length > 0) {
       var cmd = [root.resolveEnginePath(), "--clean-files"]
       for (var i = 0; i < fileList.length; i++) {
-        var f = String(fileList[i] || "").trim().replace(/^file:\/\//, "")
-        f = decodeURIComponent(f)
+        // Entries are already plain filesystem paths (decoded by the drop handler or
+        // printed by zenity). Decoding again would corrupt names containing "%" and
+        // throw URIError on names like "100%.png", aborting the whole batch.
+        var f = String(fileList[i] || "")
         if (f.length > 0) {
           cmd.push(f)
         }
       }
       if (cmd.length > 2) {
-        actionProc.command = cmd
-        actionProc.running = true
+        root.runAction(cmd)
       }
     }
   }
@@ -281,13 +293,14 @@ Panel {
 
   Process {
     id: pickFileProc
-    command: ["zenity", "--file-selection", "--multiple", "--file-filter=Images | *.jpg *.jpeg *.png *.JPG *.PNG *.webp", "--title=OpSec: Select Images to Scrub EXIF"]
+    command: ["zenity", "--file-selection", "--multiple", "--separator=\n", "--file-filter=Images | *.jpg *.jpeg *.png *.JPG *.JPEG *.PNG", "--title=OpSec: Select Images to Scrub EXIF"]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
         var raw = String(text || "").trim()
         if (raw.length > 0) {
-          var files = raw.split("|")
+          // Newline separator: "|" is a legal character in file names
+          var files = raw.split("\n")
           root.cleanFiles(files)
         }
       }
@@ -361,6 +374,7 @@ Panel {
     id: actionProc
     onExited: function(code) {
       root.refresh()
+      root.startNextAction()
     }
   }
 
@@ -443,8 +457,12 @@ Panel {
             var files = []
             for (var i = 0; i < drop.urls.length; i++) {
               var urlStr = drop.urls[i].toString()
-              var localPath = urlStr.replace(/^file:\/\//, "")
-              files.push(decodeURIComponent(localPath))
+              if (urlStr.indexOf("file://") !== 0) continue
+              try {
+                files.push(decodeURIComponent(urlStr.replace(/^file:\/\//, "")))
+              } catch (e) {
+                console.warn("Security Sentinel: skipping undecodable drop URL", urlStr)
+              }
             }
             if (files.length > 0) {
               root.cleanFiles(files)

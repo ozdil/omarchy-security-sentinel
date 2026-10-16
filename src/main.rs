@@ -6,10 +6,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub mod ai;
-pub mod kernel;
-mod subproc;
-use subproc::run_cmd_bounded;
+// The binary links the library crate instead of re-declaring its modules, so the
+// engine logic (and its SHA-256 implementation) is compiled and tested once.
+use sentinel_engine::subproc::{run_cmd_bounded, run_cmd_bounded_status};
+use sentinel_engine::{ai, kernel, sha256_hex};
 
 const O_NOFOLLOW: i32 = 0o400000;
 
@@ -55,92 +55,6 @@ pub struct BarStatus {
     pub color: String,
 }
 
-/// Standalone in-memory SHA-256 implementation (FIPS 180-4 compliant)
-pub fn sha256_hex(data: &[u8]) -> String {
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
-    ];
-
-    let k: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-    ];
-
-    let bit_len = (data.len() as u64).wrapping_mul(8);
-    let mut msg = Vec::with_capacity(data.len() + 64);
-    msg.extend_from_slice(data);
-    msg.push(0x80);
-    while (msg.len() % 64) != 56 {
-        msg.push(0x00);
-    }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
-
-    for chunk in msg.as_chunks::<64>().0 {
-        let mut w = [0u32; 64];
-        for (i, w_val) in w.iter_mut().take(16).enumerate() {
-            let idx = i * 4;
-            *w_val = u32::from_be_bytes([chunk[idx], chunk[idx + 1], chunk[idx + 2], chunk[idx + 3]]);
-        }
-        for i in 16..64 {
-            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
-            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
-        }
-
-        let mut a = h[0];
-        let mut b = h[1];
-        let mut c = h[2];
-        let mut d = h[3];
-        let mut e = h[4];
-        let mut f = h[5];
-        let mut g = h[6];
-        let mut h_val = h[7];
-
-        for i in 0..64 {
-            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-            let ch = (e & f) ^ ((!e) & g);
-            let temp1 = h_val
-                .wrapping_add(s1)
-                .wrapping_add(ch)
-                .wrapping_add(k[i])
-                .wrapping_add(w[i]);
-            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-            let maj = (a & b) ^ (a & c) ^ (b & c);
-            let temp2 = s0.wrapping_add(maj);
-
-            h_val = g;
-            g = f;
-            f = e;
-            e = d.wrapping_add(temp1);
-            d = c;
-            c = b;
-            b = a;
-            a = temp1.wrapping_add(temp2);
-        }
-
-        h[0] = h[0].wrapping_add(a);
-        h[1] = h[1].wrapping_add(b);
-        h[2] = h[2].wrapping_add(c);
-        h[3] = h[3].wrapping_add(d);
-        h[4] = h[4].wrapping_add(e);
-        h[5] = h[5].wrapping_add(f);
-        h[6] = h[6].wrapping_add(g);
-        h[7] = h[7].wrapping_add(h_val);
-    }
-
-    format!(
-        "{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
-        h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]
-    )
-}
-
 /// Enforces 0700 mode state directory per AGENTS.md Rule 4
 fn get_state_dir() -> PathBuf {
     let base = env::var("XDG_STATE_HOME")
@@ -153,7 +67,9 @@ fn get_state_dir() -> PathBuf {
 
 /// Atomically writes sensitive state file with mode 0600, sync_all, and O_NOFOLLOW per AGENTS.md Rule 4
 fn write_secure_state_file(path: &Path, content: &[u8]) -> Result<(), String> {
-    let parent = path.parent().ok_or_else(|| "Invalid state file parent path".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Invalid state file parent path".to_string())?;
     if !parent.exists() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create parent dir: {}", e))?;
         let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
@@ -188,7 +104,12 @@ fn write_secure_state_file(path: &Path, content: &[u8]) -> Result<(), String> {
         .mode(0o600)
         .custom_flags(O_NOFOLLOW)
         .open(&tmp_path)
-        .map_err(|e| format!("Failed to create temp state file with 0600/O_NOFOLLOW: {}", e))?;
+        .map_err(|e| {
+            format!(
+                "Failed to create temp state file with 0600/O_NOFOLLOW: {}",
+                e
+            )
+        })?;
 
     let _ = tmp_file.set_permissions(fs::Permissions::from_mode(0o600));
 
@@ -200,7 +121,9 @@ fn write_secure_state_file(path: &Path, content: &[u8]) -> Result<(), String> {
         .sync_all()
         .map_err(|e| format!("Failed to sync state file to disk: {}", e))?;
 
-    let meta = tmp_file.metadata().map_err(|e| format!("Failed to read temp metadata: {}", e))?;
+    let meta = tmp_file
+        .metadata()
+        .map_err(|e| format!("Failed to read temp metadata: {}", e))?;
     if meta.len() != content.len() as u64 {
         return Err("State file size verification mismatch".to_string());
     }
@@ -208,7 +131,8 @@ fn write_secure_state_file(path: &Path, content: &[u8]) -> Result<(), String> {
     drop(tmp_file);
 
     if path.exists() {
-        let dest_meta = fs::symlink_metadata(path).map_err(|e| format!("Cannot check existing target: {}", e))?;
+        let dest_meta = fs::symlink_metadata(path)
+            .map_err(|e| format!("Cannot check existing target: {}", e))?;
         if dest_meta.file_type().is_symlink() {
             return Err("Refusing to overwrite symlinked state file".to_string());
         }
@@ -228,7 +152,8 @@ fn read_secure_state_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, Stri
         return Err("File does not exist".to_string());
     }
 
-    let sym_meta = fs::symlink_metadata(path).map_err(|e| format!("symlink_metadata failed: {}", e))?;
+    let sym_meta =
+        fs::symlink_metadata(path).map_err(|e| format!("symlink_metadata failed: {}", e))?;
     if sym_meta.file_type().is_symlink() {
         return Err("Symlinks are strictly prohibited for state files".to_string());
     }
@@ -245,7 +170,9 @@ fn read_secure_state_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, Stri
         .open(path)
         .map_err(|e| format!("Failed to open state file with O_NOFOLLOW: {}", e))?;
 
-    let fd_meta = file.metadata().map_err(|e| format!("Descriptor metadata failed: {}", e))?;
+    let fd_meta = file
+        .metadata()
+        .map_err(|e| format!("Descriptor metadata failed: {}", e))?;
     if !fd_meta.is_file() {
         return Err("Descriptor is not a regular file".to_string());
     }
@@ -258,7 +185,9 @@ fn read_secure_state_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, Stri
 
     let mut buf = Vec::with_capacity(fd_meta.len() as usize);
     let mut handle = (&mut file).take((max_bytes + 1) as u64);
-    handle.read_to_end(&mut buf).map_err(|e| format!("Read failed: {}", e))?;
+    handle
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("Read failed: {}", e))?;
     if buf.len() > max_bytes {
         return Err("Read exceeded max_bytes limit".to_string());
     }
@@ -308,10 +237,24 @@ fn notify_desktop(title: &str, body: &str, is_critical: bool) {
 
     // Fallback to notify-send with verified system icon if omarchy-notification-send is absent
     if status.is_none() {
-        let icon = if is_critical { "dialog-warning" } else { "dialog-information" };
+        let icon = if is_critical {
+            "dialog-warning"
+        } else {
+            "dialog-information"
+        };
         let _ = run_cmd_bounded(
             "notify-send",
-            &["-a", "Security Sentinel", "-u", urgency, "-i", icon, "--", title, body],
+            &[
+                "-a",
+                "Security Sentinel",
+                "-u",
+                urgency,
+                "-i",
+                icon,
+                "--",
+                title,
+                body,
+            ],
             &extra_envs,
             deadline,
             4096,
@@ -327,16 +270,24 @@ pub fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<String, String
         .open(path)
         .map_err(|e| format!("Failed to open {} with O_NOFOLLOW: {}", path.display(), e))?;
 
-    let meta = file.metadata().map_err(|e| format!("Failed to read metadata: {}", e))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("Failed to read metadata: {}", e))?;
     if !meta.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
     }
 
     let mut buf = Vec::new();
     let mut handle = (&mut file).take((max_bytes + 1) as u64);
-    handle.read_to_end(&mut buf).map_err(|e| format!("Read failed on {}: {}", path.display(), e))?;
+    handle
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("Read failed on {}: {}", path.display(), e))?;
     if buf.len() > max_bytes {
-        return Err(format!("File {} exceeded limit of {} bytes", path.display(), max_bytes));
+        return Err(format!(
+            "File {} exceeded limit of {} bytes",
+            path.display(),
+            max_bytes
+        ));
     }
 
     Ok(String::from_utf8_lossy(&buf).into_owned())
@@ -344,12 +295,20 @@ pub fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<String, String
 
 pub fn parse_ip_port(s: &str) -> Option<(String, u16)> {
     let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() != 2 { return None; }
+    if parts.len() != 2 {
+        return None;
+    }
     let port = u16::from_str_radix(parts[1], 16).ok()?;
     let ip_hex = parts[0];
     if ip_hex.len() == 8 {
         let num = u32::from_str_radix(ip_hex, 16).ok()?;
-        let ip = format!("{}.{}.{}.{}", num & 0xFF, (num >> 8) & 0xFF, (num >> 16) & 0xFF, (num >> 24) & 0xFF);
+        let ip = format!(
+            "{}.{}.{}.{}",
+            num & 0xFF,
+            (num >> 8) & 0xFF,
+            (num >> 16) & 0xFF,
+            (num >> 24) & 0xFF
+        );
         Some((ip, port))
     } else {
         Some(("IPv6".to_string(), port))
@@ -407,7 +366,12 @@ fn check_network_sockets() -> ModuleStatus {
     let mut listen_items = Vec::new();
     let mut estab_items = Vec::new();
 
-    let paths = ["/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6"];
+    let paths = [
+        "/proc/net/tcp",
+        "/proc/net/tcp6",
+        "/proc/net/udp",
+        "/proc/net/udp6",
+    ];
     for p in &paths {
         if let Ok(content) = read_file_bounded(Path::new(p), 1024 * 1024) {
             for line in content.lines().skip(1) {
@@ -420,10 +384,20 @@ fn check_network_sockets() -> ModuleStatus {
                         if let Some((ip, port)) = parse_ip_port(parts[1]) {
                             if is_suspicious_port(port) {
                                 flagged += 1;
-                                alert_items.push(format!("[ALERT] Unauthorized listening backdoor on port {} ({}) [{}]", port, port_service_name(port), ip));
+                                alert_items.push(format!(
+                                    "[ALERT] Unauthorized listening backdoor on port {} ({}) [{}]",
+                                    port,
+                                    port_service_name(port),
+                                    ip
+                                ));
                             }
                             if listen_items.len() < 5 {
-                                listen_items.push(format!("LISTEN :{} ({}) [{}]", port, port_service_name(port), ip));
+                                listen_items.push(format!(
+                                    "LISTEN :{} ({}) [{}]",
+                                    port,
+                                    port_service_name(port),
+                                    ip
+                                ));
                             }
                         }
                     } else if st == "01" {
@@ -431,10 +405,20 @@ fn check_network_sockets() -> ModuleStatus {
                         if let Some((rem_ip, rem_port)) = parse_ip_port(parts[2]) {
                             if is_suspicious_port(rem_port) {
                                 flagged += 1;
-                                alert_items.push(format!("[ALERT] Outbound C2/Reverse Shell to {}:{} ({})", rem_ip, rem_port, port_service_name(rem_port)));
+                                alert_items.push(format!(
+                                    "[ALERT] Outbound C2/Reverse Shell to {}:{} ({})",
+                                    rem_ip,
+                                    rem_port,
+                                    port_service_name(rem_port)
+                                ));
                             }
                             if estab_items.len() < 5 {
-                                estab_items.push(format!("ESTAB -> {}:{} ({})", rem_ip, rem_port, port_service_name(rem_port)));
+                                estab_items.push(format!(
+                                    "ESTAB -> {}:{} ({})",
+                                    rem_ip,
+                                    rem_port,
+                                    port_service_name(rem_port)
+                                ));
                             }
                         }
                     }
@@ -488,7 +472,9 @@ fn toggle_usb_armor() -> bool {
 pub fn sanitize_usb_product(raw: &str) -> String {
     let sanitized: String = raw
         .chars()
-        .filter(|c| !c.is_control() && *c != '<' && *c != '>' && *c != '&' && *c != '"' && *c != '\'')
+        .filter(|c| {
+            !c.is_control() && *c != '<' && *c != '>' && *c != '&' && *c != '"' && *c != '\''
+        })
         .take(64)
         .collect::<String>()
         .trim()
@@ -498,6 +484,11 @@ pub fn sanitize_usb_product(raw: &str) -> String {
     } else {
         sanitized
     }
+}
+
+fn load_trusted_usb(path: &Path) -> Option<Vec<String>> {
+    let bytes = read_secure_state_file(path, 65536).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 // 2. BadUSB Defense
@@ -510,23 +501,30 @@ fn check_badusb() -> ModuleStatus {
 
     let trusted_file = get_state_dir().join("trusted_usb.json");
     let file_existed = trusted_file.exists();
-    let mut trusted: Vec<String> = if file_existed {
-        if let Ok(bytes) = read_secure_state_file(&trusted_file, 65536) {
-            serde_json::from_slice(&bytes).unwrap_or_default()
-        } else {
-            Vec::new()
-        }
+    // An existing but unreadable/corrupt baseline must not be treated as "trust nothing":
+    // with USB Armor on that would de-authorize every device, keyboard and mouse included.
+    let loaded = if file_existed {
+        load_trusted_usb(&trusted_file)
     } else {
-        Vec::new()
+        None
     };
+    let baseline_corrupt = file_existed && loaded.is_none();
+    let mut trusted: Vec<String> = loaded.unwrap_or_default();
+    let mut deauth_targets = Vec::new();
 
     if let Ok(entries) = fs::read_dir("/sys/bus/usb/devices") {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.join("idVendor").is_file() {
                 total_usb += 1;
-                let v = read_file_bounded(&p.join("idVendor"), 512).unwrap_or_default().trim().to_string();
-                let pr = read_file_bounded(&p.join("idProduct"), 512).unwrap_or_default().trim().to_string();
+                let v = read_file_bounded(&p.join("idVendor"), 512)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let pr = read_file_bounded(&p.join("idProduct"), 512)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
                 let dev_id = format!("{}:{}", v, pr);
                 let bus_id = entry.file_name().to_string_lossy().to_string();
                 current_ids.push(dev_id.clone());
@@ -537,7 +535,12 @@ fn check_badusb() -> ModuleStatus {
                         let name = s.file_name().to_string_lossy().to_string();
                         if name.contains(":1.") {
                             let driver = s.path().join("driver");
-                            if driver.exists() && driver.read_link().map(|l| l.to_string_lossy().contains("hid")).unwrap_or(false) {
+                            if driver.exists()
+                                && driver
+                                    .read_link()
+                                    .map(|l| l.to_string_lossy().contains("hid"))
+                                    .unwrap_or(false)
+                            {
                                 hid_count += 1;
                                 is_hid = true;
                             }
@@ -545,13 +548,31 @@ fn check_badusb() -> ModuleStatus {
                     }
                 }
 
-                let raw_prod = read_file_bounded(&p.join("product"), 512).unwrap_or_else(|_| "USB Device".to_string());
+                let raw_prod = read_file_bounded(&p.join("product"), 512)
+                    .unwrap_or_else(|_| "USB Device".to_string());
                 let prod = sanitize_usb_product(&raw_prod);
-                let is_trusted = trusted.contains(&dev_id) || !file_existed;
-                let tag = if is_trusted { "Approved" } else { "UNAPPROVED" };
+                let is_trusted = !file_existed || baseline_corrupt || trusted.contains(&dev_id);
+                let already_blocked = read_file_bounded(&p.join("authorized"), 16)
+                    .map(|a| a.trim() == "0")
+                    .unwrap_or(false);
+                let tag = if baseline_corrupt {
+                    "UNVERIFIED"
+                } else if is_trusted {
+                    "Approved"
+                } else if already_blocked {
+                    "UNAPPROVED, BLOCKED"
+                } else {
+                    "UNAPPROVED"
+                };
                 let hid_tag = if is_hid { " (HID)" } else { "" };
                 items.push(format!("{} [{}]{} [{}]", prod, dev_id, hid_tag, tag));
                 if !is_trusted {
+                    // Root hubs (usbN) are never auto-severed: that would drop every port on
+                    // the bus. Devices already de-authorized are skipped so each 20 s poll
+                    // does not re-trigger sysfs writes or pkexec prompts.
+                    if !already_blocked && !bus_id.starts_with("usb") {
+                        deauth_targets.push(bus_id.clone());
+                    }
                     unapproved_bus_ids.push(bus_id);
                 }
             }
@@ -569,20 +590,47 @@ fn check_badusb() -> ModuleStatus {
     let armor_active = is_usb_armor_enabled();
 
     if armor_active && untrusted_count > 0 {
-        for b_id in &unapproved_bus_ids {
+        for b_id in &deauth_targets {
             let _ = kernel::kernel_deauth_usb(b_id);
         }
-        items.push("[ARMOR ENGAGED] Unauthorized USB hardware de-authorized at kernel interface".to_string());
+        items.push(
+            "[ARMOR ENGAGED] Unauthorized USB hardware de-authorized at kernel interface"
+                .to_string(),
+        );
     }
 
-    let status = if untrusted_count > 0 { "ALERT" } else { "SECURE" };
+    if baseline_corrupt {
+        items.push(format!(
+            "[WARNING] Trusted baseline {} is unreadable or corrupt; auto-blocking suspended. Use 'Trust Devices' to rebuild it.",
+            trusted_file.display()
+        ));
+        return ModuleStatus {
+            id: "badusb".to_string(),
+            name: "BadUSB Defense".to_string(),
+            status: "WARNING".to_string(),
+            summary: format!("{} Devices (Baseline Unreadable)", total_usb),
+            detail: "Trusted USB baseline could not be verified; devices are listed but not auto-blocked.".to_string(),
+            is_toggleable: true,
+            toggle_state: armor_active,
+            items,
+        };
+    }
+
+    let status = if untrusted_count > 0 {
+        "ALERT"
+    } else {
+        "SECURE"
+    };
     ModuleStatus {
         id: "badusb".to_string(),
         name: "BadUSB Defense".to_string(),
         status: status.to_string(),
         summary: if untrusted_count > 0 {
             if armor_active {
-                format!("[AUTO-BLOCKED] {} Untrusted USB Deauthorized", untrusted_count)
+                format!(
+                    "[AUTO-BLOCKED] {} Untrusted USB Deauthorized",
+                    untrusted_count
+                )
             } else {
                 format!("[ALERT] {} UNTRUSTED USB DETECTED", untrusted_count)
             }
@@ -591,7 +639,8 @@ fn check_badusb() -> ModuleStatus {
         },
         detail: if untrusted_count > 0 {
             if armor_active {
-                "Military USB Armor active: Unauthorized USB hardware automatically severed.".to_string()
+                "Military USB Armor active: Unauthorized USB hardware automatically severed."
+                    .to_string()
             } else {
                 "Unauthorized USB device attached! Click 'Trust Devices' or toggle 'USB Armor' to auto-quarantine.".to_string()
             }
@@ -609,6 +658,8 @@ struct CveCache {
     timestamp: u64,
     pkg_count: usize,
     pending_pkgs: Vec<String>,
+    #[serde(default)]
+    check_failed: bool,
 }
 
 // 3. CVE Vulnerability Radar
@@ -624,31 +675,48 @@ fn check_cve() -> ModuleStatus {
         .as_secs();
 
     const CACHE_TTL_SECS: u64 = 900; // 15 minutes TTL
+    const FAILED_CACHE_TTL_SECS: u64 = 120; // retry failed checks sooner
 
     let mut pending_pkgs = Vec::new();
     let mut cache_hit = false;
+    let mut check_failed = false;
 
     if let Ok(bytes) = read_secure_state_file(&cache_file, 65536) {
         if let Ok(cache) = serde_json::from_slice::<CveCache>(&bytes) {
-            if now_secs.saturating_sub(cache.timestamp) < CACHE_TTL_SECS {
+            let ttl = if cache.check_failed {
+                FAILED_CACHE_TTL_SECS
+            } else {
+                CACHE_TTL_SECS
+            };
+            if now_secs.saturating_sub(cache.timestamp) < ttl {
                 pending_pkgs = cache.pending_pkgs;
+                check_failed = cache.check_failed;
                 cache_hit = true;
             }
         }
     }
 
+    // checkupdates (pacman-contrib) exits 0 with a list, 2 when there is nothing to
+    // update, and 1 (or fails to spawn / times out) on error. Errors must not be
+    // reported as "up to date"; they are cached briefly so a slow mirror does not
+    // stall every 20 s poll.
     if !cache_hit {
-        let deadline = Instant::now() + Duration::from_millis(4000);
-        if let Some(stdout) = run_cmd_bounded("checkupdates", &[], &[], deadline, 65536) {
-            let text = String::from_utf8_lossy(&stdout);
-            for l in text.lines().filter(|l| !l.trim().is_empty()) {
-                pending_pkgs.push(l.trim().to_string());
+        let deadline = Instant::now() + Duration::from_millis(8000);
+        match run_cmd_bounded_status("/usr/bin/checkupdates", &[], &[], deadline, 65536) {
+            Some((0, stdout)) => {
+                let text = String::from_utf8_lossy(&stdout);
+                for l in text.lines().filter(|l| !l.trim().is_empty()) {
+                    pending_pkgs.push(l.trim().to_string());
+                }
             }
+            Some((2, _)) => {}
+            _ => check_failed = true,
         }
         let cache = CveCache {
             timestamp: now_secs,
             pkg_count,
             pending_pkgs: pending_pkgs.clone(),
+            check_failed,
         };
         if let Ok(json_bytes) = serde_json::to_vec(&cache) {
             let _ = write_secure_state_file(&cache_file, &json_bytes);
@@ -658,18 +726,42 @@ fn check_cve() -> ModuleStatus {
     let pending_count = pending_pkgs.len();
 
     let mut items = Vec::new();
-    items.push(format!("Audited Packages: {} local packages in /var/lib/pacman/local", pkg_count));
+    items.push(format!(
+        "Audited Packages: {} local packages in /var/lib/pacman/local",
+        pkg_count
+    ));
+    if check_failed {
+        items.push("[WARNING] checkupdates failed or is not installed (pacman-contrib); update status unknown".to_string());
+        return ModuleStatus {
+            id: "cve".to_string(),
+            name: "CVE Vulnerability Radar".to_string(),
+            status: "WARNING".to_string(),
+            summary: format!("{} Packages (Update Check Unavailable)", pkg_count),
+            detail: "Could not query pending updates; install pacman-contrib or check network"
+                .to_string(),
+            is_toggleable: false,
+            toggle_state: false,
+            items,
+        };
+    }
     if pending_count == 0 {
-        items.push("Arch Security Tracker: Zero pending security patches".to_string());
-        items.push("System Status: All installed binaries up to date".to_string());
+        items.push("Pending Updates: none reported by checkupdates".to_string());
+        items.push("System Status: All installed packages up to date".to_string());
     } else {
-        items.push(format!("Updates Available: {} packages pending update", pending_count));
+        items.push(format!(
+            "Updates Available: {} packages pending update",
+            pending_count
+        ));
         for p in pending_pkgs.iter().take(5) {
             items.push(format!("Update -> {}", p));
         }
     }
 
-    let status = if pending_count > 10 { "WARNING" } else { "SECURE" };
+    let status = if pending_count > 10 {
+        "WARNING"
+    } else {
+        "SECURE"
+    };
     ModuleStatus {
         id: "cve".to_string(),
         name: "CVE Vulnerability Radar".to_string(),
@@ -680,9 +772,12 @@ fn check_cve() -> ModuleStatus {
             format!("{} Packages (All Up to Date)", pkg_count)
         },
         detail: if pending_count > 0 {
-            format!("{} system updates pending package manager sync", pending_count)
+            format!(
+                "{} system updates pending package manager sync",
+                pending_count
+            )
         } else {
-            "Arch Security Tracker verified | Zero pending security patches".to_string()
+            "checkupdates verified | No pending package updates".to_string()
         },
         is_toggleable: false,
         toggle_state: false,
@@ -702,14 +797,28 @@ fn check_auth_watch() -> ModuleStatus {
     };
 
     let deadline = Instant::now() + Duration::from_millis(1500);
-    // Bounded execution: producer-side limit (-n 200), deadline 1.5s, buffer cap 64 KiB
-    if let Some(stdout) = run_cmd_bounded(
-        journal_bin,
-        &["-n", "200", "--since", "24 hours ago", "-q", "-o", "cat"],
-        &[],
-        deadline,
-        65536,
-    ) {
+    // Bounded execution: producer-side limit (-n 200), deadline 1.5s, buffer cap 64 KiB.
+    // Filtering in journald (--grep) makes -n 200 mean "the last 200 auth failures in
+    // 24h" instead of "the last 200 log lines", which on a busy system covered minutes.
+    // Builds without PCRE2 reject --grep, so fall back to the unfiltered tail there.
+    const AUTH_PATTERN: &str = "authentication failure|failed password|incorrect password attempt";
+    let base_args = ["-n", "200", "--since", "24 hours ago", "-q", "-o", "cat"];
+    let has_pcre2 = run_cmd_bounded(journal_bin, &["--version"], &[], deadline, 4096)
+        .map(|v| String::from_utf8_lossy(&v).contains("+PCRE2"))
+        .unwrap_or(false);
+    let journal_out = if has_pcre2 {
+        let mut grep_args = base_args.to_vec();
+        grep_args.extend_from_slice(&["--case-sensitive=false", "--grep", AUTH_PATTERN]);
+        match run_cmd_bounded_status(journal_bin, &grep_args, &[], deadline, 65536) {
+            // journalctl exits 1 with empty output when --grep matches nothing
+            Some((0, out)) => Some(out),
+            Some((1, out)) if out.is_empty() => Some(out),
+            _ => None,
+        }
+    } else {
+        run_cmd_bounded(journal_bin, &base_args, &[], deadline, 65536)
+    };
+    if let Some(stdout) = journal_out {
         let text = String::from_utf8_lossy(&stdout);
         for line in text.lines() {
             let lower = line.to_lowercase();
@@ -726,8 +835,12 @@ fn check_auth_watch() -> ModuleStatus {
     }
 
     let mut items = Vec::new();
-    items.push("Log Target: systemd-journald & Linux PAM (24h scope)".to_string());
-    items.push(format!("Failed Authentication Events: {} recorded", failed_count));
+    items
+        .push("Log Target: systemd-journald & Linux PAM (24h scope, last 200 matches)".to_string());
+    items.push(format!(
+        "Failed Authentication Events: {} recorded",
+        failed_count
+    ));
     if failed_count == 0 {
         items.push("Integrity: No brute-force or unauthorized auth/ssh attempts".to_string());
     } else {
@@ -736,7 +849,11 @@ fn check_auth_watch() -> ModuleStatus {
         }
     }
 
-    let status = if failed_count > 0 { "WARNING" } else { "SECURE" };
+    let status = if failed_count > 0 {
+        "WARNING"
+    } else {
+        "SECURE"
+    };
     ModuleStatus {
         id: "auth".to_string(),
         name: "Authentication Watch".to_string(),
@@ -747,7 +864,10 @@ fn check_auth_watch() -> ModuleStatus {
             "0 Failed Logins (24h)".to_string()
         },
         detail: if failed_count > 0 {
-            format!("PAM & systemd journal recorded {} failed auth attempts!", failed_count)
+            format!(
+                "PAM & systemd journal recorded {} failed auth attempts!",
+                failed_count
+            )
         } else {
             "Journald & PAM authentication logs verified clean".to_string()
         },
@@ -784,11 +904,11 @@ fn check_tripwire() -> ModuleStatus {
     if !tmp_canary_path.exists() {
         let _ = write_secure_state_file(tmp_canary_path, b"OMARCHY_MILITARY_TRIPWIRE_TMP_CANARY\n");
     }
-    let tmp_intact = if let Ok(s) = read_file_bounded(tmp_canary_path, 128) {
-        s.contains("OMARCHY_MILITARY_TRIPWIRE_TMP_CANARY")
-    } else {
-        false
-    };
+    // /tmp is shared: a decoy pre-created (or replaced) by another user would otherwise
+    // pass this check forever, so require it to be our own regular, non-symlink file.
+    let tmp_intact = read_secure_state_file(tmp_canary_path, 128)
+        .map(|b| String::from_utf8_lossy(&b).contains("OMARCHY_MILITARY_TRIPWIRE_TMP_CANARY"))
+        .unwrap_or(false);
 
     let is_intact = is_token_intact && tmp_intact;
     let status = if is_intact { "SECURE" } else { "ALERT" };
@@ -797,11 +917,23 @@ fn check_tripwire() -> ModuleStatus {
     items.push(format!("Primary Canary: {}", token_path.display()));
     items.push(format!("Decoy Canary: {}", tmp_canary_path.display()));
     let hash_display = if expected_hash.len() > 16 {
-        format!("{}...{}", &expected_hash[..8], &expected_hash[expected_hash.len() - 8..])
+        format!(
+            "{}...{}",
+            &expected_hash[..8],
+            &expected_hash[expected_hash.len() - 8..]
+        )
     } else {
         expected_hash.clone()
     };
-    items.push(format!("SHA-256 Seal: {} [Intact]", hash_display));
+    items.push(format!(
+        "SHA-256 Seal: {} [{}]",
+        hash_display,
+        if is_token_intact {
+            "Intact"
+        } else {
+            "MISMATCH"
+        }
+    ));
     items.push(if is_intact {
         "Ransomware Defense: All honey-tokens intact | File baseline verified".to_string()
     } else {
@@ -831,18 +963,27 @@ fn check_tripwire() -> ModuleStatus {
 // 6. DNS Leak Guard
 fn check_dns_leak() -> (ModuleStatus, bool) {
     let deadline = Instant::now() + Duration::from_millis(1500);
-    let current_provider = if let Some(out) = run_cmd_bounded("omarchy-dns", &[], &[], deadline, 4096) {
-        String::from_utf8_lossy(&out).trim().to_string()
-    } else {
-        "DHCP".to_string()
-    };
+    let current_provider =
+        if let Some(out) = run_cmd_bounded("omarchy-dns", &[], &[], deadline, 4096) {
+            String::from_utf8_lossy(&out).trim().to_string()
+        } else {
+            "DHCP".to_string()
+        };
 
     let is_dot = current_provider == "Cloudflare" || current_provider == "Google";
     let status = if is_dot { "SECURE" } else { "WARNING" };
 
     let mut items = Vec::new();
     if is_dot {
-        items.push(format!("Active Resolver: {} DNS (1.1.1.1 / 853)", current_provider));
+        let resolver_ip = if current_provider == "Google" {
+            "8.8.8.8"
+        } else {
+            "1.1.1.1"
+        };
+        items.push(format!(
+            "Active Resolver: {} DNS ({} / 853)",
+            current_provider, resolver_ip
+        ));
         items.push("Protocol: DNS-over-TLS (DoT Encrypted Tunnel)".to_string());
         items.push("Privacy Status: Zero plaintext query leakage to ISP".to_string());
     } else {
@@ -883,7 +1024,14 @@ fn check_ghost_mac() -> (ModuleStatus, bool) {
     let deadline = Instant::now() + Duration::from_millis(1500);
     if let Some(out) = run_cmd_bounded(
         "nmcli",
-        &["-t", "-f", "NAME,TYPE,DEVICE", "connection", "show", "--active"],
+        &[
+            "-t",
+            "-f",
+            "NAME,TYPE,DEVICE",
+            "connection",
+            "show",
+            "--active",
+        ],
         &[],
         deadline,
         8192,
@@ -896,7 +1044,9 @@ fn check_ghost_mac() -> (ModuleStatus, bool) {
                 dev_name = parts[2].to_string();
 
                 if !dev_name.is_empty()
-                    && dev_name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+                    && dev_name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
                     && !dev_name.contains("..")
                 {
                     let addr_path = Path::new("/sys/class/net").join(&dev_name).join("address");
@@ -908,7 +1058,14 @@ fn check_ghost_mac() -> (ModuleStatus, bool) {
                 let sub_deadline = Instant::now() + Duration::from_millis(1500);
                 if let Some(c_out) = run_cmd_bounded(
                     "nmcli",
-                    &["-t", "-f", "802-11-wireless.cloned-mac-address", "connection", "show", &conn_name],
+                    &[
+                        "-t",
+                        "-f",
+                        "802-11-wireless.cloned-mac-address",
+                        "connection",
+                        "show",
+                        &conn_name,
+                    ],
                     &[],
                     sub_deadline,
                     4096,
@@ -923,8 +1080,28 @@ fn check_ghost_mac() -> (ModuleStatus, bool) {
     }
 
     let mut items = Vec::new();
-    items.push(format!("Active MAC: {} ({})", current_mac, if is_randomized { "Randomized / Cloaked" } else { "Hardware Permanent" }));
-    items.push(format!("Connection: {} on interface {}", if conn_name.is_empty() { "None" } else { &conn_name }, if dev_name.is_empty() { "wlo1" } else { &dev_name }));
+    items.push(format!(
+        "Active MAC: {} ({})",
+        current_mac,
+        if is_randomized {
+            "Randomized / Cloaked"
+        } else {
+            "Hardware Permanent"
+        }
+    ));
+    items.push(format!(
+        "Connection: {} on interface {}",
+        if conn_name.is_empty() {
+            "None"
+        } else {
+            &conn_name
+        },
+        if dev_name.is_empty() {
+            "wlo1"
+        } else {
+            &dev_name
+        }
+    ));
     items.push(if is_randomized {
         "Privacy Mode: NetworkManager assigns random MAC on every connection".to_string()
     } else {
@@ -980,7 +1157,8 @@ const MAX_IMAGE_SIZE: usize = 25 * 1024 * 1024; // 25 MiB cap
 // Lossless JPEG & PNG cleaner with strict bounded I/O, no-follow descriptor binding, and atomic replacement
 fn clean_file(path: &Path) -> Result<(), String> {
     // 1. Initial symlink and regular file verification
-    let sym_meta = fs::symlink_metadata(path).map_err(|e| format!("Cannot read metadata: {}", e))?;
+    let sym_meta =
+        fs::symlink_metadata(path).map_err(|e| format!("Cannot read metadata: {}", e))?;
     if sym_meta.file_type().is_symlink() {
         return Err("Symlinks are strictly prohibited".to_string());
     }
@@ -988,7 +1166,10 @@ fn clean_file(path: &Path) -> Result<(), String> {
         return Err("Target is not a regular file".to_string());
     }
     if sym_meta.len() > MAX_IMAGE_SIZE as u64 {
-        return Err(format!("File exceeds maximum allowed size of {} bytes", MAX_IMAGE_SIZE));
+        return Err(format!(
+            "File exceeds maximum allowed size of {} bytes",
+            MAX_IMAGE_SIZE
+        ));
     }
 
     // 2. Open through held descriptor with O_NOFOLLOW
@@ -999,12 +1180,17 @@ fn clean_file(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("Failed to open file safely with O_NOFOLLOW: {}", e))?;
 
     // 3. Re-verify attributes on the held descriptor
-    let fd_meta = file.metadata().map_err(|e| format!("Failed to read descriptor metadata: {}", e))?;
+    let fd_meta = file
+        .metadata()
+        .map_err(|e| format!("Failed to read descriptor metadata: {}", e))?;
     if !fd_meta.is_file() {
         return Err("Descriptor is not a regular file".to_string());
     }
     if fd_meta.len() > MAX_IMAGE_SIZE as u64 {
-        return Err(format!("Descriptor file size exceeds {} bytes", MAX_IMAGE_SIZE));
+        return Err(format!(
+            "Descriptor file size exceeds {} bytes",
+            MAX_IMAGE_SIZE
+        ));
     }
 
     // SAFETY: getuid returns the real UID of the running process
@@ -1020,92 +1206,21 @@ fn clean_file(path: &Path) -> Result<(), String> {
     // 4. Bounded read
     let mut data = Vec::with_capacity(fd_meta.len() as usize);
     let mut handle = (&mut file).take((MAX_IMAGE_SIZE + 1) as u64);
-    handle.read_to_end(&mut data).map_err(|e| format!("Read failed: {}", e))?;
+    handle
+        .read_to_end(&mut data)
+        .map_err(|e| format!("Read failed: {}", e))?;
     if data.len() > MAX_IMAGE_SIZE {
         return Err("Read data exceeded maximum image buffer limit".to_string());
     }
 
     // 5. Lossless metadata stripping
-    let cleaned_bytes: Option<Vec<u8>> = if data.len() >= 4 && data[0] == 0xFF && data[1] == 0xD8 {
-        // JPEG cleaner
-        let mut out = Vec::with_capacity(data.len());
-        out.push(0xFF);
-        out.push(0xD8);
-        let mut idx = 2;
-        while idx < data.len() {
-            if data[idx] != 0xFF {
-                out.extend_from_slice(&data[idx..]);
-                break;
-            }
-            while idx < data.len() && data[idx] == 0xFF {
-                idx += 1;
-            }
-            if idx >= data.len() {
-                break;
-            }
-            let marker = data[idx];
-            idx += 1;
-            if marker == 0xD9 {
-                out.push(0xFF);
-                out.push(0xD9);
-                break;
-            }
-            if marker == 0xDA {
-                out.push(0xFF);
-                out.push(0xDA);
-                out.extend_from_slice(&data[idx..]);
-                break;
-            }
-            if idx + 2 > data.len() {
-                break;
-            }
-            let len = ((data[idx] as usize) << 8) | (data[idx + 1] as usize);
-            if idx + len > data.len() {
-                break;
-            }
-            let is_meta = (0xE1..=0xEF).contains(&marker) || marker == 0xFE;
-            if !is_meta {
-                out.push(0xFF);
-                out.push(marker);
-                out.extend_from_slice(&data[idx..idx + len]);
-            }
-            idx += len;
-        }
-        Some(out)
+    let png_header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    let out = if data.len() >= 4 && data[0] == 0xFF && data[1] == 0xD8 {
+        strip_jpeg_metadata(&data)?
+    } else if data.len() >= 8 && data[..8] == png_header {
+        strip_png_metadata(&data)
     } else {
-        let png_header = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        if data.len() >= 8 && data[..8] == png_header {
-            // PNG cleaner
-            let mut out = Vec::with_capacity(data.len());
-            out.extend_from_slice(&png_header);
-            let mut idx = 8;
-            while idx + 12 <= data.len() {
-                let length = ((data[idx] as usize) << 24)
-                    | ((data[idx + 1] as usize) << 16)
-                    | ((data[idx + 2] as usize) << 8)
-                    | (data[idx + 3] as usize);
-                let chunk_type = &data[idx + 4..idx + 8];
-                let total_chunk_len = 12 + length;
-                if idx + total_chunk_len > data.len() {
-                    out.extend_from_slice(&data[idx..]);
-                    break;
-                }
-                let type_str = String::from_utf8_lossy(chunk_type);
-                let is_meta = type_str == "tEXt" || type_str == "zTXt" || type_str == "iTXt" || type_str == "eXIf";
-                if !is_meta {
-                    out.extend_from_slice(&data[idx..idx + total_chunk_len]);
-                }
-                idx += total_chunk_len;
-            }
-            Some(out)
-        } else {
-            None
-        }
-    };
-
-    let out = match cleaned_bytes {
-        Some(b) => b,
-        None => return Err("Unsupported image format or invalid header".to_string()),
+        return Err("Unsupported image format or invalid header".to_string());
     };
 
     // Close descriptor before replacing file
@@ -1157,7 +1272,9 @@ fn clean_file(path: &Path) -> Result<(), String> {
         .sync_all()
         .map_err(|e| format!("Failed to sync cleaned file to disk: {}", e))?;
 
-    let tmp_meta = tmp_file.metadata().map_err(|e| format!("Failed to read temp metadata: {}", e))?;
+    let tmp_meta = tmp_file
+        .metadata()
+        .map_err(|e| format!("Failed to read temp metadata: {}", e))?;
     if tmp_meta.len() != out.len() as u64 {
         return Err("Written bytes verification mismatch".to_string());
     }
@@ -1165,16 +1282,105 @@ fn clean_file(path: &Path) -> Result<(), String> {
     drop(tmp_file);
 
     // Re-verify target path is still regular file and not replaced with symlink prior to rename
-    let pre_rename_meta = fs::symlink_metadata(path).map_err(|e| format!("Cannot verify target prior to rename: {}", e))?;
+    let pre_rename_meta = fs::symlink_metadata(path)
+        .map_err(|e| format!("Cannot verify target prior to rename: {}", e))?;
     if pre_rename_meta.file_type().is_symlink() {
         return Err("Target path changed to symlink during cleaning".to_string());
     }
 
-    fs::rename(&tmp_path, path).map_err(|e| format!("Failed to atomically replace image: {}", e))?;
+    fs::rename(&tmp_path, path)
+        .map_err(|e| format!("Failed to atomically replace image: {}", e))?;
 
     guard.active = false;
 
     Ok(())
+}
+
+/// Removes EXIF/XMP/comment segments from a JPEG without re-encoding.
+///
+/// Kept on purpose: APP0 (JFIF), APP2 ICC_PROFILE (colour management) and APP14
+/// "Adobe" (colour transform; dropping it corrupts CMYK/YCCK images). Malformed or
+/// truncated segment headers abort with an error instead of producing a truncated
+/// file that would then atomically replace the original.
+fn strip_jpeg_metadata(data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(data.len());
+    out.extend_from_slice(&[0xFF, 0xD8]);
+    let mut idx = 2;
+    loop {
+        if idx >= data.len() {
+            return Err("Truncated JPEG: no start-of-scan marker found".to_string());
+        }
+        if data[idx] != 0xFF {
+            return Err(format!("Malformed JPEG: expected marker at offset {}", idx));
+        }
+        while idx < data.len() && data[idx] == 0xFF {
+            idx += 1;
+        }
+        if idx >= data.len() {
+            return Err("Truncated JPEG marker".to_string());
+        }
+        let marker = data[idx];
+        idx += 1;
+        match marker {
+            0xD9 => {
+                out.extend_from_slice(&[0xFF, 0xD9]);
+                return Ok(out);
+            }
+            0xDA => {
+                // Start of scan: entropy-coded data and everything after it is kept verbatim
+                out.extend_from_slice(&[0xFF, 0xDA]);
+                out.extend_from_slice(&data[idx..]);
+                return Ok(out);
+            }
+            // Standalone markers carry no length field
+            0x01 | 0xD0..=0xD7 => {
+                out.extend_from_slice(&[0xFF, marker]);
+                continue;
+            }
+            _ => {}
+        }
+        if idx + 2 > data.len() {
+            return Err("Truncated JPEG segment length".to_string());
+        }
+        let len = ((data[idx] as usize) << 8) | (data[idx + 1] as usize);
+        if len < 2 || idx + len > data.len() {
+            return Err(format!("Malformed JPEG segment 0x{:02X} length", marker));
+        }
+        let payload = &data[idx + 2..idx + len];
+        let keep_colour_info = (marker == 0xE2 && payload.starts_with(b"ICC_PROFILE\0"))
+            || (marker == 0xEE && payload.starts_with(b"Adobe"));
+        let is_meta = ((0xE1..=0xEF).contains(&marker) || marker == 0xFE) && !keep_colour_info;
+        if !is_meta {
+            out.extend_from_slice(&[0xFF, marker]);
+            out.extend_from_slice(&data[idx..idx + len]);
+        }
+        idx += len;
+    }
+}
+
+/// Removes textual and EXIF chunks (tEXt, zTXt, iTXt, eXIf) from a PNG.
+fn strip_png_metadata(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    out.extend_from_slice(&data[..8]);
+    let mut idx = 8;
+    while idx + 12 <= data.len() {
+        let length =
+            u32::from_be_bytes([data[idx], data[idx + 1], data[idx + 2], data[idx + 3]]) as usize;
+        let chunk_type = &data[idx + 4..idx + 8];
+        let total_chunk_len = 12usize.saturating_add(length);
+        if idx.saturating_add(total_chunk_len) > data.len() {
+            out.extend_from_slice(&data[idx..]);
+            return out;
+        }
+        let is_meta = matches!(chunk_type, b"tEXt" | b"zTXt" | b"iTXt" | b"eXIf");
+        if !is_meta {
+            out.extend_from_slice(&data[idx..idx + total_chunk_len]);
+        }
+        idx += total_chunk_len;
+    }
+    // Keep any trailing bytes that do not form a full chunk instead of dropping them
+    out.extend_from_slice(&data[idx..]);
+    out
 }
 
 fn scrub_downloads() -> usize {
@@ -1187,7 +1393,9 @@ fn scrub_downloads() -> usize {
                 if !meta.file_type().is_symlink() && meta.is_file() {
                     if let Some(ext) = p.extension() {
                         let ext_str = ext.to_string_lossy().to_lowercase();
-                        if (ext_str == "jpg" || ext_str == "jpeg" || ext_str == "png") && clean_file(&p).is_ok() {
+                        if (ext_str == "jpg" || ext_str == "jpeg" || ext_str == "png")
+                            && clean_file(&p).is_ok()
+                        {
                             cleaned += 1;
                         }
                     }
@@ -1220,7 +1428,14 @@ fn toggle_ghost_mac() -> bool {
                 let sub_deadline = Instant::now() + Duration::from_millis(1500);
                 let current_cloned = if let Some(c_out) = run_cmd_bounded(
                     "nmcli",
-                    &["-t", "-f", "802-11-wireless.cloned-mac-address", "connection", "show", conn],
+                    &[
+                        "-t",
+                        "-f",
+                        "802-11-wireless.cloned-mac-address",
+                        "connection",
+                        "show",
+                        conn,
+                    ],
                     &[],
                     sub_deadline,
                     4096,
@@ -1232,17 +1447,61 @@ fn toggle_ghost_mac() -> bool {
 
                 if current_cloned.contains("random") {
                     let mod_deadline = Instant::now() + Duration::from_millis(2000);
-                    let _ = run_cmd_bounded("nmcli", &["connection", "modify", conn, "802-11-wireless.cloned-mac-address", "permanent"], &[], mod_deadline, 4096);
+                    let _ = run_cmd_bounded(
+                        "nmcli",
+                        &[
+                            "connection",
+                            "modify",
+                            conn,
+                            "802-11-wireless.cloned-mac-address",
+                            "permanent",
+                        ],
+                        &[],
+                        mod_deadline,
+                        4096,
+                    );
                     let up_deadline = Instant::now() + Duration::from_millis(3000);
-                    let _ = run_cmd_bounded("nmcli", &["connection", "up", conn], &[], up_deadline, 4096);
-                    notify_desktop("Ghost MAC", "Reverted to Wi-Fi hardware (original) MAC address.", false);
+                    let _ = run_cmd_bounded(
+                        "nmcli",
+                        &["connection", "up", conn],
+                        &[],
+                        up_deadline,
+                        4096,
+                    );
+                    notify_desktop(
+                        "Ghost MAC",
+                        "Reverted to Wi-Fi hardware (original) MAC address.",
+                        false,
+                    );
                     return false;
                 } else {
                     let mod_deadline = Instant::now() + Duration::from_millis(2000);
-                    let _ = run_cmd_bounded("nmcli", &["connection", "modify", conn, "802-11-wireless.cloned-mac-address", "random"], &[], mod_deadline, 4096);
+                    let _ = run_cmd_bounded(
+                        "nmcli",
+                        &[
+                            "connection",
+                            "modify",
+                            conn,
+                            "802-11-wireless.cloned-mac-address",
+                            "random",
+                        ],
+                        &[],
+                        mod_deadline,
+                        4096,
+                    );
                     let up_deadline = Instant::now() + Duration::from_millis(3000);
-                    let _ = run_cmd_bounded("nmcli", &["connection", "up", conn], &[], up_deadline, 4096);
-                    notify_desktop("Ghost MAC", "Wi-Fi MAC randomization enabled (random MAC per connection).", false);
+                    let _ = run_cmd_bounded(
+                        "nmcli",
+                        &["connection", "up", conn],
+                        &[],
+                        up_deadline,
+                        4096,
+                    );
+                    notify_desktop(
+                        "Ghost MAC",
+                        "Wi-Fi MAC randomization enabled (random MAC per connection).",
+                        false,
+                    );
                     return true;
                 }
             }
@@ -1262,12 +1521,20 @@ fn toggle_dns() -> bool {
     if current == "Cloudflare" || current == "Google" {
         let deadline = Instant::now() + Duration::from_millis(2000);
         let _ = run_cmd_bounded("omarchy-dns", &["DHCP"], &[], deadline, 4096);
-        notify_desktop("DNS Leak Guard", "Switched to standard ISP DNS (DHCP) mode.", false);
+        notify_desktop(
+            "DNS Leak Guard",
+            "Switched to standard ISP DNS (DHCP) mode.",
+            false,
+        );
         false
     } else {
         let deadline = Instant::now() + Duration::from_millis(2000);
         let _ = run_cmd_bounded("omarchy-dns", &["Cloudflare"], &[], deadline, 4096);
-        notify_desktop("DNS Leak Guard", "Cloudflare DNS-over-TLS (DoT 1.1.1.1) encrypted tunnel enabled.", false);
+        notify_desktop(
+            "DNS Leak Guard",
+            "Cloudflare DNS-over-TLS (DoT 1.1.1.1) encrypted tunnel enabled.",
+            false,
+        );
         true
     }
 }
@@ -1278,30 +1545,58 @@ fn trust_all_usb() -> usize {
         for entry in entries.flatten() {
             let p = entry.path();
             if p.join("idVendor").is_file() {
-                let v = read_file_bounded(&p.join("idVendor"), 512).unwrap_or_default().trim().to_string();
-                let pr = read_file_bounded(&p.join("idProduct"), 512).unwrap_or_default().trim().to_string();
+                let v = read_file_bounded(&p.join("idVendor"), 512)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
+                let pr = read_file_bounded(&p.join("idProduct"), 512)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_string();
                 ids.push(format!("{}:{}", v, pr));
             }
         }
     }
     let count = ids.len();
     let trusted_file = get_state_dir().join("trusted_usb.json");
-    if let Ok(data) = serde_json::to_vec(&ids) {
+    // Merge with the existing baseline so devices that are approved but currently
+    // unplugged are not silently dropped from the whitelist.
+    let mut merged = load_trusted_usb(&trusted_file).unwrap_or_default();
+    for id in ids {
+        if !merged.contains(&id) {
+            merged.push(id);
+        }
+    }
+    if let Ok(data) = serde_json::to_vec(&merged) {
         let _ = write_secure_state_file(&trusted_file, &data);
     }
-    notify_desktop("BadUSB Defense", &format!("Added {} connected USB devices to trusted whitelist.", count), false);
+    notify_desktop(
+        "BadUSB Defense",
+        &format!(
+            "Added {} connected USB devices to trusted whitelist.",
+            count
+        ),
+        false,
+    );
     count
 }
 
 fn reset_canaries() {
     let token_path = get_state_dir().join("canary.token");
     let hash_path = get_state_dir().join("canary.sha256");
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let token_data = format!("OMARCHY_SECURITY_SENTINEL_TRIPWIRE_TOKEN_GEN_{}\n", now);
     let _ = write_secure_state_file(&token_path, token_data.as_bytes());
     let hash = sha256_hex(token_data.as_bytes());
     let _ = write_secure_state_file(&hash_path, hash.as_bytes());
-    notify_desktop("Tripwire Canaries", "New canary honeypot token generated and SHA-256 hash sealed.", false);
+    notify_desktop(
+        "Tripwire Canaries",
+        "New canary honeypot token generated and SHA-256 hash sealed.",
+        false,
+    );
 }
 
 fn check_ai_behavior() -> (ModuleStatus, u32, Vec<ai::ProcessAnomaly>) {
@@ -1311,8 +1606,13 @@ fn check_ai_behavior() -> (ModuleStatus, u32, Vec<ai::ProcessAnomaly>) {
     let (status, summary, detail) = if max_score >= 80 {
         (
             "ALERT",
-            format!("CRITICAL: {} suspicious behavioral anomalies detected (Highest Threat Score: {})", anomalies.len(), max_score),
-            "Immediate kernel intervention recommended (freeze process / sever active socket).".to_string(),
+            format!(
+                "CRITICAL: {} suspicious behavioral anomalies detected (Highest Threat Score: {})",
+                anomalies.len(),
+                max_score
+            ),
+            "Immediate kernel intervention recommended (freeze process / sever active socket)."
+                .to_string(),
         )
     } else if max_score >= 40 {
         (
@@ -1332,7 +1632,13 @@ fn check_ai_behavior() -> (ModuleStatus, u32, Vec<ai::ProcessAnomaly>) {
         .iter()
         .take(8)
         .map(|a| {
-            format!("[PID {} - {}] Score {}: {}", a.pid, a.name, a.score, a.reasons.join(", "))
+            format!(
+                "[PID {} - {}] Score {}: {}",
+                a.pid,
+                a.name,
+                a.score,
+                a.reasons.join(", ")
+            )
         })
         .collect();
 
@@ -1382,7 +1688,8 @@ fn build_report() -> SentinelReport {
 
     let usb_armor_enabled = is_usb_armor_enabled();
     let network_blackout_active = kernel::kernel_is_network_blackout_active();
-    let self_integrity_hash = kernel::calculate_self_exe_sha256().unwrap_or_else(|_| "UNVERIFIED".to_string());
+    let self_integrity_hash =
+        kernel::calculate_self_exe_sha256().unwrap_or_else(|_| "UNVERIFIED".to_string());
 
     let kernel_capabilities = vec![
         "cgroups_v2_freeze".to_string(),
@@ -1418,15 +1725,36 @@ fn main() {
     let _ = kernel::enforce_anti_tamper();
 
     let args: Vec<String> = env::args().collect();
+    // Only the first argument selects the action. Scanning every argument would let a
+    // file name passed to --clean-files (e.g. a dropped file called "panic-blackout")
+    // trigger an unrelated, possibly destructive subcommand.
+    let cmd = args.get(1).map(String::as_str).unwrap_or("");
+
+    // Root-side polkit helper: `pkexec /usr/bin/sentinel-engine --privileged-* <op> [arg]`
+    if matches!(
+        cmd,
+        kernel::PRIVILEGED_INTERVENTION_FLAG | kernel::PRIVILEGED_NETWORK_FLAG
+    ) {
+        let op = args.get(2).map(String::as_str).unwrap_or("");
+        let res = kernel::run_privileged_operation(cmd, op, args.get(3).map(String::as_str));
+        println!("{}", serde_json::to_string(&res).unwrap());
+        std::process::exit(if res.success { 0 } else { 1 });
+    }
 
     // Verify self-integrity
-    if args.iter().any(|a| a == "--verify-integrity" || a == "verify-integrity") {
+    if matches!(cmd, "--verify-integrity" | "verify-integrity") {
         match kernel::calculate_self_exe_sha256() {
             Ok(hash) => {
-                println!("{{\"self_integrity\": \"SECURE\", \"sha256\": \"{}\", \"anti_tamper\": true}}", hash);
+                println!(
+                    "{{\"self_integrity\": \"SECURE\", \"sha256\": \"{}\", \"anti_tamper\": true}}",
+                    hash
+                );
             }
             Err(e) => {
-                eprintln!("{{\"self_integrity\": \"COMPROMISED\", \"error\": \"{}\"}}", e);
+                eprintln!(
+                    "{{\"self_integrity\": \"COMPROMISED\", \"error\": \"{}\"}}",
+                    e
+                );
                 std::process::exit(1);
             }
         }
@@ -1434,39 +1762,44 @@ fn main() {
     }
 
     // Emergency Military Network Blackout (Killswitch)
-    if args.iter().any(|a| a == "--panic-blackout" || a == "panic-blackout") {
+    if matches!(cmd, "--panic-blackout" | "panic-blackout") {
         let res = kernel::kernel_apply_network_blackout();
         println!("{}", serde_json::to_string(&res).unwrap());
         return;
     }
 
-    if args.iter().any(|a| a == "--resume-network" || a == "resume-network") {
+    if matches!(cmd, "--resume-network" | "resume-network") {
         let res = kernel::kernel_clear_network_blackout();
         println!("{}", serde_json::to_string(&res).unwrap());
         return;
     }
 
-    if args.iter().any(|a| a == "--blackout-status" || a == "blackout-status") {
+    if matches!(cmd, "--blackout-status" | "blackout-status") {
         let active = kernel::kernel_is_network_blackout_active();
         println!("{{\"blackout_active\": {}}}", active);
         return;
     }
 
-    if args.iter().any(|a| a == "--toggle-usb-armor") {
+    if matches!(cmd, "--toggle-usb-armor") {
         let state = toggle_usb_armor();
         println!("{}", if state { "ENABLED" } else { "DISABLED" });
         return;
     }
 
     // AI audit subcommand
-    if args.iter().any(|a| a == "--ai-audit" || a == "ai-audit") {
+    if matches!(cmd, "--ai-audit" | "ai-audit") {
         let anomalies = ai::analyze_all_processes();
         println!("{}", serde_json::to_string_pretty(&anomalies).unwrap());
         return;
     }
 
     // Kernel freeze process
-    if let Some(pos) = args.iter().position(|a| a == "--kernel-freeze" || a == "kernel-freeze" || a == "--freeze-process") {
+    if let Some(pos) = matches!(
+        cmd,
+        "--kernel-freeze" | "kernel-freeze" | "--freeze-process"
+    )
+    .then_some(1usize)
+    {
         if let Some(pid_str) = args.get(pos + 1) {
             if let Ok(pid) = pid_str.parse::<i32>() {
                 let res = kernel::kernel_freeze_process(pid);
@@ -1479,7 +1812,12 @@ fn main() {
     }
 
     // Kernel terminate process
-    if let Some(pos) = args.iter().position(|a| a == "--kernel-terminate" || a == "kernel-terminate" || a == "--terminate-process") {
+    if let Some(pos) = matches!(
+        cmd,
+        "--kernel-terminate" | "kernel-terminate" | "--terminate-process"
+    )
+    .then_some(1usize)
+    {
         if let Some(pid_str) = args.get(pos + 1) {
             if let Ok(pid) = pid_str.parse::<i32>() {
                 let res = kernel::kernel_terminate_process(pid);
@@ -1492,7 +1830,7 @@ fn main() {
     }
 
     // Kernel thaw process
-    if let Some(pos) = args.iter().position(|a| a == "--kernel-thaw" || a == "kernel-thaw") {
+    if let Some(pos) = matches!(cmd, "--kernel-thaw" | "kernel-thaw").then_some(1usize) {
         if let Some(pid_str) = args.get(pos + 1) {
             if let Ok(pid) = pid_str.parse::<i32>() {
                 let res = kernel::kernel_thaw_process(pid);
@@ -1505,7 +1843,9 @@ fn main() {
     }
 
     // Kernel sever socket
-    if let Some(pos) = args.iter().position(|a| a == "--kernel-sever-socket" || a == "kernel-sever-socket") {
+    if let Some(pos) =
+        matches!(cmd, "--kernel-sever-socket" | "kernel-sever-socket").then_some(1usize)
+    {
         if let Some(target) = args.get(pos + 1) {
             let res = kernel::kernel_sever_socket(target);
             println!("{}", serde_json::to_string(&res).unwrap());
@@ -1516,7 +1856,8 @@ fn main() {
     }
 
     // Kernel de-auth USB
-    if let Some(pos) = args.iter().position(|a| a == "--kernel-deauth-usb" || a == "kernel-deauth-usb") {
+    if let Some(pos) = matches!(cmd, "--kernel-deauth-usb" | "kernel-deauth-usb").then_some(1usize)
+    {
         if let Some(bus_id) = args.get(pos + 1) {
             let res = kernel::kernel_deauth_usb(bus_id);
             println!("{}", serde_json::to_string(&res).unwrap());
@@ -1527,7 +1868,9 @@ fn main() {
     }
 
     // Kernel quarantine IP
-    if let Some(pos) = args.iter().position(|a| a == "--kernel-quarantine-ip" || a == "kernel-quarantine-ip") {
+    if let Some(pos) =
+        matches!(cmd, "--kernel-quarantine-ip" | "kernel-quarantine-ip").then_some(1usize)
+    {
         if let Some(ip) = args.get(pos + 1) {
             let res = kernel::kernel_quarantine_ip(ip);
             println!("{}", serde_json::to_string(&res).unwrap());
@@ -1537,31 +1880,31 @@ fn main() {
         std::process::exit(1);
     }
 
-    if args.iter().any(|a| a == "--toggle-ghost-mac") {
+    if matches!(cmd, "--toggle-ghost-mac") {
         let state = toggle_ghost_mac();
         println!("{}", if state { "ENABLED" } else { "DISABLED" });
         return;
     }
 
-    if args.iter().any(|a| a == "--toggle-dns" || a == "--toggle-dot") {
+    if matches!(cmd, "--toggle-dns" | "--toggle-dot") {
         let state = toggle_dns();
         println!("{}", if state { "ENABLED" } else { "DISABLED" });
         return;
     }
 
-    if args.iter().any(|a| a == "--trust-all-usb") {
+    if matches!(cmd, "--trust-all-usb") {
         let count = trust_all_usb();
         println!("Trusted {} devices", count);
         return;
     }
 
-    if args.iter().any(|a| a == "--reset-canaries") {
+    if matches!(cmd, "--reset-canaries") {
         reset_canaries();
         println!("Canaries reset");
         return;
     }
 
-    if args.iter().any(|a| a == "--scrub-downloads") {
+    if matches!(cmd, "--scrub-downloads") {
         let count = scrub_downloads();
         if count > 0 {
             notify_desktop(
@@ -1580,7 +1923,7 @@ fn main() {
         return;
     }
 
-    if let Some(pos) = args.iter().position(|a| a == "--clean-files") {
+    if let Some(pos) = matches!(cmd, "--clean-files").then_some(1usize) {
         let files = &args[pos + 1..];
         let mut cleaned = 0;
         for f_str in files {
@@ -1608,7 +1951,7 @@ fn main() {
 
     let report = build_report();
 
-    if args.iter().any(|a| a == "--status" || a == "--bar") {
+    if matches!(cmd, "--status" | "--bar") {
         let text = "\u{f0483}".to_string();
         let tooltip = format!(
             "Security Sentinel Hub\nStatus: {}\nThreat Level: {}\nActive Subsystems: {} / {}\n\n[Left Click] Open Security Center",
@@ -1617,20 +1960,27 @@ fn main() {
         let out = BarStatus {
             text,
             tooltip,
-            class: if report.threat_level == "ZERO" { "normal".to_string() } else { "warning".to_string() },
+            class: if report.threat_level == "ZERO" {
+                "normal".to_string()
+            } else {
+                "warning".to_string()
+            },
             color: report.threat_color,
         };
         println!("{}", serde_json::to_string(&out).unwrap());
         return;
     }
 
-    if args.iter().any(|a| a == "--json") {
+    if matches!(cmd, "--json") {
         println!("{}", serde_json::to_string(&report).unwrap());
         return;
     }
 
     println!("OMARCHY SECURITY SENTINEL - UNIFIED DEFENSE ENGINE");
-    println!("Status: {} | Threat: {}", report.overall_status, report.threat_level);
+    println!(
+        "Status: {} | Threat: {}",
+        report.overall_status, report.threat_level
+    );
     for m in &report.modules {
         println!("{:<25} [{:<8}] {}", m.name, m.status, m.summary);
     }
@@ -1655,7 +2005,9 @@ mod tests {
 
         let res = clean_file(&sym_file);
         assert!(res.is_err(), "clean_file must reject symlinks");
-        assert!(res.unwrap_err().contains("Symlinks are strictly prohibited"));
+        assert!(res
+            .unwrap_err()
+            .contains("Symlinks are strictly prohibited"));
 
         // Verify real file was untouched
         assert_eq!(fs::read(&real_file).unwrap(), png_header);
@@ -1690,7 +2042,9 @@ mod tests {
         // IHDR chunk (length 13, type IHDR, 13 data bytes, 4 CRC bytes = 25 bytes total)
         png_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x0D]);
         png_data.extend_from_slice(b"IHDR");
-        png_data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00]);
+        png_data.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00,
+        ]);
         png_data.extend_from_slice(&[0x1F, 0x15, 0xC4, 0x89]); // CRC
 
         // tEXt metadata chunk (length 9, type tEXt, "Author=Oz", 4 CRC bytes)
@@ -1712,14 +2066,30 @@ mod tests {
 
         // Clean file
         let clean_res = clean_file(&png_file);
-        assert!(clean_res.is_ok(), "clean_file must succeed on valid PNG: {:?}", clean_res.err());
+        assert!(
+            clean_res.is_ok(),
+            "clean_file must succeed on valid PNG: {:?}",
+            clean_res.err()
+        );
 
         // Verify metadata was stripped
         let raw_after = fs::read(&png_file).unwrap();
-        assert_eq!(&raw_after[..8], &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
-        assert!(!raw_after.windows(4).any(|w| w == b"tEXt"), "tEXt metadata must be stripped");
-        assert!(raw_after.windows(4).any(|w| w == b"IHDR"), "IHDR chunk must be preserved");
-        assert!(raw_after.windows(4).any(|w| w == b"IEND"), "IEND chunk must be preserved");
+        assert_eq!(
+            &raw_after[..8],
+            &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]
+        );
+        assert!(
+            !raw_after.windows(4).any(|w| w == b"tEXt"),
+            "tEXt metadata must be stripped"
+        );
+        assert!(
+            raw_after.windows(4).any(|w| w == b"IHDR"),
+            "IHDR chunk must be preserved"
+        );
+        assert!(
+            raw_after.windows(4).any(|w| w == b"IEND"),
+            "IEND chunk must be preserved"
+        );
 
         // Verify no temporary files remain in directory
         let remaining_files: Vec<_> = fs::read_dir(&temp_dir)
@@ -1743,7 +2113,7 @@ mod tests {
         // Construct synthetic JPEG with APP1 (EXIF: 0xFF, 0xE1) and SOI (0xFF, 0xD8), EOI (0xFF, 0xD9)
         let mut jpg_data = Vec::new();
         jpg_data.extend_from_slice(&[0xFF, 0xD8]); // SOI
-        // APP1 metadata segment (length 6: len bytes 0x00, 0x06 + 4 bytes payload)
+                                                   // APP1 metadata segment (length 6: len bytes 0x00, 0x06 + 4 bytes payload)
         jpg_data.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x06, 0x45, 0x78, 0x69, 0x66]);
         // EOI marker
         jpg_data.extend_from_slice(&[0xFF, 0xD9]);
@@ -1751,13 +2121,59 @@ mod tests {
         fs::write(&jpg_file, &jpg_data).unwrap();
 
         let clean_res = clean_file(&jpg_file);
-        assert!(clean_res.is_ok(), "clean_file must succeed on synthetic JPEG: {:?}", clean_res.err());
+        assert!(
+            clean_res.is_ok(),
+            "clean_file must succeed on synthetic JPEG: {:?}",
+            clean_res.err()
+        );
 
         let raw_after = fs::read(&jpg_file).unwrap();
         assert_eq!(&raw_after[..2], &[0xFF, 0xD8]);
         assert_eq!(&raw_after[raw_after.len() - 2..], &[0xFF, 0xD9]);
         // APP1 marker must be stripped
         assert!(!raw_after.windows(2).any(|w| w == [0xFF, 0xE1]));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_strip_jpeg_keeps_icc_and_adobe_segments() {
+        let mut jpg = vec![0xFF, 0xD8];
+        // APP1 EXIF (stripped)
+        jpg.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x08]);
+        jpg.extend_from_slice(b"Exif\0\0");
+        // APP2 ICC_PROFILE (kept)
+        jpg.extend_from_slice(&[0xFF, 0xE2, 0x00, 0x0E]);
+        jpg.extend_from_slice(b"ICC_PROFILE\0");
+        // APP14 Adobe (kept)
+        jpg.extend_from_slice(&[0xFF, 0xEE, 0x00, 0x07]);
+        jpg.extend_from_slice(b"Adobe");
+        // COM comment (stripped)
+        jpg.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x05, b'h', b'i', b'!']);
+        jpg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x11, 0x22, 0xFF, 0xD9]);
+
+        let out = strip_jpeg_metadata(&jpg).unwrap();
+        assert!(!out.windows(4).any(|w| w == b"Exif"));
+        assert!(!out.windows(3).any(|w| w == b"hi!"));
+        assert!(out.windows(11).any(|w| w == b"ICC_PROFILE"));
+        assert!(out.windows(5).any(|w| w == b"Adobe"));
+        assert!(out.ends_with(&[0x11, 0x22, 0xFF, 0xD9]));
+    }
+
+    #[test]
+    fn test_strip_jpeg_rejects_truncated_input_without_touching_file() {
+        let temp_dir = env::temp_dir().join(format!("sentinel_trunc_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+        let jpg_file = temp_dir.join("truncated.jpg");
+        // APP1 claims 0x1000 bytes but the file ends early
+        let data = [0xFF, 0xD8, 0xFF, 0xE1, 0x10, 0x00, 0x45, 0x78];
+        fs::write(&jpg_file, data).unwrap();
+
+        assert!(clean_file(&jpg_file).is_err());
+        assert_eq!(fs::read(&jpg_file).unwrap(), data);
+        // Zero-length segment headers are malformed too
+        assert!(strip_jpeg_metadata(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x00]).is_err());
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -1790,7 +2206,11 @@ mod tests {
 
         // 1. Write file securely
         let write_res = write_secure_state_file(&state_file, content);
-        assert!(write_res.is_ok(), "write_secure_state_file should succeed: {:?}", write_res.err());
+        assert!(
+            write_res.is_ok(),
+            "write_secure_state_file should succeed: {:?}",
+            write_res.err()
+        );
 
         // 2. Verify file permissions are strictly 0600
         let meta = fs::symlink_metadata(&state_file).unwrap();
@@ -1814,11 +2234,17 @@ mod tests {
         let sym_file = temp_dir.join("sym_state.json");
         std::os::unix::fs::symlink(&state_file, &sym_file).unwrap();
         let sym_read = read_secure_state_file(&sym_file, 1024);
-        assert!(sym_read.is_err(), "read_secure_state_file must reject symlinks");
+        assert!(
+            sym_read.is_err(),
+            "read_secure_state_file must reject symlinks"
+        );
 
         // 6. Test symlink rejection on write
         let sym_write = write_secure_state_file(&sym_file, b"hack");
-        assert!(sym_write.is_err(), "write_secure_state_file must refuse to overwrite symlink");
+        assert!(
+            sym_write.is_err(),
+            "write_secure_state_file must refuse to overwrite symlink"
+        );
 
         // 7. Verify no temporary files remain
         let remaining_files: Vec<_> = fs::read_dir(&temp_dir)
@@ -1859,7 +2285,10 @@ mod tests {
         let sym_file = temp_dir.join("sym_sample.txt");
         std::os::unix::fs::symlink(&test_file, &sym_file).unwrap();
         let sym_res = read_file_bounded(&sym_file, 100);
-        assert!(sym_res.is_err(), "read_file_bounded must reject symlinks via O_NOFOLLOW");
+        assert!(
+            sym_res.is_err(),
+            "read_file_bounded must reject symlinks via O_NOFOLLOW"
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
@@ -1907,7 +2336,10 @@ mod tests {
         assert!(!cleaned.contains('>'));
         assert!(!cleaned.contains('"'));
         assert!(!cleaned.contains('\0'));
-        assert_eq!(cleaned, "img src=http://127.0.0.1:8080/beaconBadUSB Payload");
+        assert_eq!(
+            cleaned,
+            "img src=http://127.0.0.1:8080/beaconBadUSB Payload"
+        );
 
         let empty = "   \n\t  ";
         assert_eq!(sanitize_usb_product(empty), "USB Device");
@@ -1916,4 +2348,3 @@ mod tests {
         assert_eq!(sanitize_usb_product(normal), "Logitech USB Optical Mouse");
     }
 }
-

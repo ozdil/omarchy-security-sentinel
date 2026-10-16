@@ -22,6 +22,22 @@ Item {
         return parent + "/sentinel-engine";
     }
 
+    // Actions share one Process; queue them so a second click while the first
+    // (e.g. a pkexec prompt) is still running is not silently dropped.
+    property var actionQueue: []
+
+    function runAction(cmd) {
+        root.actionQueue = root.actionQueue.concat([cmd]);
+        root.startNextAction();
+    }
+
+    function startNextAction() {
+        if (actionProc.running || root.actionQueue.length === 0) return;
+        actionProc.command = root.actionQueue[0];
+        root.actionQueue = root.actionQueue.slice(1);
+        actionProc.running = true;
+    }
+
     function refresh() {
         if (!sentinelProc.running) {
             sentinelProc.running = true;
@@ -29,52 +45,39 @@ Item {
     }
 
     function toggleBlackout() {
-        if (root.networkBlackoutActive) {
-            actionProc.command = [root.enginePath, "--resume-network"];
-        } else {
-            actionProc.command = [root.enginePath, "--panic-blackout"];
-        }
-        actionProc.running = true;
+        root.runAction([root.enginePath, root.networkBlackoutActive ? "--resume-network" : "--panic-blackout"]);
     }
 
     function toggleUsbArmor() {
-        actionProc.command = [root.enginePath, "--toggle-usb-armor"];
-        actionProc.running = true;
+        root.runAction([root.enginePath, "--toggle-usb-armor"]);
     }
 
     function freezePid(pid) {
-        actionProc.command = [root.enginePath, "--kernel-freeze", String(pid)];
-        actionProc.running = true;
+        root.runAction([root.enginePath, "--kernel-freeze", String(pid)]);
     }
 
     function terminatePid(pid) {
-        actionProc.command = [root.enginePath, "--kernel-terminate", String(pid)];
-        actionProc.running = true;
+        root.runAction([root.enginePath, "--kernel-terminate", String(pid)]);
     }
 
     function toggleDot() {
-        actionProc.command = [root.enginePath, "--toggle-dns"];
-        actionProc.running = true;
+        root.runAction([root.enginePath, "--toggle-dns"]);
     }
 
     function toggleGhostMac() {
-        actionProc.command = [root.enginePath, "--toggle-ghost-mac"];
-        actionProc.running = true;
+        root.runAction([root.enginePath, "--toggle-ghost-mac"]);
     }
 
     function trustAllUsb() {
-        actionProc.command = [root.enginePath, "--trust-all-usb"];
-        actionProc.running = true;
+        root.runAction([root.enginePath, "--trust-all-usb"]);
     }
 
     function resetCanaries() {
-        actionProc.command = [root.enginePath, "--reset-canaries"];
-        actionProc.running = true;
+        root.runAction([root.enginePath, "--reset-canaries"]);
     }
 
     function scrubDownloads() {
-        actionProc.command = [root.enginePath, "--scrub-downloads"];
-        actionProc.running = true;
+        root.runAction([root.enginePath, "--scrub-downloads"]);
     }
 
     Process {
@@ -111,7 +114,10 @@ Item {
 
     Process {
         id: actionProc
-        onExited: root.refresh()
+        onExited: {
+            root.refresh();
+            root.startNextAction();
+        }
     }
 
     Component.onCompleted: refresh()
