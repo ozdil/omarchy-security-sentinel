@@ -13,19 +13,24 @@ pub(crate) fn check_network_sockets() -> ModuleStatus {
     let mut estab_items = Vec::new();
 
     let mut sockets = Vec::new();
+    let mut unreadable = Vec::new();
     for (path, proto) in [
         ("/proc/net/tcp", "tcp"),
         ("/proc/net/tcp6", "tcp6"),
         ("/proc/net/udp", "udp"),
         ("/proc/net/udp6", "udp6"),
     ] {
-        if let Ok(content) = read_file_bounded(Path::new(path), 1024 * 1024) {
-            sockets.extend(
+        // ~150 bytes per socket: 16 MiB covers about 100k sockets per table
+        match read_file_bounded(Path::new(path), 16 * 1024 * 1024) {
+            Ok(content) => sockets.extend(
                 content
                     .lines()
                     .skip(1)
                     .filter_map(|l| net::parse_proc_net_line(l, proto)),
-            );
+            ),
+            // A missing tcp6/udp6 just means IPv6 is disabled
+            Err(_) if !Path::new(path).exists() => {}
+            Err(_) => unreadable.push(path),
         }
     }
     let owners = net::socket_owners();
@@ -119,13 +124,23 @@ pub(crate) fn check_network_sockets() -> ModuleStatus {
     items.extend(alert_items);
     items.extend(listen_items);
     items.extend(estab_items);
+    // A table that could not be read has not been checked
+    for path in &unreadable {
+        items.insert(
+            0,
+            format!(
+                "[WARNING] {} could not be read; its sockets were not checked",
+                path
+            ),
+        );
+    }
     if items.is_empty() {
         items.push("No active listening sockets found".to_string());
     }
 
     let status = if flagged > 0 {
         Status::Alert
-    } else if warned > 0 {
+    } else if warned > 0 || !unreadable.is_empty() {
         Status::Warning
     } else {
         Status::Secure
@@ -139,6 +154,8 @@ pub(crate) fn check_network_sockets() -> ModuleStatus {
             format!("[ALERT] {} Suspicious connections detected!", flagged)
         } else if warned > 0 {
             format!("{} listener(s) worth a look; see the list", warned)
+        } else if !unreadable.is_empty() {
+            "Some socket tables could not be read; see the list".to_string()
         } else {
             "All outbound connections verified".to_string()
         },
