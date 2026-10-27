@@ -4,6 +4,8 @@ use std::fs::{self, File};
 use std::io::Read;
 
 const MAX_CMDLINE_READ_BYTES: u64 = 65536; // 64 KiB ceiling
+/// Command line kept in the report; the analysis itself sees up to 64 KiB
+const MAX_REPORTED_CMDLINE_CHARS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AnomalySeverity {
@@ -22,6 +24,10 @@ pub struct ProcessAnomaly {
     pub severity: AnomalySeverity,
     pub reasons: Vec<String>,
     pub recommended_action: String,
+    /// Kernel start time (clock ticks since boot), so an action taken from an older
+    /// report cannot hit a different process that reused the PID
+    #[serde(default)]
+    pub start_time: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -217,11 +223,12 @@ impl BehaviorAnalyzer {
         Some(ProcessAnomaly {
             pid,
             name: name.to_string(),
-            cmdline: cmdline.to_string(),
+            cmdline: truncate_chars(cmdline, MAX_REPORTED_CMDLINE_CHARS),
             score: clamped_score,
             severity,
             reasons,
             recommended_action,
+            start_time: 0,
         })
     }
 
@@ -331,13 +338,18 @@ pub fn analyze_all_processes() -> Vec<ProcessAnomaly> {
             // Read /proc/[pid]/cmdline bounded
             let cmdline_path = pid_path.join("cmdline");
             let mut cmdline = String::new();
+            let mut oversized = false;
             if let Ok(mut f) = File::open(&cmdline_path) {
                 let mut buf = Vec::new();
                 let _ = f
                     .by_ref()
                     .take(MAX_CMDLINE_READ_BYTES + 1)
                     .read_to_end(&mut buf);
-                if buf.len() <= MAX_CMDLINE_READ_BYTES as usize {
+                // Padding argv past the limit must not hide the command: analyze the
+                // first 64 KiB and score the oversize itself
+                oversized = buf.len() > MAX_CMDLINE_READ_BYTES as usize;
+                buf.truncate(MAX_CMDLINE_READ_BYTES as usize);
+                {
                     // Split null bytes into spaces
                     cmdline = buf
                         .split(|&b| b == 0)
@@ -361,9 +373,27 @@ pub fn analyze_all_processes() -> Vec<ProcessAnomaly> {
             let exe_path_buf = fs::read_link(pid_path.join("exe")).ok();
             let exe_str = exe_path_buf.as_ref().and_then(|p| p.to_str());
 
-            if let Some(anomaly) =
-                BehaviorAnalyzer::evaluate_process(pid, &proc_name, exe_str, &cmdline)
-            {
+            let mut found = BehaviorAnalyzer::evaluate_process(pid, &proc_name, exe_str, &cmdline);
+            if oversized {
+                let a = found.get_or_insert_with(|| ProcessAnomaly {
+                    pid,
+                    name: proc_name.clone(),
+                    cmdline: truncate_chars(&cmdline, MAX_REPORTED_CMDLINE_CHARS),
+                    score: 0,
+                    severity: AnomalySeverity::Low,
+                    reasons: Vec::new(),
+                    recommended_action: "AUDIT PROCESS TREE & NETWORK MONITORING".to_string(),
+                    start_time: 0,
+                });
+                a.score = (a.score + 40).min(100);
+                a.severity = a.severity.max(AnomalySeverity::Medium);
+                a.reasons.push(
+                    "Command line over 64 KiB: argv padding is a known way to hide a command"
+                        .to_string(),
+                );
+            }
+            if let Some(mut anomaly) = found {
+                anomaly.start_time = crate::kernel::process_start_time(pid).unwrap_or(0);
                 anomalies.push(anomaly);
             }
         }
@@ -387,4 +417,14 @@ pub fn analyze_socket_anomalies(
     }
     results.sort_by_key(|a| std::cmp::Reverse(a.score));
     results
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
 }

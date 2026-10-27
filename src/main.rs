@@ -26,6 +26,13 @@ fn exit_with_toggle_result(res: Result<bool, String>) -> ! {
     }
 }
 
+/// Prints an intervention result as JSON and exits non-zero when it failed, so the
+/// panel can tell the user instead of resetting the button as if it worked.
+fn print_intervention(res: &kernel::InterventionResult) -> ! {
+    println!("{}", serde_json::to_string(res).unwrap());
+    std::process::exit(if res.success { 0 } else { 1 });
+}
+
 fn main() {
     // 1. Enforce military-grade anti-tamper (prctl PR_SET_DUMPABLE 0)
     let _ = kernel::enforce_anti_tamper();
@@ -76,15 +83,11 @@ fn main() {
 
     // Emergency Military Network Blackout (Killswitch)
     if matches!(cmd, "--panic-blackout" | "panic-blackout") {
-        let res = kernel::kernel_apply_network_blackout();
-        println!("{}", serde_json::to_string(&res).unwrap());
-        return;
+        print_intervention(&kernel::kernel_apply_network_blackout());
     }
 
     if matches!(cmd, "--resume-network" | "resume-network") {
-        let res = kernel::kernel_clear_network_blackout();
-        println!("{}", serde_json::to_string(&res).unwrap());
-        return;
+        print_intervention(&kernel::kernel_clear_network_blackout());
     }
 
     if matches!(cmd, "--blackout-status" | "blackout-status") {
@@ -115,10 +118,8 @@ fn main() {
     .then_some(1usize)
     {
         if let Some(pid_str) = args.get(pos + 1) {
-            if let Ok(pid) = pid_str.parse::<i32>() {
-                let res = kernel::kernel_freeze_process(pid);
-                println!("{}", serde_json::to_string(&res).unwrap());
-                return;
+            if let Some((pid, start)) = kernel::parse_process_target(pid_str) {
+                print_intervention(&kernel::kernel_freeze_pinned(pid, start));
             }
         }
         eprintln!("Error: Valid numeric PID required for kernel freeze");
@@ -133,10 +134,8 @@ fn main() {
     .then_some(1usize)
     {
         if let Some(pid_str) = args.get(pos + 1) {
-            if let Ok(pid) = pid_str.parse::<i32>() {
-                let res = kernel::kernel_terminate_process(pid);
-                println!("{}", serde_json::to_string(&res).unwrap());
-                return;
+            if let Some((pid, start)) = kernel::parse_process_target(pid_str) {
+                print_intervention(&kernel::kernel_terminate_pinned(pid, start));
             }
         }
         eprintln!("Error: Valid numeric PID required for kernel terminate");
@@ -146,10 +145,8 @@ fn main() {
     // Kernel thaw process
     if let Some(pos) = matches!(cmd, "--kernel-thaw" | "kernel-thaw").then_some(1usize) {
         if let Some(pid_str) = args.get(pos + 1) {
-            if let Ok(pid) = pid_str.parse::<i32>() {
-                let res = kernel::kernel_thaw_process(pid);
-                println!("{}", serde_json::to_string(&res).unwrap());
-                return;
+            if let Some((pid, start)) = kernel::parse_process_target(pid_str) {
+                print_intervention(&kernel::kernel_thaw_pinned(pid, start));
             }
         }
         eprintln!("Error: Valid numeric PID required for kernel thaw");
@@ -161,9 +158,7 @@ fn main() {
         matches!(cmd, "--kernel-sever-socket" | "kernel-sever-socket").then_some(1usize)
     {
         if let Some(target) = args.get(pos + 1) {
-            let res = kernel::kernel_sever_socket(target);
-            println!("{}", serde_json::to_string(&res).unwrap());
-            return;
+            print_intervention(&kernel::kernel_sever_socket(target));
         }
         eprintln!("Error: Target port or IP required for socket severing");
         std::process::exit(1);
@@ -173,9 +168,7 @@ fn main() {
     if let Some(pos) = matches!(cmd, "--kernel-deauth-usb" | "kernel-deauth-usb").then_some(1usize)
     {
         if let Some(bus_id) = args.get(pos + 1) {
-            let res = kernel::kernel_deauth_usb(bus_id);
-            println!("{}", serde_json::to_string(&res).unwrap());
-            return;
+            print_intervention(&kernel::kernel_deauth_usb(bus_id));
         }
         eprintln!("Error: USB bus ID required for de-authorization");
         std::process::exit(1);
@@ -186,9 +179,7 @@ fn main() {
         matches!(cmd, "--kernel-quarantine-ip" | "kernel-quarantine-ip").then_some(1usize)
     {
         if let Some(ip) = args.get(pos + 1) {
-            let res = kernel::kernel_quarantine_ip(ip);
-            println!("{}", serde_json::to_string(&res).unwrap());
-            return;
+            print_intervention(&kernel::kernel_quarantine_ip(ip));
         }
         eprintln!("Error: IP address required for quarantine");
         std::process::exit(1);

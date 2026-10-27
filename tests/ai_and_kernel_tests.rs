@@ -300,3 +300,34 @@ fn test_spoofed_immune_name_outside_system_paths_is_not_immune() {
         res.message
     );
 }
+
+#[test]
+fn test_padded_cmdline_is_still_flagged_and_reported_short() {
+    // argv padded past the 64 KiB read limit used to blank the command line entirely
+    let padding = "A".repeat(70 * 1024);
+    // sh keeps running (no exec of the last command) with the padding as $1
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "sleep 30; :", "sh"])
+        .arg(&padding)
+        .spawn()
+        .unwrap();
+    let pid = child.id() as i32;
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let found = sentinel_engine::ai::analyze_all_processes()
+        .into_iter()
+        .find(|a| a.pid == pid);
+    let _ = child.kill();
+    let _ = child.wait();
+    let a = found.expect("oversized command line must be flagged");
+    assert!(a.reasons.iter().any(|r| r.contains("64 KiB")));
+    assert!(a.cmdline.chars().count() <= 513);
+    assert!(a.start_time > 0);
+}
+
+#[test]
+fn test_cli_process_target_parsing() {
+    use sentinel_engine::kernel::parse_process_target;
+    assert_eq!(parse_process_target("1234"), Some((1234, None)));
+    assert_eq!(parse_process_target("1234:987"), Some((1234, Some(987))));
+    assert_eq!(parse_process_target("abc"), None);
+}

@@ -421,6 +421,40 @@ pub fn kernel_freeze_process(pid: i32) -> InterventionResult {
     freeze_process(pid, None)
 }
 
+/// Like [`kernel_freeze_process`], but refuses when the PID no longer has the start
+/// time the UI saw in its report (the process exited and the PID was reused).
+pub fn kernel_freeze_pinned(pid: i32, start: Option<u64>) -> InterventionResult {
+    freeze_process(pid, start)
+}
+
+/// Like [`kernel_terminate_process`], pinned to a start time when one is given.
+pub fn kernel_terminate_pinned(pid: i32, start: Option<u64>) -> InterventionResult {
+    terminate_process(pid, start)
+}
+
+/// Like [`kernel_thaw_process`], pinned to a start time when one is given.
+pub fn kernel_thaw_pinned(pid: i32, start: Option<u64>) -> InterventionResult {
+    thaw_process(pid, start)
+}
+
+/// Parses a CLI process target: `<pid>` or `<pid>:<starttime>`.
+pub fn parse_process_target(arg: &str) -> Option<(i32, Option<u64>)> {
+    match parse_identity_arg(arg) {
+        Some((pid, start)) => Some((pid, Some(start))),
+        None => arg.trim().parse().ok().map(|pid| (pid, None)),
+    }
+}
+
+/// Signals are never sent through a generic `pkexec /usr/bin/kill <pid>`: that
+/// prompt does not show which process it is for, and the bare PID could be reused
+/// while it is open. Without the packaged helper, only own processes can be signalled.
+const NO_HELPER_FOR_SIGNALS: &str = "Permission denied. Signalling processes of other users needs the packaged root-owned /usr/bin/sentinel-engine and its polkit policy";
+
+/// Kernel start time of a process, for the report (see `proc_start_time`).
+pub fn process_start_time(pid: i32) -> Option<u64> {
+    proc_start_time(pid)
+}
+
 fn freeze_process(pid: i32, expected_start: Option<u64>) -> InterventionResult {
     let pid_str = pid.to_string();
     if pid <= 2 {
@@ -467,23 +501,7 @@ fn freeze_process(pid: i32, expected_start: Option<u64>) -> InterventionResult {
         }
         return res;
     }
-    if legacy_pkexec(&["/usr/bin/kill", "-STOP", "--", &pid_str], None) {
-        capture_forensic_evidence(pid);
-        return InterventionResult::ok(
-            "kernel_freeze",
-            &pid_str,
-            &format!(
-                "Process {} frozen via privileged kernel signal with forensic capture",
-                pid
-            ),
-        );
-    }
-
-    InterventionResult::err(
-        "kernel_freeze",
-        &pid_str,
-        "Permission denied or failure sending SIGSTOP signal",
-    )
+    InterventionResult::err("kernel_freeze", &pid_str, NO_HELPER_FOR_SIGNALS)
 }
 
 /// Terminates a malicious or uncooperative process at kernel level.
@@ -544,19 +562,7 @@ fn terminate_process(pid: i32, expected_start: Option<u64>) -> InterventionResul
     ) {
         return res;
     }
-    if legacy_pkexec(&["/usr/bin/kill", "-KILL", "--", &pid_str], None) {
-        return InterventionResult::ok(
-            "kernel_terminate",
-            &pid_str,
-            &format!("Process {} terminated via privileged kernel signal", pid),
-        );
-    }
-
-    InterventionResult::err(
-        "kernel_terminate",
-        &pid_str,
-        "Permission denied or failure sending termination signals",
-    )
+    InterventionResult::err("kernel_terminate", &pid_str, NO_HELPER_FOR_SIGNALS)
 }
 
 /// Thaws (resumes) a previously frozen process (SIGCONT / 18).
@@ -571,6 +577,10 @@ fn thaw_process(pid: i32, expected_start: Option<u64>) -> InterventionResult {
     }
 
     let handle = ProcessHandle::open(pid);
+    // The root helper must not resume an immune process someone else stopped
+    if let Err(msg) = validate_signal_target(pid, "resume") {
+        return InterventionResult::err("kernel_thaw", &pid_str, &msg);
+    }
     let start = match proc_start_time(pid) {
         Some(start) => start,
         None => {
@@ -606,14 +616,7 @@ fn thaw_process(pid: i32, expected_start: Option<u64>) -> InterventionResult {
     ) {
         return res;
     }
-    if legacy_pkexec(&["/usr/bin/kill", "-CONT", "--", &pid_str], None) {
-        return InterventionResult::ok(
-            "kernel_thaw",
-            &pid_str,
-            &format!("Process {} resumed via signal", pid),
-        );
-    }
-    InterventionResult::err("kernel_thaw", &pid_str, "Failed to send SIGCONT to process")
+    InterventionResult::err("kernel_thaw", &pid_str, NO_HELPER_FOR_SIGNALS)
 }
 
 // ---------------------------------------------------------------------------
@@ -1302,9 +1305,19 @@ mod tests {
             assert_eq!(policy.matches(&needle).count(), 1, "{}", flag);
         }
         // Only the USB block action may skip the password prompt
-        assert_eq!(policy.matches("<allow_active>yes</allow_active>").count(), 1);
-        let block = policy.split("io.omarchy.sentinel.usb-block").nth(1).unwrap();
-        assert!(block.split("</action>").next().unwrap().contains("<allow_active>yes"));
+        assert_eq!(
+            policy.matches("<allow_active>yes</allow_active>").count(),
+            1
+        );
+        let block = policy
+            .split("io.omarchy.sentinel.usb-block")
+            .nth(1)
+            .unwrap();
+        assert!(block
+            .split("</action>")
+            .next()
+            .unwrap()
+            .contains("<allow_active>yes"));
     }
 
     #[test]
