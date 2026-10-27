@@ -131,6 +131,11 @@ fn trusted_privileged_engine() -> bool {
     }
 }
 
+/// Whether root actions can go through the packaged, policy-gated helper.
+pub fn privileged_helper_available() -> bool {
+    Path::new(PKEXEC).exists() && trusted_privileged_engine()
+}
+
 /// Re-runs one operation as root through `pkexec /usr/bin/sentinel-engine <flag> <args>`,
 /// which matches the shipped polkit actions (custom message, `auth_admin`; USB blocks need no prompt).
 /// Returns `None` when the helper is unavailable so callers can use the legacy path.
