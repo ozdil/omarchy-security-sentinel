@@ -33,6 +33,12 @@ pub const PRIVILEGED_ENGINE: &str = "/usr/bin/sentinel-engine";
 pub const PRIVILEGED_INTERVENTION_FLAG: &str = "--privileged-intervention";
 /// CLI flag for the `io.omarchy.sentinel.network` polkit action.
 pub const PRIVILEGED_NETWORK_FLAG: &str = "--privileged-network";
+/// CLI flag for `io.omarchy.sentinel.usb-block`: de-authorizing a device only ever
+/// removes access, so the active session may do it without a password prompt that
+/// a keystroke injector could simply dismiss.
+pub const PRIVILEGED_USB_BLOCK_FLAG: &str = "--privileged-usb-block";
+/// CLI flag for `io.omarchy.sentinel.usb-trust` (re-authorizing a blocked device).
+pub const PRIVILEGED_USB_TRUST_FLAG: &str = "--privileged-usb-trust";
 
 /// Generous deadline for anything that may wait on a polkit password prompt.
 const PKEXEC_TIMEOUT: Duration = Duration::from_secs(120);
@@ -126,7 +132,7 @@ fn trusted_privileged_engine() -> bool {
 }
 
 /// Re-runs one operation as root through `pkexec /usr/bin/sentinel-engine <flag> <args>`,
-/// which matches the shipped polkit actions (custom message, `auth_admin_keep`).
+/// which matches the shipped polkit actions (custom message, `auth_admin`; USB blocks need no prompt).
 /// Returns `None` when the helper is unavailable so callers can use the legacy path.
 fn escalate_via_helper(flag: &str, args: &[&str]) -> Option<InterventionResult> {
     if in_privileged_mode() || !Path::new(PKEXEC).exists() || !trusted_privileged_engine() {
@@ -756,11 +762,35 @@ pub fn kernel_reauth_usb(bus_id: &str) -> InterventionResult {
     kernel_set_usb_authorized(bus_id, true)
 }
 
+/// Root hub (`usbN`) or a device whose class is hub (09)
+fn is_usb_hub(bus_id: &str) -> bool {
+    bus_id.starts_with("usb")
+        || read_proc_bounded(
+            &Path::new("/sys/bus/usb/devices")
+                .join(bus_id)
+                .join("bDeviceClass"),
+            16,
+        )
+        .is_ok_and(|c| String::from_utf8_lossy(&c).trim() == "09")
+}
+
 fn kernel_set_usb_authorized(bus_id: &str, authorize: bool) -> InterventionResult {
-    let (action, op, value, verb) = if authorize {
-        ("kernel_reauth_usb", "reauth-usb", b"1\n", "re-authorized")
+    let (action, flag, op, value, verb) = if authorize {
+        (
+            "kernel_reauth_usb",
+            PRIVILEGED_USB_TRUST_FLAG,
+            "reauth-usb",
+            b"1\n",
+            "re-authorized",
+        )
     } else {
-        ("kernel_deauth_usb", "deauth-usb", b"0\n", "de-authorized")
+        (
+            "kernel_deauth_usb",
+            PRIVILEGED_USB_BLOCK_FLAG,
+            "deauth-usb",
+            b"0\n",
+            "de-authorized",
+        )
     };
     let clean_id = bus_id.trim();
 
@@ -775,6 +805,12 @@ fn kernel_set_usb_authorized(bus_id: &str, authorize: bool) -> InterventionResul
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == ':')
     {
         return InterventionResult::err(action, clean_id, "Invalid USB Bus ID format");
+    }
+
+    // Root hubs and hubs are never blocked: the prompt-free block action would
+    // otherwise let any session process cut off every keyboard and mouse at once
+    if !authorize && is_usb_hub(clean_id) {
+        return InterventionResult::err(action, clean_id, "Refusing to de-authorize a USB hub");
     }
 
     let auth_path = format!("/sys/bus/usb/devices/{}/authorized", clean_id);
@@ -808,7 +844,7 @@ fn kernel_set_usb_authorized(bus_id: &str, authorize: bool) -> InterventionResul
     if !path.exists() {
         return InterventionResult::err(action, clean_id, "USB device not found in sysfs");
     }
-    if let Some(res) = escalate_via_helper(PRIVILEGED_INTERVENTION_FLAG, &[op, clean_id]) {
+    if let Some(res) = escalate_via_helper(flag, &[op, clean_id]) {
         return res;
     }
     // tee writes stdin to the validated path without a shell in between
@@ -1237,8 +1273,8 @@ pub fn run_privileged_operation(flag: &str, op: &str, arg: Option<&str>) -> Inte
             Some((pid, start)) => thaw_process(pid, Some(start)),
             None => InterventionResult::err(&action, arg.unwrap_or(""), IDENTITY_REQUIRED),
         },
-        (PRIVILEGED_INTERVENTION_FLAG, "deauth-usb") => kernel_deauth_usb(arg.unwrap_or("")),
-        (PRIVILEGED_INTERVENTION_FLAG, "reauth-usb") => kernel_reauth_usb(arg.unwrap_or("")),
+        (PRIVILEGED_USB_BLOCK_FLAG, "deauth-usb") => kernel_deauth_usb(arg.unwrap_or("")),
+        (PRIVILEGED_USB_TRUST_FLAG, "reauth-usb") => kernel_reauth_usb(arg.unwrap_or("")),
         (PRIVILEGED_INTERVENTION_FLAG, "sever-socket") => kernel_sever_socket(arg.unwrap_or("")),
         (PRIVILEGED_NETWORK_FLAG, "quarantine") => kernel_quarantine_ip(arg.unwrap_or("")),
         (PRIVILEGED_NETWORK_FLAG, "blackout-apply") => kernel_apply_network_blackout(),
@@ -1250,6 +1286,35 @@ pub fn run_privileged_operation(flag: &str, op: &str, arg: Option<&str>) -> Inte
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_polkit_policy_matches_helper_flags() {
+        let policy = include_str!("../../assets/io.omarchy.sentinel.policy");
+        // One approval must not unlock prompt-free root actions for minutes
+        assert!(!policy.contains("auth_admin_keep"));
+        for flag in [
+            PRIVILEGED_INTERVENTION_FLAG,
+            PRIVILEGED_NETWORK_FLAG,
+            PRIVILEGED_USB_BLOCK_FLAG,
+            PRIVILEGED_USB_TRUST_FLAG,
+        ] {
+            let needle = format!("exec.argv1\">{}</annotate>", flag);
+            assert_eq!(policy.matches(&needle).count(), 1, "{}", flag);
+        }
+        // Only the USB block action may skip the password prompt
+        assert_eq!(policy.matches("<allow_active>yes</allow_active>").count(), 1);
+        let block = policy.split("io.omarchy.sentinel.usb-block").nth(1).unwrap();
+        assert!(block.split("</action>").next().unwrap().contains("<allow_active>yes"));
+    }
+
+    #[test]
+    fn test_helper_routes_usb_ops_only_through_their_own_action() {
+        // Non-root: rejected before dispatch, but the unknown combinations must not
+        // be accepted under the prompt-free flag either
+        let r = run_privileged_operation(PRIVILEGED_USB_BLOCK_FLAG, "reauth-usb", Some("1-2"));
+        assert!(!r.success);
+        assert!(is_usb_hub("usb1"));
+    }
 
     #[test]
     fn test_pidfd_refuses_to_signal_a_reaped_process() {

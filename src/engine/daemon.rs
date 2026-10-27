@@ -103,7 +103,7 @@ pub(crate) fn run_daemon() -> i32 {
         let usb_due = usb_check_at.is_some_and(|t| t <= now);
         if usb_due || next_report <= now {
             let scan = scan_badusb();
-            notify_new_untrusted_usb(&scan.untrusted, &mut notified);
+            notify_new_untrusted_usb(&scan.untrusted, &scan.blocked, &mut notified);
             usb_check_at = if scan.pending_enumeration
                 && enumeration_rechecks < DAEMON_MAX_ENUMERATION_RECHECKS
             {
@@ -157,7 +157,11 @@ pub(crate) fn usb_device_signature() -> Vec<String> {
 }
 
 /// Raises one critical notification per untrusted device while it stays connected
-pub(crate) fn notify_new_untrusted_usb(untrusted: &[String], notified: &mut HashSet<String>) {
+pub(crate) fn notify_new_untrusted_usb(
+    untrusted: &[String],
+    blocked: &[String],
+    notified: &mut HashSet<String>,
+) {
     notified.retain(|id| untrusted.contains(id));
     let fresh: Vec<&String> = untrusted
         .iter()
@@ -166,11 +170,16 @@ pub(crate) fn notify_new_untrusted_usb(untrusted: &[String], notified: &mut Hash
     if fresh.is_empty() {
         return;
     }
-    let armor = is_usb_armor_enabled();
+    // Say "blocked" only for devices the kernel reports de-authorized
+    let blocked_now = fresh.iter().filter(|id| blocked.contains(id)).count();
     let body = format!(
         "{} untrusted USB device(s) connected{}: {}",
         fresh.len(),
-        if armor { " and de-authorized" } else { "" },
+        match blocked_now {
+            0 => String::new(),
+            n if n == fresh.len() => " and de-authorized".to_string(),
+            n => format!(", {} de-authorized", n),
+        },
         fresh
             .iter()
             .map(|s| s.as_str())

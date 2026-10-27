@@ -39,7 +39,10 @@ fn main() {
     // Root-side polkit helper: `pkexec /usr/bin/sentinel-engine --privileged-* <op> [arg]`
     if matches!(
         cmd,
-        kernel::PRIVILEGED_INTERVENTION_FLAG | kernel::PRIVILEGED_NETWORK_FLAG
+        kernel::PRIVILEGED_INTERVENTION_FLAG
+            | kernel::PRIVILEGED_NETWORK_FLAG
+            | kernel::PRIVILEGED_USB_BLOCK_FLAG
+            | kernel::PRIVILEGED_USB_TRUST_FLAG
     ) {
         let op = args.get(2).map(String::as_str).unwrap_or("");
         let res = kernel::run_privileged_operation(cmd, op, args.get(3).map(String::as_str));
@@ -200,8 +203,13 @@ fn main() {
     }
 
     if matches!(cmd, "--trust-all-usb") {
-        let count = trust_all_usb();
-        println!("Trusted {} devices", count);
+        match trust_all_usb() {
+            Ok(count) => println!("Trusted {} devices", count),
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        }
         return;
     }
 
