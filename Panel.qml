@@ -39,7 +39,7 @@ Panel {
   readonly property string manifestFallbackPath: Quickshell.env("HOME") ? Quickshell.env("HOME") + "/.config/omarchy/plugins/ozdil.security-sentinel/manifest.json" : ""
 
   property string pluginName: "Security Sentinel"
-  property string pluginVersion: "1.4.0"
+  property string pluginVersion: "1.5.0"
   property string pluginDescription: "Unified cyber security sentinel for Omarchy Linux: BadUSB hardware guard, kernel integrity auditor, and zero-trust privacy monitor."
   property string pluginAuthor: "Ozan Özdil"
   property string pluginLicense: "MIT"

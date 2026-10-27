@@ -1,0 +1,17 @@
+post_install() {
+  cat <<'MSG'
+==> Security Sentinel is installed in /usr/share/omarchy-security-sentinel.
+    Omarchy only loads plugins from your own config, so link it in once per user:
+
+      ln -s /usr/share/omarchy-security-sentinel ~/.config/omarchy/plugins/ozdil.security-sentinel
+      omarchy plugin enable ozdil.security-sentinel
+MSG
+}
+
+post_upgrade() {
+  # The plugin used to be installed under /usr/share/omarchy/plugins, which
+  # Omarchy never scanned
+  if [ "$(vercmp "$2" 1.5.0)" -lt 0 ]; then
+    post_install
+  fi
+}
