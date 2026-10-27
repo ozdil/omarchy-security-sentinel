@@ -8,7 +8,10 @@ import "theme"
 Item {
     id: root
 
-    property string threatLevel: "NORMAL"
+    // Fail closed: "UNKNOWN" until a report parses, never a green shield
+    property string threatLevel: "UNKNOWN"
+    property string engineError: "Waiting for the first report"
+    property string actionError: ""
     property var modules: []
     property var anomalousProcesses: []
     property var selectedModule: null
@@ -44,7 +47,7 @@ Item {
 
     // One colour per verdict; everything that is fine stays muted
     function statusColor(status) {
-        if (status === "ALERT" || status === "CRITICAL") return Theme.accentDanger;
+        if (status === "ALERT" || status === "CRITICAL" || status === "UNKNOWN") return Theme.accentDanger;
         if (status === "WARNING" || status === "ELEVATED") return Theme.accentWarning;
         return Theme.textMuted;
     }
@@ -68,10 +71,33 @@ Item {
     readonly property string runtimeDir: Quickshell.env("XDG_RUNTIME_DIR") || ""
     readonly property string reportCachePath: runtimeDir !== "" ? runtimeDir + "/omarchy-security-sentinel/report.json" : ""
 
+    // Refused whole when oversized instead of cut mid-JSON (which never parsed)
+    function parseReport(raw) {
+        var text = String(raw || "");
+        if (text.length > 1048576) {
+            root.markEngineError("Report too large (" + text.length + " bytes)");
+            return null;
+        }
+        try {
+            var d = JSON.parse(text);
+            if (d && d.modules && d.threat_level) return d;
+            root.markEngineError("Report is missing fields");
+        } catch(e) {
+            root.markEngineError("Report is not valid JSON");
+        }
+        return null;
+    }
+
+    function markEngineError(msg) {
+        root.engineError = msg;
+        root.threatLevel = "UNKNOWN";
+    }
+
     function applyReport(data) {
-        root.threatLevel = data.threat_level || "ZERO";
+        root.threatLevel = data.threat_level || "UNKNOWN";
+        root.engineError = "";
         root.modules = data.modules || [];
-        root.anomalousProcesses = data.ai_anomalies || data.anomalous_processes || [];
+        root.anomalousProcesses = data.ai_anomalies || [];
         root.networkBlackoutActive = !!data.network_blackout_active;
         root.networkBlackoutConfirmed = data.network_blackout_confirmed !== false;
         root.usbArmorEnabled = !!data.usb_armor_enabled;
@@ -117,12 +143,17 @@ Item {
         root.runAction([root.enginePath, "--toggle-usb-armor"]);
     }
 
-    function freezePid(pid) {
-        root.runAction([root.enginePath, "--kernel-freeze", String(pid)]);
+    // pid:start_time: the engine refuses a PID reused since the report was taken
+    function processTarget(pid, startTime) {
+        return String(pid) + (Number(startTime) > 0 ? ":" + String(startTime) : "");
     }
 
-    function terminatePid(pid) {
-        root.runAction([root.enginePath, "--kernel-terminate", String(pid)]);
+    function freezePid(pid, startTime) {
+        root.runAction([root.enginePath, "--kernel-freeze", root.processTarget(pid, startTime)]);
+    }
+
+    function terminatePid(pid, startTime) {
+        root.runAction([root.enginePath, "--kernel-terminate", root.processTarget(pid, startTime)]);
     }
 
     function toggleDot() {
@@ -148,7 +179,8 @@ Item {
     Process {
         id: sentinelProc
         command: [root.enginePath, "--json"]
-        onExited: {
+        onExited: function(code) {
+            if (code !== 0) root.markEngineError("Engine exited with code " + code);
             if (root.rescanPending) {
                 root.rescanPending = false;
                 root.refresh();
@@ -157,18 +189,33 @@ Item {
         stdout: StdioCollector {
             waitForEnd: true
             onStreamFinished: {
-                try {
-                    root.applyReport(JSON.parse(String(text || "{}").slice(0, 131072)));
-                } catch(e) {
-                    console.warn("Failed to parse sentinel json:", e);
-                }
+                var d = root.parseReport(text);
+                if (d) root.applyReport(d);
             }
         }
     }
 
     Process {
         id: actionProc
-        onExited: {
+        // Failed actions exit 1 with an InterventionResult; show its message
+        property string output: ""
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: actionProc.output = String(text || "")
+        }
+        onStarted: {
+            actionProc.output = "";
+            root.actionError = "";
+        }
+        onExited: function(code) {
+            if (code !== 0) {
+                var msg = "Action failed";
+                try {
+                    var r = JSON.parse(actionProc.output.slice(0, 16384));
+                    if (r && r.message) msg = String(r.message);
+                } catch(e) {}
+                root.actionError = msg;
+            }
             root.refresh();
             root.startNextAction();
         }
@@ -188,17 +235,24 @@ Item {
         printErrors: false
         // A stale, missing or unreadable cache means the daemon is not keeping up:
         // fall back to a direct scan so the dashboard never shows old data as live
+        // An invalid cache does not rescan: our own --json run rewrites it, which
+        // would fire this again and loop on back-to-back full scans
         onLoaded: {
-            var fresh = false;
-            try {
-                var d = JSON.parse(String(text() || "").slice(0, 131072));
-                var age = Date.now() / 1000 - Number(d.generated_at || 0);
-                if (age >= 0 && age <= 60) {
-                    root.applyReport(d);
-                    fresh = true;
-                }
-            } catch(e) {}
-            if (!fresh) root.refresh();
+            var raw = String(text() || "");
+            if (raw === "") {
+                root.refresh();
+                return;
+            }
+            var d = root.parseReport(raw);
+            if (!d) return;
+            var age = Date.now() / 1000 - Number(d.generated_at || 0);
+            if (age >= 0 && age <= 60) {
+                root.applyReport(d);
+            } else {
+                // Nobody keeps the cache fresh: start our daemon and scan once
+                if (!daemonProc.running) daemonProc.running = true;
+                root.refresh();
+            }
         }
         onLoadFailed: root.refresh()
         onFileChanged: reload()
@@ -208,10 +262,7 @@ Item {
         interval: 20000
         running: root.reportCachePath !== ""
         repeat: true
-        onTriggered: {
-            if (!daemonProc.running) daemonProc.running = true;
-            reportView.reload();
-        }
+        onTriggered: reportView.reload()
     }
 
     Component.onCompleted: refresh()
@@ -237,7 +288,8 @@ Item {
                 spacing: 12
 
                 Text {
-                    text: root.threatLevel === "CRITICAL" ? Theme.iconShieldAlert : (root.threatLevel === "ELEVATED" ? Theme.iconShield : Theme.iconShieldCheck)
+                    textFormat: Text.PlainText
+                    text: (root.threatLevel === "CRITICAL" || root.threatLevel === "UNKNOWN") ? Theme.iconShieldAlert : (root.threatLevel === "ELEVATED" ? Theme.iconShield : Theme.iconShieldCheck)
                     font.family: Theme.iconFont
                     font.pixelSize: 24
                     color: root.threatLevel === "ZERO" ? Theme.textMain : root.statusColor(root.threatLevel)
@@ -246,6 +298,7 @@ Item {
                 ColumnLayout {
                     spacing: 2
                     Text {
+                        textFormat: Text.PlainText
                         text: "Security Sentinel"
                         font.family: Theme.fontFamily
                         font.pixelSize: 15
@@ -253,6 +306,15 @@ Item {
                         color: Theme.textMain
                     }
                     Text {
+                        textFormat: Text.PlainText
+                        visible: root.engineError !== "" || root.actionError !== ""
+                        text: root.actionError !== "" ? root.actionError : root.engineError
+                        font.family: Theme.fontFamily
+                        font.pixelSize: 11
+                        color: Theme.accentDanger
+                    }
+                    Text {
+                        textFormat: Text.PlainText
                         text: "integrity " + (root.selfIntegrityHash && root.selfIntegrityHash !== "UNVERIFIED" ? root.selfIntegrityHash.substring(0, 12) : "unverified")
                         font.family: Theme.monoFont
                         font.pixelSize: 11
@@ -277,6 +339,7 @@ Item {
                         spacing: 6
 
                         Text {
+                            textFormat: Text.PlainText
                             text: root.networkBlackoutActive ? Theme.iconShieldAlert : Theme.iconShield
                             font.family: Theme.iconFont
                             font.pixelSize: 12
@@ -284,6 +347,7 @@ Item {
                         }
 
                         Text {
+                            textFormat: Text.PlainText
                             text: root.networkBlackoutActive
                                   ? (root.networkBlackoutConfirmed ? "Resume network" : "Resume network (blackout unconfirmed)")
                                   : (root.armedAction === "blackout" ? "Click again to cut all network" : "Panic blackout")
@@ -307,6 +371,7 @@ Item {
                 }
 
                 Text {
+                    textFormat: Text.PlainText
                     text: "threat " + root.threatLevel.toLowerCase()
                     font.family: Theme.monoFont
                     font.pixelSize: 12
@@ -324,6 +389,7 @@ Item {
                     border.width: 1
 
                     Text {
+                        textFormat: Text.PlainText
                         anchors.centerIn: parent
                         text: Theme.iconRefresh
                         font.family: Theme.iconFont
@@ -363,6 +429,7 @@ Item {
                     spacing: 10
 
                     Text {
+                        textFormat: Text.PlainText
                         text: "MODULES"
                         font.family: Theme.fontFamily
                         font.pixelSize: 11
@@ -399,6 +466,7 @@ Item {
                                 spacing: 10
 
                                 Text {
+                                    textFormat: Text.PlainText
                                     // ALERT used to render as a green check
                                     text: (modelData.status === "ALERT" || modelData.status === "WARNING") ? Theme.iconShieldAlert : Theme.iconShieldCheck
                                     font.family: Theme.iconFont
@@ -411,6 +479,7 @@ Item {
                                     spacing: 2
 
                                     Text {
+                                        textFormat: Text.PlainText
                                         Layout.fillWidth: true
                                         text: modelData.name || ""
                                         font.family: Theme.fontFamily
@@ -421,6 +490,7 @@ Item {
                                     }
 
                                     Text {
+                                        textFormat: Text.PlainText
                                         Layout.fillWidth: true
                                         text: modelData.summary || ""
                                         font.family: Theme.monoFont
@@ -431,6 +501,7 @@ Item {
                                 }
 
                                 Text {
+                                    textFormat: Text.PlainText
                                     text: String(modelData.status || "").toLowerCase()
                                     font.family: Theme.monoFont
                                     font.pixelSize: 10
@@ -466,6 +537,7 @@ Item {
                             Layout.fillWidth: true
                             spacing: 2
                             Text {
+                                textFormat: Text.PlainText
                                 text: root.selectedModule ? root.selectedModule.name : ""
                                 font.family: Theme.fontFamily
                                 font.pixelSize: 15
@@ -473,6 +545,7 @@ Item {
                                 color: Theme.textMain
                             }
                             Text {
+                                textFormat: Text.PlainText
                                 text: root.selectedModule ? root.selectedModule.detail : ""
                                 font.family: Theme.fontFamily
                                 font.pixelSize: 11
@@ -494,8 +567,8 @@ Item {
                                 id: dotBtnRow
                                 anchors.centerIn: parent
                                 spacing: 6
-                                Text { text: Theme.iconLock; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.textMuted }
-                                Text { text: "Toggle DNS-over-TLS"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
+                                Text { textFormat: Text.PlainText; text: Theme.iconLock; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.textMuted }
+                                Text { textFormat: Text.PlainText; text: "Toggle DNS-over-TLS"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
                             }
 
                             MouseArea {
@@ -518,8 +591,8 @@ Item {
                                 id: macBtnRow
                                 anchors.centerIn: parent
                                 spacing: 6
-                                Text { text: Theme.iconNetwork; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.textMuted }
-                                Text { text: "Toggle MAC randomization"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
+                                Text { textFormat: Text.PlainText; text: Theme.iconNetwork; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.textMuted }
+                                Text { textFormat: Text.PlainText; text: "Toggle MAC randomization"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
                             }
 
                             MouseArea {
@@ -543,12 +616,14 @@ Item {
                                 anchors.centerIn: parent
                                 spacing: 6
                                 Text { 
+                                    textFormat: Text.PlainText
                                     text: Theme.iconShield
                                     font.family: Theme.iconFont
                                     font.pixelSize: 11
                                     color: root.usbArmorEnabled ? Theme.accent : Theme.textMuted
                                 }
                                 Text { 
+                                    textFormat: Text.PlainText
                                     text: root.usbArmorEnabled ? "USB Armor on" : "USB Armor off"
                                     font.family: Theme.fontFamily
                                     font.pixelSize: 11
@@ -576,8 +651,8 @@ Item {
                                 id: usbBtnRow
                                 anchors.centerIn: parent
                                 spacing: 6
-                                Text { text: Theme.iconUsb; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.textMuted }
-                                Text { text: "Trust connected"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
+                                Text { textFormat: Text.PlainText; text: Theme.iconUsb; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.textMuted }
+                                Text { textFormat: Text.PlainText; text: "Trust connected"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
                             }
 
                             MouseArea {
@@ -600,8 +675,8 @@ Item {
                                 id: tripBtnRow
                                 anchors.centerIn: parent
                                 spacing: 6
-                                Text { text: Theme.iconShield; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.textMuted }
-                                Text { text: "Reset canaries"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
+                                Text { textFormat: Text.PlainText; text: Theme.iconShield; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.textMuted }
+                                Text { textFormat: Text.PlainText; text: "Reset canaries"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
                             }
 
                             MouseArea {
@@ -624,8 +699,8 @@ Item {
                                 id: opsecBtnRow
                                 anchors.centerIn: parent
                                 spacing: 6
-                                Text { text: Theme.iconTrash; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.textMuted }
-                                Text { text: "Scrub Downloads"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
+                                Text { textFormat: Text.PlainText; text: Theme.iconTrash; font.family: Theme.iconFont; font.pixelSize: 11; color: Theme.textMuted }
+                                Text { textFormat: Text.PlainText; text: "Scrub Downloads"; font.family: Theme.fontFamily; font.pixelSize: 11; color: Theme.textMain }
                             }
 
                             MouseArea {
@@ -649,6 +724,7 @@ Item {
                         visible: root.selectedModule && root.selectedModule.id === "ai_behavior" && root.anomalousProcesses.length > 0
 
                         Text {
+                            textFormat: Text.PlainText
                             text: "SUSPICIOUS PROCESSES"
                             font.family: Theme.fontFamily
                             font.pixelSize: 11
@@ -673,6 +749,7 @@ Item {
                                     spacing: 10
 
                                     Text {
+                                        textFormat: Text.PlainText
                                         text: "PID " + modelData.pid + " • " + (modelData.name || "")
                                         font.family: Theme.monoFont
                                         font.pixelSize: 11
@@ -702,8 +779,8 @@ Item {
                                         RowLayout {
                                             anchors.centerIn: parent
                                             spacing: 4
-                                            Text { text: Theme.iconSnowflake; font.family: Theme.iconFont; font.pixelSize: 10; color: Theme.accent }
-                                            Text { id: freezeText; text: root.armedAction === "freeze:" + modelData.pid ? "Confirm freeze?" : "Freeze"; font.family: Theme.fontFamily; font.pixelSize: 10; color: Theme.textMain }
+                                            Text { textFormat: Text.PlainText; text: Theme.iconSnowflake; font.family: Theme.iconFont; font.pixelSize: 10; color: Theme.accent }
+                                            Text { textFormat: Text.PlainText; id: freezeText; text: root.armedAction === "freeze:" + modelData.pid ? "Confirm freeze?" : "Freeze"; font.family: Theme.fontFamily; font.pixelSize: 10; color: Theme.textMain }
                                         }
 
                                         MouseArea {
@@ -713,7 +790,8 @@ Item {
                                             cursorShape: Qt.PointingHandCursor
                                             onClicked: {
                                                 var pid = modelData.pid;
-                                                root.confirmOrArm("freeze:" + pid, function() { root.freezePid(pid); });
+                                                var start = modelData.start_time;
+                                                root.confirmOrArm("freeze:" + pid, function() { root.freezePid(pid, start); });
                                             }
                                         }
                                     }
@@ -730,8 +808,8 @@ Item {
                                         RowLayout {
                                             anchors.centerIn: parent
                                             spacing: 4
-                                            Text { text: Theme.iconTrash; font.family: Theme.iconFont; font.pixelSize: 10; color: Theme.accentDanger }
-                                            Text { id: termText; text: root.armedAction === "kill:" + modelData.pid ? "Confirm kill?" : "Kill"; font.family: Theme.fontFamily; font.pixelSize: 10; color: Theme.accentDanger }
+                                            Text { textFormat: Text.PlainText; text: Theme.iconTrash; font.family: Theme.iconFont; font.pixelSize: 10; color: Theme.accentDanger }
+                                            Text { textFormat: Text.PlainText; id: termText; text: root.armedAction === "kill:" + modelData.pid ? "Confirm kill?" : "Kill"; font.family: Theme.fontFamily; font.pixelSize: 10; color: Theme.accentDanger }
                                         }
 
                                         MouseArea {
@@ -741,7 +819,8 @@ Item {
                                             cursorShape: Qt.PointingHandCursor
                                             onClicked: {
                                                 var pid = modelData.pid;
-                                                root.confirmOrArm("kill:" + pid, function() { root.terminatePid(pid); });
+                                                var start = modelData.start_time;
+                                                root.confirmOrArm("kill:" + pid, function() { root.terminatePid(pid, start); });
                                             }
                                         }
                                     }
