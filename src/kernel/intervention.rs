@@ -1109,10 +1109,13 @@ fn get_private_state_dir() -> Result<PathBuf, String> {
         return Err("State storage is disabled in privileged helper mode".to_string());
     }
     let base = match std::env::var("XDG_STATE_HOME") {
-        Ok(state) if !state.is_empty() => PathBuf::from(state),
+        // Same rule as the engine's get_state_dir: relative XDG values are ignored
+        Ok(state) if state.starts_with('/') => PathBuf::from(state),
         _ => {
             let home = std::env::var("HOME")
-                .map_err(|_| "HOME environment variable is not set".to_string())?;
+                .ok()
+                .filter(|h| h.starts_with('/'))
+                .ok_or_else(|| "HOME is not set to an absolute path".to_string())?;
             PathBuf::from(home).join(".local/state")
         }
     };
