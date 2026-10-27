@@ -8,11 +8,11 @@
 
   <action id="io.omarchy.sentinel.intervention">
     <description>Perform kernel-level security interventions</description>
-    <message>Authentication is required to execute kernel security interventions (process freeze/terminate/resume, socket sever, or USB de-authorization and re-authorization).</message>
+    <message>Authentication is required to execute kernel security interventions (process freeze/terminate/resume or socket sever).</message>
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
-      <allow_active>auth_admin_keep</allow_active>
+      <allow_active>auth_admin</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/sentinel-engine</annotate>
     <annotate key="org.freedesktop.policykit.exec.argv1">--privileged-intervention</annotate>
@@ -24,9 +24,35 @@
     <defaults>
       <allow_any>no</allow_any>
       <allow_inactive>no</allow_inactive>
-      <allow_active>auth_admin_keep</allow_active>
+      <allow_active>auth_admin</allow_active>
     </defaults>
     <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/sentinel-engine</annotate>
     <annotate key="org.freedesktop.policykit.exec.argv1">--privileged-network</annotate>
+  </action>
+  <!-- Blocking only removes access, so the active local session needs no password:
+       a BadUSB keystroke injector could otherwise dismiss the prompt itself.
+       The helper refuses hubs, so this cannot cut off every keyboard at once. -->
+  <action id="io.omarchy.sentinel.usb-block">
+    <description>Block an untrusted USB device</description>
+    <message>Authentication is required to de-authorize a USB device.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/sentinel-engine</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">--privileged-usb-block</annotate>
+  </action>
+
+  <action id="io.omarchy.sentinel.usb-trust">
+    <description>Re-enable a blocked USB device</description>
+    <message>Authentication is required to re-authorize a USB device that USB Armor blocked.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/bin/sentinel-engine</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">--privileged-usb-trust</annotate>
   </action>
 </policyconfig>

@@ -42,10 +42,21 @@ pub(crate) fn load_trusted_usb(path: &Path) -> Option<TrustStore> {
     TrustStore::parse(&bytes)
 }
 
-pub(crate) fn save_trusted_usb(path: &Path, store: &TrustStore) {
-    if let Some(data) = store.to_json() {
-        let _ = write_secure_state_file(path, &data);
-    }
+pub(crate) fn save_trusted_usb(path: &Path, store: &TrustStore) -> Result<(), String> {
+    let data = store
+        .to_json()
+        .ok_or_else(|| "Cannot serialize the USB baseline".to_string())?;
+    write_secure_state_file(path, &data)
+}
+
+/// (mtime ns, size) of the baseline, to notice "Trust Devices" rewriting it mid-scan
+fn baseline_stamp(path: &Path) -> Option<(i128, u64)> {
+    fs::symlink_metadata(path).ok().map(|m| {
+        (
+            m.mtime() as i128 * 1_000_000_000 + m.mtime_nsec() as i128,
+            m.len(),
+        )
+    })
 }
 
 /// Connected USB devices as (bus id, sysfs dir, fingerprint)
@@ -70,6 +81,8 @@ pub(crate) struct BadUsbScan {
     pub(crate) pending_enumeration: bool,
     /// Stable identity (bus id + fingerprint id) of every untrusted device
     pub(crate) untrusted: Vec<String>,
+    /// The subset of `untrusted` that is de-authorized after this pass
+    pub(crate) blocked: Vec<String>,
 }
 
 pub(crate) fn check_badusb() -> ModuleStatus {
@@ -84,6 +97,7 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
 
     let trusted_file = get_state_dir().join("trusted_usb.json");
     let file_existed = trusted_file.exists();
+    let loaded_stamp = baseline_stamp(&trusted_file);
     // An existing but unreadable/corrupt baseline must not be treated as "trust nothing":
     // with USB Armor on that would de-authorize every device, keyboard and mouse included.
     let loaded = if file_existed {
@@ -96,6 +110,9 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
     let mut store_changed = false;
     let mut pending_enumeration = false;
     let mut untrusted = Vec::new();
+    // Untrusted devices as (bus id, identity, high risk): high risk is anything that
+    // can type (HID), a HID+storage composite, or a clone that changed its interfaces
+    let mut untrusted_devices: Vec<(String, String, bool)> = Vec::new();
 
     let devices = connected_usb_devices();
     let total_usb = devices.len();
@@ -169,7 +186,11 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
                 deauth_targets.push((bus_id.clone(), format!("{} {}", bus_id, fp.id())));
             }
             unapproved_bus_ids.push(bus_id.clone());
-            untrusted.push(format!("{} {} {}", bus_id, fp.id(), prod));
+            let ident = format!("{} {} {}", bus_id, fp.id(), prod);
+            let high_risk =
+                fp.is_hid() || matches!(verdict, Some(TrustVerdict::FingerprintMismatch { .. }));
+            untrusted_devices.push((bus_id.clone(), ident.clone(), high_risk));
+            untrusted.push(ident);
         }
     }
 
@@ -180,36 +201,45 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
     let any_blocked = devices.iter().any(|(_, path, _)| is_deauthorized(path));
     let first_run_ready =
         !file_existed && !baseline_corrupt && !pending_enumeration && !any_blocked;
-    if (store_changed && file_existed) || first_run_ready {
-        save_trusted_usb(&trusted_file, &store);
-    }
+    let wants_save = (store_changed && file_existed) || first_run_ready;
 
     // Prune declined-prompt entries of unplugged devices on every pass, so a device
     // that comes back on the same port is judged (and blocked) afresh
     let connected: Vec<&str> = devices.iter().map(|(b, _, _)| b.as_str()).collect();
-    load_deauth_declined(&connected);
+    load_deauth_declined(&connected, unix_now());
 
     let untrusted_count = unapproved_bus_ids.len();
     let armor_active = is_usb_armor_enabled();
 
-    // The daemon, panel and dashboard scan independently. Only the one holding the
-    // armor lock may raise a polkit prompt; the others skip blocking this pass, so
-    // one hot-plug never opens several password dialogs at once.
-    let armor_lock = if armor_active && !deauth_targets.is_empty() {
+    // The daemon, panel and dashboard scan independently, and "Trust Devices" holds
+    // the same lock while it rewrites the baseline. Only the holder may save the
+    // baseline or raise a block; the others skip both this pass, so one hot-plug
+    // never opens several dialogs and a stale scan never overwrites new trust.
+    let wants_block = armor_active && !deauth_targets.is_empty();
+    let armor_lock = if wants_save || wants_block {
         armor_lock(false)
     } else {
         None
     };
-    if armor_active && untrusted_count > 0 && armor_lock.is_some() {
-        // A cancelled or failed polkit prompt is remembered per device (bus id +
-        // VID:PID) until it is unplugged; otherwise every scan from the daemon,
-        // panel and dashboard would raise the password dialog again.
-        // Another scan may have recorded a cancelled prompt while we waited
-        let mut declined = load_deauth_declined(&connected);
+    // The baseline must still be the one this scan loaded: "Trust Devices" may have
+    // rewritten it after we read it and released the lock before we got it
+    if wants_save && armor_lock.is_some() && baseline_stamp(&trusted_file) == loaded_stamp {
+        if let Err(e) = save_trusted_usb(&trusted_file, &store) {
+            items.push(format!("[WARNING] Cannot save USB baseline: {}", e));
+        }
+    }
+
+    let mut block_failed = 0;
+    if wants_block && armor_lock.is_some() {
+        // A cancelled or failed block is retried after DEAUTH_RETRY_SECS, not
+        // remembered until replug: a keystroke injector must not be able to dismiss
+        // the prompt once and stay authorized for good.
+        // Another scan may have recorded a failure while we waited
+        let now = unix_now();
+        let mut declined = load_deauth_declined(&connected, now);
         let mut declined_changed = false;
-        let mut blocked_now = 0;
         for (b_id, key) in &deauth_targets {
-            if declined.contains(key) {
+            if declined.iter().any(|(k, _)| k == key) {
                 continue;
             }
             // Another scan may have blocked it while we waited for the lock
@@ -219,25 +249,44 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
             if read_file_bounded(&auth, 16).is_ok_and(|a| a.trim() == "0") {
                 continue;
             }
-            if kernel::kernel_deauth_usb(b_id).success {
-                blocked_now += 1;
-            } else {
-                declined.push(key.clone());
+            if !kernel::kernel_deauth_usb(b_id).success {
+                declined.push((key.clone(), now));
                 declined_changed = true;
             }
         }
         if declined_changed {
             save_deauth_declined(&declined);
         }
-        if blocked_now > 0 {
-            items.push("USB Armor: untrusted devices were de-authorized".to_string());
-        }
-        if !declined.is_empty() {
-            items.push(
-                "[WARNING] USB Armor could not block a device (authorization cancelled or failed); it will not ask again until the device is replugged"
-                    .to_string(),
-            );
-        }
+    }
+
+    // Report what the kernel says now, not what was attempted
+    let blocked: Vec<String> = untrusted_devices
+        .iter()
+        .filter(|(b, _, _)| is_deauthorized(&Path::new("/sys/bus/usb/devices").join(b)))
+        .map(|(_, ident, _)| ident.clone())
+        .collect();
+    let unblocked_high_risk = untrusted_devices
+        .iter()
+        .filter(|(_, ident, high)| *high && !blocked.contains(ident))
+        .count();
+    if armor_active {
+        let blockable: Vec<&str> = deauth_targets.iter().map(|(b, _)| b.as_str()).collect();
+        block_failed = untrusted_devices
+            .iter()
+            .filter(|(b, ident, _)| blockable.contains(&b.as_str()) && !blocked.contains(ident))
+            .count();
+    }
+    if !blocked.is_empty() {
+        items.push(format!(
+            "USB Armor: {} untrusted device(s) de-authorized",
+            blocked.len()
+        ));
+    }
+    if block_failed > 0 {
+        items.push(format!(
+            "[ALERT] USB Armor could not block {} device(s) (authorization cancelled, failed or another scan holds the lock); retrying in {} s",
+            block_failed, DEAUTH_RETRY_SECS
+        ));
     }
 
     let legacy_left = store.devices.iter().filter(|d| d.is_legacy()).count();
@@ -267,11 +316,17 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
             module,
             pending_enumeration,
             untrusted,
+            blocked,
         };
     }
 
-    let status = if untrusted_count > 0 {
+    // A device that can type and is not blocked, or a block that failed, is an
+    // active threat. Other untrusted devices (an audio DAC, a blocked keyboard) only
+    // need the user's decision.
+    let status = if unblocked_high_risk > 0 || block_failed > 0 {
         Status::Alert
+    } else if untrusted_count > 0 {
+        Status::Warning
     } else {
         Status::Secure
     };
@@ -280,16 +335,19 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
         name: "BadUSB Defense".to_string(),
         status,
         summary: if untrusted_count > 0 {
-            if armor_active {
-                format!("{} untrusted, blocked", untrusted_count)
-            } else {
+            if blocked.is_empty() {
                 format!("{} untrusted device(s)", untrusted_count)
+            } else {
+                format!("{} untrusted, {} blocked", untrusted_count, blocked.len())
             }
         } else {
             format!("{} devices, {} HID, all trusted", total_usb, hid_count)
         },
         detail: if untrusted_count > 0 {
-            if armor_active {
+            if block_failed > 0 {
+                "USB Armor could not block every untrusted device. Unplug it if it is not yours."
+                    .to_string()
+            } else if armor_active {
                 "USB Armor blocked the untrusted devices. Trust them if they are yours.".to_string()
             } else {
                 "Untrusted USB device attached. Trust it if it is yours, or turn on USB Armor to block it.".to_string()
@@ -306,6 +364,7 @@ pub(crate) fn scan_badusb() -> BadUsbScan {
         module,
         pending_enumeration,
         untrusted,
+        blocked,
     }
 }
 
@@ -334,31 +393,40 @@ fn deauth_declined_path() -> PathBuf {
         .join("usb_deauth_declined")
 }
 
-/// Devices whose de-authorization was declined, pruned to the ones still connected
-fn load_deauth_declined(connected: &[&str]) -> Vec<String> {
+/// How long a failed or cancelled block is held back before Armor tries again
+const DEAUTH_RETRY_SECS: u64 = 60;
+
+/// Devices whose de-authorization failed recently, as (key, unix time), pruned to the
+/// ones still connected and still inside the retry window
+fn load_deauth_declined(connected: &[&str], now: u64) -> Vec<(String, u64)> {
     let path = deauth_declined_path();
     let raw = read_secure_state_file(&path, 64 * 1024).unwrap_or_default();
-    let all: Vec<String> = String::from_utf8_lossy(&raw)
-        .lines()
-        .map(str::to_string)
-        .collect();
-    let kept: Vec<String> = all
-        .iter()
-        .filter(|k| {
-            k.split(' ')
-                .next()
-                .is_some_and(|bus| connected.contains(&bus))
-        })
-        .cloned()
-        .collect();
+    let text = String::from_utf8_lossy(&raw);
+    let all: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    let kept = parse_declined(&all, connected, now);
     if kept.len() != all.len() {
         save_deauth_declined(&kept);
     }
     kept
 }
 
-fn save_deauth_declined(keys: &[String]) {
-    let _ = write_secure_state_file(&deauth_declined_path(), keys.join("\n").as_bytes());
+fn parse_declined(lines: &[&str], connected: &[&str], now: u64) -> Vec<(String, u64)> {
+    lines
+        .iter()
+        .filter_map(|l| {
+            // Lines without a timestamp come from older versions: drop them
+            let (key, ts) = l.rsplit_once('\t')?;
+            let ts: u64 = ts.parse().ok()?;
+            let bus = key.split(' ').next()?;
+            (connected.contains(&bus) && now.saturating_sub(ts) < DEAUTH_RETRY_SECS)
+                .then(|| (key.to_string(), ts))
+        })
+        .collect()
+}
+
+fn save_deauth_declined(keys: &[(String, u64)]) {
+    let text: Vec<String> = keys.iter().map(|(k, t)| format!("{}\t{}", k, t)).collect();
+    let _ = write_secure_state_file(&deauth_declined_path(), text.join("\n").as_bytes());
 }
 
 fn is_deauthorized(path: &Path) -> bool {
@@ -420,7 +488,7 @@ fn merge_into_baseline(store: &mut TrustStore, devices: &[ObservedDevice]) -> us
     added
 }
 
-pub(crate) fn trust_all_usb() -> usize {
+pub(crate) fn trust_all_usb() -> Result<usize, String> {
     // Hold off Armor until the restored devices are approved: a scan in between
     // would see them re-enabled but not yet trusted and block them again.
     let _armor_guard = armor_lock(true);
@@ -467,7 +535,14 @@ pub(crate) fn trust_all_usb() -> usize {
         })
         .collect();
     let added = merge_into_baseline(&mut store, &observed);
-    save_trusted_usb(&trusted_file, &store);
+    if let Err(e) = save_trusted_usb(&trusted_file, &store) {
+        notify_desktop(
+            "BadUSB Defense",
+            &format!("Could not save the trusted USB baseline: {}", e),
+            true,
+        );
+        return Err(e);
+    }
     // Trusted devices are no longer Armor targets; forget declined prompts
     save_deauth_declined(&[]);
     notify_desktop(
@@ -486,12 +561,26 @@ pub(crate) fn trust_all_usb() -> usize {
         ),
         false,
     );
-    devices.len()
+    Ok(devices.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_declined_block_is_retried_after_window() {
+        let lines = [
+            "1-2 1234:5678 Ducky\t1000",
+            "1-3 aaaa:bbbb Gone\t1000",
+            "1-4 cccc:dddd Legacy line without timestamp",
+        ];
+        let connected = ["1-2", "1-4"];
+        let kept = parse_declined(&lines, &connected, 1000 + DEAUTH_RETRY_SECS - 1);
+        assert_eq!(kept, vec![("1-2 1234:5678 Ducky".to_string(), 1000)]);
+        // A cancelled prompt does not exempt the device for good
+        assert!(parse_declined(&lines, &connected, 1000 + DEAUTH_RETRY_SECS).is_empty());
+    }
 
     fn fp(vid: &str, pid: &str, ifs: &[&str]) -> UsbFingerprint {
         UsbFingerprint {

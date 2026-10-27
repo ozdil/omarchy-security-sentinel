@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// Flagged processes carried in the report (most suspicious first)
+const MAX_REPORTED_ANOMALIES: usize = 16;
+
 pub(crate) fn check_ai_behavior() -> (ModuleStatus, u32, Vec<ai::ProcessAnomaly>) {
     let anomalies = ai::analyze_all_processes();
     let max_score = anomalies.iter().map(|a| a.score).max().unwrap_or(0);
@@ -47,6 +50,11 @@ pub(crate) fn check_ai_behavior() -> (ModuleStatus, u32, Vec<ai::ProcessAnomaly>
             )
         })
         .collect();
+
+    // The panel and dashboard parse the whole report; an unbounded list of flagged
+    // processes would let one noisy (or hostile) host push it past their limit
+    let mut anomalies = anomalies;
+    anomalies.truncate(MAX_REPORTED_ANOMALIES);
 
     (
         ModuleStatus {

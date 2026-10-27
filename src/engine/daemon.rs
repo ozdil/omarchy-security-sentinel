@@ -5,6 +5,8 @@ use super::*;
 pub(crate) const DAEMON_REPORT_INTERVAL: Duration = Duration::from_secs(20);
 /// Hot-plug produces a burst of uevents (device, then each interface); wait for quiet
 pub(crate) const DAEMON_USB_SETTLE: Duration = Duration::from_millis(750);
+/// Upper bound on how long a stream of USB events can postpone the Armor check
+pub(crate) const DAEMON_USB_MAX_DELAY: Duration = Duration::from_secs(3);
 pub(crate) const DAEMON_ENUMERATION_RECHECK: Duration = Duration::from_secs(1);
 pub(crate) const DAEMON_MAX_ENUMERATION_RECHECKS: u32 = 15;
 pub(crate) const DAEMON_INTEGRITY_REFRESH: Duration = Duration::from_secs(300);
@@ -94,6 +96,9 @@ pub(crate) fn run_daemon() -> i32 {
 
     let mut next_report = Instant::now();
     let mut usb_check_at: Option<Instant> = None;
+    // First USB event of the current burst: later events push the check back by the
+    // settle time, but never past DAEMON_USB_MAX_DELAY after the first one
+    let mut burst_start: Option<Instant> = None;
     let mut enumeration_rechecks = 0u32;
     let mut notified: HashSet<String> = HashSet::new();
     let mut usb_signature = usb_device_signature();
@@ -102,8 +107,9 @@ pub(crate) fn run_daemon() -> i32 {
         let now = Instant::now();
         let usb_due = usb_check_at.is_some_and(|t| t <= now);
         if usb_due || next_report <= now {
+            burst_start = None;
             let scan = scan_badusb();
-            notify_new_untrusted_usb(&scan.untrusted, &mut notified);
+            notify_new_untrusted_usb(&scan.untrusted, &scan.blocked, &mut notified);
             usb_check_at = if scan.pending_enumeration
                 && enumeration_rechecks < DAEMON_MAX_ENUMERATION_RECHECKS
             {
@@ -124,10 +130,12 @@ pub(crate) fn run_daemon() -> i32 {
         let deadline = usb_check_at.map_or(next_report, |t| t.min(next_report));
         let wait = deadline.saturating_duration_since(now);
         let usb_changed = match &uevents {
-            Some(sock) => sock
-                .wait(wait)
-                .iter()
-                .any(|ev| ev.is_usb_arrival() || ev.is_usb_removal()),
+            Some(sock) => {
+                let (events, lost) = sock.wait_lossy(wait);
+                lost || events
+                    .iter()
+                    .any(|ev| ev.is_usb_arrival() || ev.is_usb_removal())
+            }
             None => {
                 std::thread::sleep(wait.min(DAEMON_USB_POLL_FALLBACK));
                 let sig = usb_device_signature();
@@ -137,7 +145,9 @@ pub(crate) fn run_daemon() -> i32 {
             }
         };
         if usb_changed {
-            usb_check_at = Some(Instant::now() + DAEMON_USB_SETTLE);
+            let now = Instant::now();
+            let first = *burst_start.get_or_insert(now);
+            usb_check_at = Some((now + DAEMON_USB_SETTLE).min(first + DAEMON_USB_MAX_DELAY));
             enumeration_rechecks = 0;
         }
     }
@@ -157,7 +167,11 @@ pub(crate) fn usb_device_signature() -> Vec<String> {
 }
 
 /// Raises one critical notification per untrusted device while it stays connected
-pub(crate) fn notify_new_untrusted_usb(untrusted: &[String], notified: &mut HashSet<String>) {
+pub(crate) fn notify_new_untrusted_usb(
+    untrusted: &[String],
+    blocked: &[String],
+    notified: &mut HashSet<String>,
+) {
     notified.retain(|id| untrusted.contains(id));
     let fresh: Vec<&String> = untrusted
         .iter()
@@ -166,11 +180,16 @@ pub(crate) fn notify_new_untrusted_usb(untrusted: &[String], notified: &mut Hash
     if fresh.is_empty() {
         return;
     }
-    let armor = is_usb_armor_enabled();
+    // Say "blocked" only for devices the kernel reports de-authorized
+    let blocked_now = fresh.iter().filter(|id| blocked.contains(id)).count();
     let body = format!(
         "{} untrusted USB device(s) connected{}: {}",
         fresh.len(),
-        if armor { " and de-authorized" } else { "" },
+        match blocked_now {
+            0 => String::new(),
+            n if n == fresh.len() => " and de-authorized".to_string(),
+            n => format!(", {} de-authorized", n),
+        },
         fresh
             .iter()
             .map(|s| s.as_str())

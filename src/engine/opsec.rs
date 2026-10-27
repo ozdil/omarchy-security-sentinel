@@ -166,7 +166,8 @@ pub(crate) fn clean_file(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Removes EXIF/XMP/comment segments from a JPEG without re-encoding.
+/// Removes EXIF/XMP/comment segments from a JPEG without re-encoding, in every scan
+/// of a progressive JPEG, and drops everything after the end-of-image marker.
 ///
 /// Kept on purpose: APP0 (JFIF), APP2 ICC_PROFILE (colour management) and APP14
 /// "Adobe" (colour transform; dropping it corrupts CMYK/YCCK images). Malformed or
@@ -192,15 +193,48 @@ pub(crate) fn strip_jpeg_metadata(data: &[u8]) -> Result<Vec<u8>, String> {
         let marker = data[idx];
         idx += 1;
         match marker {
+            // End of image. Anything after it is dropped: phones append a second
+            // image (MPF) with its own EXIF/GPS there, and vendors add trailers.
             0xD9 => {
                 out.extend_from_slice(&[0xFF, 0xD9]);
                 return Ok(out);
             }
             0xDA => {
-                // Start of scan: entropy-coded data and everything after it is kept verbatim
+                // Start of scan: copy the header, then the entropy-coded data up to the
+                // next real marker. Progressive JPEGs have more segments (and possibly
+                // APPn/COM) between scans, so parsing continues instead of copying the
+                // rest verbatim.
+                if idx + 2 > data.len() {
+                    return Err("Truncated JPEG scan header".to_string());
+                }
+                let len = ((data[idx] as usize) << 8) | (data[idx + 1] as usize);
+                if len < 2 || idx + len > data.len() {
+                    return Err("Malformed JPEG scan header length".to_string());
+                }
                 out.extend_from_slice(&[0xFF, 0xDA]);
-                out.extend_from_slice(&data[idx..]);
-                return Ok(out);
+                out.extend_from_slice(&data[idx..idx + len]);
+                idx += len;
+                let start = idx;
+                while idx + 1 < data.len() {
+                    if data[idx] != 0xFF {
+                        idx += 1;
+                        continue;
+                    }
+                    match data[idx + 1] {
+                        // Stuffed 0xFF byte or restart marker: still scan data
+                        0x00 | 0xD0..=0xD7 => idx += 2,
+                        // Fill byte before a marker
+                        0xFF => idx += 1,
+                        _ => break,
+                    }
+                }
+                if idx + 1 >= data.len() {
+                    // No EOI: keep the scan data as it was
+                    out.extend_from_slice(&data[start..]);
+                    return Ok(out);
+                }
+                out.extend_from_slice(&data[start..idx]);
+                continue;
             }
             // Standalone markers carry no length field
             0x01 | 0xD0..=0xD7 => {
@@ -279,4 +313,47 @@ pub(crate) fn scrub_downloads() -> usize {
 pub(crate) fn dirs_downloads() -> PathBuf {
     let home = env::var("HOME").unwrap_or_default();
     Path::new(&home).join("Downloads")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seg(marker: u8, payload: &[u8]) -> Vec<u8> {
+        let len = (payload.len() + 2) as u16;
+        let mut v = vec![0xFF, marker];
+        v.extend_from_slice(&len.to_be_bytes());
+        v.extend_from_slice(payload);
+        v
+    }
+
+    #[test]
+    fn test_jpeg_metadata_between_scans_and_after_eoi_is_removed() {
+        let mut jpg = vec![0xFF, 0xD8];
+        jpg.extend(seg(0xE0, b"JFIF\0\x01\x01"));
+        jpg.extend(seg(0xE1, b"Exif\0\0GPS-PRIMARY"));
+        jpg.extend(seg(0xC2, b"\x08\x00\x10\x00\x10\x01\x01\x11\x00"));
+        jpg.extend(seg(0xDA, b"\x01\x01\x00\x00\x3f\x00"));
+        jpg.extend_from_slice(&[0x12, 0xFF, 0x00, 0x34, 0xFF, 0xD0, 0x56]);
+        // Progressive: metadata between the scans
+        jpg.extend(seg(0xE1, b"Exif\0\0GPS-BETWEEN"));
+        jpg.extend(seg(0xFE, b"comment"));
+        jpg.extend(seg(0xDA, b"\x01\x01\x00\x00\x3f\x00"));
+        jpg.extend_from_slice(&[0x78, 0x9A]);
+        jpg.extend_from_slice(&[0xFF, 0xD9]);
+        // MPF secondary image with its own EXIF after EOI
+        jpg.extend_from_slice(&[0xFF, 0xD8]);
+        jpg.extend(seg(0xE1, b"Exif\0\0GPS-SECONDARY"));
+        jpg.extend_from_slice(&[0xFF, 0xD9]);
+
+        let out = strip_jpeg_metadata(&jpg).unwrap();
+        let has = |needle: &[u8]| out.windows(needle.len()).any(|w| w == needle);
+        assert!(!has(b"Exif"));
+        assert!(!has(b"comment"));
+        assert!(has(b"JFIF"));
+        // Scan data (with its stuffed byte and restart marker) survives intact
+        assert!(has(&[0x12, 0xFF, 0x00, 0x34, 0xFF, 0xD0, 0x56]));
+        assert!(has(&[0x78, 0x9A, 0xFF, 0xD9]));
+        assert!(out.ends_with(&[0xFF, 0xD9]));
+    }
 }

@@ -53,3 +53,35 @@ jobs:
 
       - name: Build
         run: cargo build --locked --all-targets
+
+  packaging:
+    name: QML, shell scripts & PKGBUILD
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install tools
+        run: |
+          for i in 1 2 3; do
+            pacman -Syu --noconfirm --needed git base-devel qt6-declarative shellcheck namcap && break
+            sleep 5
+          done
+
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: QML syntax (qmllint fails on parse errors)
+        run: /usr/lib/qt6/bin/qmllint Panel.qml qml/*.qml qml/theme/*.qml
+
+      - name: shellcheck
+        run: |
+          shellcheck --severity=warning sentinel-dashboard
+          shellcheck --severity=warning -s bash omarchy-security-sentinel.install
+
+      - name: PKGBUILD
+        # makepkg refuses to run as root
+        run: |
+          useradd -m builder
+          chown -R builder .
+          su builder -c "makepkg --printsrcinfo" > /dev/null
+          namcap PKGBUILD
+

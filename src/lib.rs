@@ -13,7 +13,9 @@ pub use ai::{
 pub use kernel::{
     calculate_self_exe_sha256, constant_time_eq, enforce_anti_tamper,
     kernel_apply_network_blackout, kernel_clear_network_blackout, kernel_deauth_usb,
-    kernel_freeze_process, kernel_is_network_blackout_active, kernel_network_blackout_state,
-    kernel_quarantine_ip, kernel_reauth_usb, kernel_sever_socket, kernel_terminate_process,
-    kernel_thaw_process, sha256_hex, BlackoutState, InterventionResult, SecureBuffer,
+    kernel_freeze_pinned, kernel_freeze_process, kernel_is_network_blackout_active,
+    kernel_network_blackout_state, kernel_quarantine_ip, kernel_reauth_usb, kernel_sever_socket,
+    kernel_terminate_pinned, kernel_terminate_process, kernel_thaw_pinned, kernel_thaw_process,
+    parse_process_target, process_start_time, sha256_hex, BlackoutState, InterventionResult,
+    SecureBuffer,
 };

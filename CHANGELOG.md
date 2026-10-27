@@ -3,9 +3,83 @@
 All notable changes to Security Sentinel are listed here. Versions follow
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.5.0] - Unreleased
 
-Follow-ups to the review of the 1.4.0 hardening work.
+Fixes from a second full-stack analysis (engine, panel, dashboard,
+packaging), plus the follow-ups to the review of the 1.4.0 hardening work.
+
+### Security
+
+- **CVE radar**: `arch-audit` prints severities as "High risk", which were
+  all parsed as Unknown, so a fixable critical or high advisory never raised
+  the module. Severities are read correctly; the cache file is versioned.
+- **Tripwire**: a deleted `canary.token` or `canary.sha256` was re-created
+  and reported intact, so rename-then-delete ransomware passed. Once armed,
+  a missing canary is an ALERT; only "Reset canaries" re-creates it. The
+  `/tmp` decoy is per user and created with `O_EXCL`.
+- **USB Armor**: blocking needed a polkit prompt the BadUSB device itself
+  could dismiss with Esc, and the cancel was remembered until replug. Blocks
+  now use their own polkit action (`io.omarchy.sentinel.usb-block`) that the
+  active session may run without a password; it refuses hubs. A failed
+  block is retried after 60 s and shown as an ALERT.
+- **Polkit**: `auth_admin_keep` became `auth_admin` on every action, so one
+  approval no longer allows five minutes of prompt-free root actions.
+  Re-enabling a blocked USB device has its own action.
+- **No generic `pkexec kill`**: without the packaged helper, signalling
+  another user's process fails with an explanation instead of a prompt that
+  names no process and could hit a reused PID.
+- **PID reuse**: reports carry each flagged process's start time and the
+  panel and dashboard pass `<pid>:<start_time>`, so Freeze/Kill from a
+  report up to a minute old refuse a different process.
+- **Dashboard**: process names (settable by any local process) were shown
+  as StyledText; every dashboard text is plain text now.
+- **Hiding from the analyzer**: a command line padded past 64 KiB was
+  blanked and scored 0; it is now analysed and the padding itself scored.
+- **OpSec scrubber**: metadata between the scans of a progressive JPEG and
+  everything after the end of the image (phone MPF images with their own
+  EXIF/GPS, vendor trailers) survived cleaning; both are removed now.
+
+### Fixed
+
+- The panel and dashboard fail closed: they start as "ENGINE OFFLINE /
+  UNKNOWN", show why a report is missing or invalid, and mark a report older
+  than 90 s as stale. They used to show "ALL SYSTEMS SECURE" in all of
+  these cases.
+- Reports over 128 KiB were cut before `JSON.parse`, always failed, and the
+  rewrite of the cache started back-to-back full scans. The engine now
+  caps the report (16 flagged processes, 512-char command lines) and the UI
+  no longer rescans on an invalid cache.
+- Failed actions exit non-zero and the UI shows the engine's message.
+- USB Armor's summary and notification count the devices the kernel
+  reports blocked, not the ones a block was attempted on. An untrusted
+  non-HID device (for example a USB DAC) is a WARNING, not CRITICAL.
+- A scan can no longer overwrite the baseline that "Trust Devices" just
+  saved; `--trust-all-usb` reports a save error.
+- An unreadable `/proc/net` table or an invisible system journal is a
+  warning, not "verified clean".
+- Lost uevents (socket buffer overflow) trigger a USB rescan, and a burst
+  of events delays it by at most 3 s.
+- Ghost MAC handles SSIDs with a colon and treats `stable` MACs as
+  randomized; DNS reports an `omarchy dns Custom` resolver and the toggle
+  no longer replaces it with Cloudflare.
+- An empty or relative `XDG_STATE_HOME` no longer puts state files in the
+  working directory.
+- `kernel_capabilities` is probed instead of a fixed list; `timestamp` is a
+  real RFC 3339 time.
+- Toggles show progress and are no longer flipped back by a report built
+  before they finished.
+- `sentinel-dashboard` brings the open window forward instead of starting a
+  new instance on every click, and keeps the D-Bus session address.
+
+### Packaging
+
+- The PKGBUILD builds from the release tag in `$srcdir` (it built the
+  caller's checkout via `$startdir`), installs the LICENSE and the missing
+  dependencies, and puts the plugin in `/usr/share/omarchy-security-sentinel`
+  with instructions to link it into `~/.config/omarchy/plugins`. The old
+  location was never scanned by Omarchy.
+- CI: CodeQL analyses Rust, and a new job lints the QML, the shell scripts
+  and the PKGBUILD.
 
 ### Fixed
 

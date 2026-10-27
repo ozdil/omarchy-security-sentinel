@@ -14,9 +14,18 @@ Panel {
   implicitWidth: button.implicitWidth
   implicitHeight: button.implicitHeight
 
-  property string overallStatus: "ALL SYSTEMS SECURE"
-  property string threatLevel: "ZERO"
-  property int activeCount: 9
+  // Fail closed: until a valid report arrives the widget says so, never "secure"
+  property string overallStatus: "ENGINE OFFLINE"
+  property string threatLevel: "UNKNOWN"
+  property int activeCount: 0
+  // Date.now() of the last report that parsed; 0 = none yet
+  property double lastReportAt: 0
+  // Why the last report could not be used, shown in the panel
+  property string engineError: "Waiting for the first report"
+  // Result of the last action that failed (engine message), cleared on the next one
+  property string actionError: ""
+  readonly property int reportStaleSec: 90
+  readonly property bool engineDown: root.threatLevel === "UNKNOWN"
   property int aiThreatScore: 0
   property var aiAnomalies: []
   property var kernelCapabilities: []
@@ -30,7 +39,7 @@ Panel {
   readonly property string manifestFallbackPath: Quickshell.env("HOME") ? Quickshell.env("HOME") + "/.config/omarchy/plugins/ozdil.security-sentinel/manifest.json" : ""
 
   property string pluginName: "Security Sentinel"
-  property string pluginVersion: "1.4.0"
+  property string pluginVersion: "1.5.0"
   property string pluginDescription: "Unified cyber security sentinel for Omarchy Linux: BadUSB hardware guard, kernel integrity auditor, and zero-trust privacy monitor."
   property string pluginAuthor: "Ozan Özdil"
   property string pluginLicense: "MIT"
@@ -138,27 +147,71 @@ Panel {
   readonly property string reportCachePath: runtimeDir !== "" ? runtimeDir + "/omarchy-security-sentinel/report.json" : ""
   readonly property int reportMaxAgeSec: 60
 
+  // The engine caps its report well below this; anything larger is refused
+  // whole instead of being cut mid-JSON (which always failed to parse)
+  readonly property int reportMaxBytes: 1048576
+
+  // Parses a report; returns null (and records why) when it is unusable
+  function parseReport(raw) {
+    var text = String(raw || "")
+    if (text.length > root.reportMaxBytes) {
+      root.markEngineError("Report too large (" + text.length + " bytes)")
+      return null
+    }
+    try {
+      var d = JSON.parse(text)
+      if (!d || !d.modules || !d.threat_level) {
+        root.markEngineError("Report is missing fields")
+        return null
+      }
+      return d
+    } catch(e) {
+      root.markEngineError("Report is not valid JSON")
+      return null
+    }
+  }
+
+  function markEngineError(msg) {
+    root.engineError = msg
+    root.overallStatus = "ENGINE ERROR"
+    root.threatLevel = "UNKNOWN"
+  }
+
   function applyReport(d) {
-    root.overallStatus = String(d.overall_status || "ALL SYSTEMS SECURE")
-    root.threatLevel = String(d.threat_level || "ZERO")
-    root.activeCount = Number(d.active_modules) || 9
-    root.modules = d.modules || []
+    root.overallStatus = String(d.overall_status || "UNKNOWN")
+    root.threatLevel = String(d.threat_level || "UNKNOWN")
+    root.activeCount = Number(d.active_modules) || 0
+    root.modules = root.withPendingToggles(d.modules || [])
     root.aiThreatScore = Number(d.ai_threat_score) || 0
     root.aiAnomalies = d.ai_anomalies || []
     root.kernelCapabilities = d.kernel_capabilities || []
+    root.lastReportAt = Date.now()
+    root.engineError = ""
   }
 
-  // Returns true when the cached report was fresh enough to use
-  function loadCachedReport(raw) {
-    try {
-      var d = JSON.parse(String(raw || "").slice(0, 131072))
-      var age = Date.now() / 1000 - Number(d.generated_at || 0)
-      if (age < 0 || age > root.reportMaxAgeSec) return false
-      root.applyReport(d)
-      return true
-    } catch(e) {
-      return false
+  // A report built before a toggle finished must not flip its switch back;
+  // modules with a toggle in flight keep their optimistic state
+  function withPendingToggles(mods) {
+    var out = mods.slice()
+    for (var i = 0; i < out.length; i++) {
+      if (root.toggleSnapshots[out[i].id] !== undefined) {
+        for (var j = 0; j < root.modules.length; j++) {
+          if (root.modules[j].id === out[i].id) out[i] = root.modules[j]
+        }
+      }
     }
+    return out
+  }
+
+  // "fresh" (applied), "stale" (valid but old or missing) or "invalid"
+  function loadCachedReport(raw) {
+    if (String(raw || "") === "") return "stale"
+    var d = root.parseReport(raw)
+    if (!d) return "invalid"
+    var age = Date.now() / 1000 - Number(d.generated_at || 0)
+    if (age < 0 || age > root.reportMaxAgeSec) return "stale"
+    root.applyReport(d)
+    return "fresh"
   }
 
   // A scan requested while one runs (e.g. right after an action) is queued,
@@ -174,32 +227,30 @@ Panel {
   }
 
   function refresh() {
+    // No report for too long: say so instead of showing the last (or no) verdict
+    if (root.lastReportAt > 0 && Date.now() - root.lastReportAt > root.reportStaleSec * 1000) {
+      root.markEngineError("No report for over " + root.reportStaleSec + " s")
+    }
     if (root.reportCachePath === "") {
       root.scanNow()
       return
     }
-    if (!daemonProc.running) daemonProc.running = true
     reportView.reload()
   }
 
-  function kernelFreezeProcess(pid) {
+  // The cache is missing or old: the daemon is not running (or died with the
+  // dashboard that owned it). Start ours and scan once meanwhile.
+  function cacheIsStale() {
+    if (!daemonProc.running) daemonProc.running = true
+    root.scanNow()
+  }
+
+  // pid:start_time pins the process the report showed; a PID reused since
+  // the scan is refused by the engine instead of being frozen
+  function kernelFreezeProcess(pid, startTime) {
     if (!pid) return
-    root.runAction([root.resolveEnginePath(), "--kernel-freeze", String(pid)])
-  }
-
-  function kernelSeverSocket(target) {
-    if (!target) return
-    root.runAction([root.resolveEnginePath(), "--kernel-sever-socket", String(target)])
-  }
-
-  function kernelDeauthUsb(busId) {
-    if (!busId) return
-    root.runAction([root.resolveEnginePath(), "--kernel-deauth-usb", String(busId)])
-  }
-
-  function kernelQuarantineIp(ip) {
-    if (!ip) return
-    root.runAction([root.resolveEnginePath(), "--kernel-quarantine-ip", String(ip)])
+    var target = String(pid) + (Number(startTime) > 0 ? ":" + String(startTime) : "")
+    root.runAction([root.resolveEnginePath(), "--kernel-freeze", target])
   }
 
   function toggleExpand(id) {
@@ -213,6 +264,7 @@ Panel {
 
   function optimisticToggle(modId, onSummary, offSummary, proc) {
     if (proc.running) return
+    root.actionError = ""
     var mods = root.modules.slice()
     for (var i = 0; i < mods.length; i++) {
       if (mods[i].id === modId) {
@@ -236,6 +288,7 @@ Panel {
     var prev = snaps[modId]
     delete snaps[modId]
     root.toggleSnapshots = snaps
+    if (code !== 0) root.actionError = "Toggle failed; the previous state was restored"
     if (code !== 0 && prev) {
       var mods = root.modules.slice()
       for (var i = 0; i < mods.length; i++) {
@@ -367,6 +420,7 @@ Panel {
     id: stateProc
     command: [root.resolveEnginePath(), "--json"]
     onExited: function(code) {
+      if (code !== 0) root.markEngineError("Engine exited with code " + code + " (is sentinel-engine built and installed?)")
       if (root.rescanPending) {
         root.rescanPending = false
         root.scanNow()
@@ -375,9 +429,8 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        try {
-          root.applyReport(JSON.parse(String(text || "").slice(0, 131072)))
-        } catch(e) {}
+        var d = root.parseReport(text)
+        if (d) root.applyReport(d)
       }
     }
   }
@@ -396,10 +449,12 @@ Panel {
     path: root.reportCachePath
     watchChanges: true
     printErrors: false
+    // An invalid cache does not trigger a scan: our own --json run rewrites the
+    // file, which would fire this again and loop on back-to-back full scans
     onLoaded: {
-      if (!root.loadCachedReport(text())) root.scanNow()
+      if (root.loadCachedReport(text()) === "stale") root.cacheIsStale()
     }
-    onLoadFailed: root.scanNow()
+    onLoadFailed: root.cacheIsStale()
     onFileChanged: reload()
   }
 
@@ -431,6 +486,7 @@ Panel {
     id: trustUsbProc
     command: [root.resolveEnginePath(), "--trust-all-usb"]
     onExited: function(code) {
+      root.actionError = code !== 0 ? "Trust Devices failed: the USB baseline could not be saved" : ""
       root.scanNow()
     }
   }
@@ -445,7 +501,26 @@ Panel {
 
   Process {
     id: actionProc
+    // Kernel actions print an InterventionResult and exit 1 when it failed
+    // (cancelled prompt, immune process, PID reused); show its message
+    property string output: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: actionProc.output = String(text || "")
+    }
+    onStarted: {
+      actionProc.output = ""
+      root.actionError = ""
+    }
     onExited: function(code) {
+      if (code !== 0) {
+        var msg = "Action failed"
+        try {
+          var r = JSON.parse(actionProc.output.slice(0, 16384))
+          if (r && r.message) msg = String(r.message)
+        } catch(e) {}
+        root.actionError = msg
+      }
       root.scanNow()
       root.startNextAction()
     }
@@ -459,7 +534,6 @@ Panel {
     onTriggered: root.refresh()
   }
 
-  Component.onCompleted: refresh()
   Component.onDestruction: {
     if (stateProc.running) stateProc.running = false
     if (daemonProc.running) daemonProc.running = false
@@ -477,13 +551,14 @@ Panel {
     bar: root.bar
     text: ""
     foreground: {
-      if (root.threatLevel === "CRITICAL" || root.overallStatus === "THREAT DETECTED") {
-        return Color.urgent
+      if (root.threatLevel === "CRITICAL" || root.engineDown) {
+        return root.urgent
       } else {
         return root.bar ? root.bar.foreground : root.foreground
       }
     }
     tooltipText: "Security Sentinel Hub\nStatus: " + root.overallStatus + "\nThreat Level: " + root.threatLevel
+      + (root.engineError !== "" ? "\n" + root.engineError : "")
     onPressed: function(b) {
       root.toggle()
     }
@@ -559,7 +634,7 @@ Panel {
           id: heroIcon
           textFormat: Text.PlainText
           text: ""
-          color: root.threatLevel === "CRITICAL" ? Color.urgent : root.foreground
+          color: (root.threatLevel === "CRITICAL" || root.engineDown) ? root.urgent : root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.display
           anchors.left: parent.left
@@ -605,7 +680,7 @@ Panel {
           Text {
             textFormat: Text.PlainText
             text: root.overallStatus.toUpperCase()
-            color: root.threatLevel === "CRITICAL" ? Color.urgent : root.dim
+            color: (root.threatLevel === "CRITICAL" || root.engineDown) ? root.urgent : root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             font.bold: true
@@ -618,6 +693,17 @@ Panel {
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption - 1
+          }
+
+          Text {
+            visible: root.engineError !== "" || root.actionError !== ""
+            width: parent.width
+            textFormat: Text.PlainText
+            text: root.actionError !== "" ? root.actionError : root.engineError
+            color: root.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption - 1
+            wrapMode: Text.WordWrap
           }
         }
       }
@@ -724,7 +810,7 @@ Panel {
                     Text {
                       textFormat: Text.PlainText
                       text: root.moduleIcon(rowDelegate.modId)
-                      color: rowDelegate.isAlert ? Color.urgent : root.foreground
+                      color: rowDelegate.isAlert ? root.urgent : root.foreground
                       font.family: root.fontFamily
                       font.pixelSize: Style.font.title
                       Layout.alignment: Qt.AlignVCenter
@@ -751,7 +837,7 @@ Panel {
                         Layout.fillWidth: true
                         textFormat: Text.PlainText
                         text: rowDelegate.modData ? String(rowDelegate.modData.summary) : "--"
-                        color: rowDelegate.isAlert ? Color.urgent : root.dim
+                        color: rowDelegate.isAlert ? root.urgent : root.dim
                         font.family: root.fontFamily
                         font.pixelSize: Style.font.caption
                         elide: Text.ElideRight
@@ -851,15 +937,16 @@ Panel {
                           ? "Confirm: freeze " + String(freezeTarget.name || "process") + " (PID " + freezeTarget.pid + ")"
                           : "Freeze PID " + freezeTarget.pid)
                         iconText: "󰟀"
-                        foreground: freezeArmed ? Color.urgent : root.foreground
-                        accent: freezeArmed ? Color.urgent : root.accent
+                        foreground: freezeArmed ? root.urgent : root.foreground
+                        accent: freezeArmed ? root.urgent : root.accent
                         fontFamily: root.fontFamily
                         fontSize: Style.font.caption
                         bordered: true
                         onClicked: {
                           if (!freezeTarget) return
                           var pid = freezeTarget.pid
-                          root.confirmOrArm("freeze:" + pid, function() { root.kernelFreezeProcess(pid) })
+                          var start = freezeTarget.start_time
+                          root.confirmOrArm("freeze:" + pid, function() { root.kernelFreezeProcess(pid, start) })
                         }
                       }
 
@@ -895,6 +982,9 @@ Panel {
                 id: toggleComp
                 ToggleSwitch {
                   checked: rowDelegate.modData ? Boolean(rowDelegate.modData.toggle_state) : false
+                  busy: (rowDelegate.modId === "ghost_mac" && toggleGhostProc.running)
+                    || (rowDelegate.modId === "dns" && toggleDnsProc.running)
+                    || (rowDelegate.modId === "badusb" && toggleUsbArmorProc.running)
                   foreground: root.foreground
                   accent: root.accent
                   onToggled: {
@@ -914,7 +1004,7 @@ Panel {
                 Text {
                   textFormat: Text.PlainText
                   text: rowDelegate.modStatus.toLowerCase()
-                  color: (rowDelegate.isAlert || rowDelegate.isWarning) ? Color.urgent : root.dim
+                  color: (rowDelegate.isAlert || rowDelegate.isWarning) ? root.urgent : root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                   font.bold: rowDelegate.isAlert
@@ -1032,10 +1122,11 @@ Panel {
             elide: Text.ElideRight
           }
 
-          // Plain text in theme colours instead of a green pill (Omarchy style)
+          // Verified in the Omarchy plugin marketplace (omacom/omarchy-plugin-marketplace#9531)
           Text {
             visible: root.pluginVerified
             Layout.alignment: Qt.AlignVCenter
+            textFormat: Text.PlainText
             text: "󰄬 verified"
             color: root.dim
             font.family: root.fontFamily
@@ -1055,6 +1146,7 @@ Panel {
         }
 
         Text {
+          textFormat: Text.PlainText
           text: "Sürüm: " + root.pluginVersion + "\nGeliştirici: " + root.pluginAuthor + "\nLisans: " + root.pluginLicense + "\n\n" + root.pluginDescription
           color: root.foreground
           opacity: 0.8

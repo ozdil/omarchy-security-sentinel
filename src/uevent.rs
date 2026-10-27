@@ -126,7 +126,15 @@ impl UEventSocket {
 
     /// Waits up to `timeout` for events and returns everything currently queued.
     pub fn wait(&self, timeout: Duration) -> Vec<UEvent> {
+        self.wait_lossy(timeout).0
+    }
+
+    /// Like [`wait`](Self::wait), plus whether events were lost: a burst that
+    /// overflows the socket buffer (ENOBUFS) drops messages, and the caller must then
+    /// assume anything, a USB arrival included, may have happened.
+    pub fn wait_lossy(&self, timeout: Duration) -> (Vec<UEvent>, bool) {
         let mut events = Vec::new();
+        let mut lost = false;
         let mut pfd = PollFd {
             fd: self.fd,
             events: POLLIN,
@@ -135,20 +143,28 @@ impl UEventSocket {
         let ms = timeout.as_millis().min(i32::MAX as u128) as i32;
         // SAFETY: one valid pollfd
         if unsafe { poll(&mut pfd, 1, ms) } <= 0 {
-            return events;
+            return (events, false);
         }
         let mut buf = vec![0u8; 16 * 1024];
         loop {
             // SAFETY: buf is valid for buf.len() bytes
             let n = unsafe { recv(self.fd, buf.as_mut_ptr(), buf.len(), MSG_DONTWAIT) };
-            if n <= 0 {
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                lost |= err.kind() != std::io::ErrorKind::WouldBlock;
+                break;
+            }
+            if n == 0 {
                 break;
             }
             if let Some(ev) = parse_uevent(&buf[..n as usize]) {
                 events.push(ev);
             }
         }
-        events
+        (events, lost)
     }
 }
 

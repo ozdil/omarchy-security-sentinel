@@ -2,6 +2,23 @@
 
 use super::*;
 
+/// Whether this user can read the system journal. Without the systemd-journal (or
+/// wheel/adm) group, journalctl exits 0 showing only the user's own journal, which
+/// never contains sshd or PAM failures, so an empty result proves nothing.
+fn system_journal_readable() -> bool {
+    let machine_id = match read_file_bounded(Path::new("/etc/machine-id"), 64) {
+        Ok(id) => id.trim().to_string(),
+        Err(_) => return false,
+    };
+    if machine_id.is_empty() || !machine_id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return false;
+    }
+    ["/var/log/journal", "/run/log/journal"].iter().any(|base| {
+        let file = Path::new(base).join(&machine_id).join("system.journal");
+        fs::File::open(file).is_ok()
+    })
+}
+
 pub(crate) fn check_auth_watch() -> ModuleStatus {
     let mut failed_count = 0;
     let mut fail_entries = Vec::new();
@@ -59,18 +76,20 @@ pub(crate) fn check_auth_watch() -> ModuleStatus {
         .push("Log Target: systemd-journald & Linux PAM (24h scope, last 200 matches)".to_string());
 
     // A query that failed or timed out has not shown the logs are clean
-    if !journal_read {
-        items.push(
-            "Journal query failed or timed out; authentication logs were not checked".to_string(),
-        );
+    let system_visible = system_journal_readable();
+    if !journal_read || (failed_count == 0 && !system_visible) {
+        items.push(if journal_read {
+            "The system journal is not readable by this user (add it to the systemd-journal group); only the user journal was checked".to_string()
+        } else {
+            "Journal query failed or timed out; authentication logs were not checked".to_string()
+        });
         return ModuleStatus {
             id: "auth".to_string(),
             name: "Authentication Watch".to_string(),
             status: Status::Warning,
             summary: "Auth logs unavailable".to_string(),
-            detail:
-                "The systemd journal could not be read in time, so failed logins were not checked"
-                    .to_string(),
+            detail: "The system journal could not be read, so failed logins were not checked"
+                .to_string(),
             is_toggleable: false,
             toggle_state: false,
             items,

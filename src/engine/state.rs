@@ -8,14 +8,37 @@ extern "C" {
     pub(crate) fn getuid() -> u32;
 }
 
+/// Base for per-user state. The XDG spec says relative (or empty) values must be
+/// ignored; honouring them put the trust store and canaries in the working directory.
+pub(crate) fn state_base(xdg_state_home: Option<&str>, home: Option<&str>) -> Option<PathBuf> {
+    match xdg_state_home {
+        Some(x) if x.starts_with('/') => Some(PathBuf::from(x)),
+        _ => home
+            .filter(|h| h.starts_with('/'))
+            .map(|h| Path::new(h).join(".local/state")),
+    }
+}
+
 /// Enforces 0700 mode state directory per AGENTS.md Rule 4
 pub(crate) fn get_state_dir() -> PathBuf {
-    let base = env::var("XDG_STATE_HOME")
-        .unwrap_or_else(|_| format!("{}/.local/state", env::var("HOME").unwrap_or_default()));
-    let dir = Path::new(&base).join("omarchy/security-sentinel");
+    let base = state_base(
+        env::var("XDG_STATE_HOME").ok().as_deref(),
+        env::var("HOME").ok().as_deref(),
+    )
+    // No usable HOME: a private per-user directory under the runtime dir, never "."
+    .or_else(|| get_runtime_dir().map(|d| d.join("state")))
+    .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+    let dir = base.join("omarchy/security-sentinel");
     let _ = fs::create_dir_all(&dir);
-    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-    dir
+    // Do not chmod (or use) a symlink or a directory owned by someone else
+    match fs::symlink_metadata(&dir) {
+        // SAFETY: getuid has no preconditions
+        Ok(m) if m.file_type().is_dir() && m.uid() == unsafe { getuid() } => {
+            let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+            dir
+        }
+        _ => PathBuf::from("/nonexistent/omarchy-security-sentinel"),
+    }
 }
 
 /// Atomically writes sensitive state file with mode 0600, sync_all, and O_NOFOLLOW per AGENTS.md Rule 4
@@ -212,5 +235,27 @@ pub(crate) fn report_cache_path() -> Option<PathBuf> {
 pub(crate) fn write_report_cache(report: &SentinelReport) {
     if let (Some(path), Ok(json)) = (report_cache_path(), serde_json::to_vec(report)) {
         let _ = write_secure_state_file(&path, &json);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_state_base_ignores_relative_xdg() {
+        assert_eq!(
+            state_base(Some("/x/state"), Some("/home/u")),
+            Some(PathBuf::from("/x/state"))
+        );
+        assert_eq!(
+            state_base(Some(""), Some("/home/u")),
+            Some(PathBuf::from("/home/u/.local/state"))
+        );
+        assert_eq!(
+            state_base(Some("rel/dir"), Some("/home/u")),
+            Some(PathBuf::from("/home/u/.local/state"))
+        );
+        assert_eq!(state_base(None, Some("")), None);
     }
 }

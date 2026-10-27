@@ -20,6 +20,10 @@ if [ "${SENTINEL_SECURE_ENV:-0}" != "1" ]; then
         XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(/usr/bin/id -u 2>/dev/null || echo 1000)}" \
         XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}" \
         XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}" \
+        DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
+        XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-}" \
+        XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-}" \
+        HYPRLAND_INSTANCE_SIGNATURE="${HYPRLAND_INSTANCE_SIGNATURE:-}" \
         SENTINEL_SECURE_ENV=1 \
         /bin/bash -p "$0" "$@"
 fi
@@ -46,15 +50,17 @@ fi
 
 # Prefer native Quickshell standalone UI if available
 if [[ "${1:-}" != "--cli" && -n "${QUICKSHELL_BIN}" ]]; then
-    if "${QUICKSHELL_BIN}" ipc call ozdil.sentinel toggle >/dev/null 2>&1; then
-        exit 0
-    fi
     QML_SHELL="${DIR}/qml/shell.qml"
-    # Packaged installs put this script in /usr/bin and the QML next to the plugin
+    # Packaged installs put this script in /usr/bin and the QML in the package's own dir
     if [[ ! -f "${QML_SHELL}" ]]; then
-        QML_SHELL="/usr/share/omarchy/plugins/security-sentinel/qml/shell.qml"
+        QML_SHELL="/usr/share/omarchy-security-sentinel/qml/shell.qml"
     fi
     if [[ -f "${QML_SHELL}" ]]; then
+        # Bring an open dashboard forward instead of starting a second instance.
+        # Without --path, ipc talks to the 'default' config, never this one.
+        if "${QUICKSHELL_BIN}" ipc --path "${QML_SHELL}" call ozdil.sentinel show >/dev/null 2>&1; then
+            exit 0
+        fi
         exec "${QUICKSHELL_BIN}" -p "${QML_SHELL}"
     fi
 fi

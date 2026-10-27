@@ -50,6 +50,8 @@ pub(crate) fn notify_desktop(title: &str, body: &str, is_critical: bool) {
         } else {
             "dialog-information"
         };
+        // A fresh budget: the first attempt may have used all of its own
+        let deadline = Instant::now() + Duration::from_millis(1500);
         let _ = run_cmd_bounded(
             "notify-send",
             &[

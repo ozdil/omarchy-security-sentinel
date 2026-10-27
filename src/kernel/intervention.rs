@@ -33,6 +33,12 @@ pub const PRIVILEGED_ENGINE: &str = "/usr/bin/sentinel-engine";
 pub const PRIVILEGED_INTERVENTION_FLAG: &str = "--privileged-intervention";
 /// CLI flag for the `io.omarchy.sentinel.network` polkit action.
 pub const PRIVILEGED_NETWORK_FLAG: &str = "--privileged-network";
+/// CLI flag for `io.omarchy.sentinel.usb-block`: de-authorizing a device only ever
+/// removes access, so the active session may do it without a password prompt that
+/// a keystroke injector could simply dismiss.
+pub const PRIVILEGED_USB_BLOCK_FLAG: &str = "--privileged-usb-block";
+/// CLI flag for `io.omarchy.sentinel.usb-trust` (re-authorizing a blocked device).
+pub const PRIVILEGED_USB_TRUST_FLAG: &str = "--privileged-usb-trust";
 
 /// Generous deadline for anything that may wait on a polkit password prompt.
 const PKEXEC_TIMEOUT: Duration = Duration::from_secs(120);
@@ -125,8 +131,13 @@ fn trusted_privileged_engine() -> bool {
     }
 }
 
+/// Whether root actions can go through the packaged, policy-gated helper.
+pub fn privileged_helper_available() -> bool {
+    Path::new(PKEXEC).exists() && trusted_privileged_engine()
+}
+
 /// Re-runs one operation as root through `pkexec /usr/bin/sentinel-engine <flag> <args>`,
-/// which matches the shipped polkit actions (custom message, `auth_admin_keep`).
+/// which matches the shipped polkit actions (custom message, `auth_admin`; USB blocks need no prompt).
 /// Returns `None` when the helper is unavailable so callers can use the legacy path.
 fn escalate_via_helper(flag: &str, args: &[&str]) -> Option<InterventionResult> {
     if in_privileged_mode() || !Path::new(PKEXEC).exists() || !trusted_privileged_engine() {
@@ -415,6 +426,40 @@ pub fn kernel_freeze_process(pid: i32) -> InterventionResult {
     freeze_process(pid, None)
 }
 
+/// Like [`kernel_freeze_process`], but refuses when the PID no longer has the start
+/// time the UI saw in its report (the process exited and the PID was reused).
+pub fn kernel_freeze_pinned(pid: i32, start: Option<u64>) -> InterventionResult {
+    freeze_process(pid, start)
+}
+
+/// Like [`kernel_terminate_process`], pinned to a start time when one is given.
+pub fn kernel_terminate_pinned(pid: i32, start: Option<u64>) -> InterventionResult {
+    terminate_process(pid, start)
+}
+
+/// Like [`kernel_thaw_process`], pinned to a start time when one is given.
+pub fn kernel_thaw_pinned(pid: i32, start: Option<u64>) -> InterventionResult {
+    thaw_process(pid, start)
+}
+
+/// Parses a CLI process target: `<pid>` or `<pid>:<starttime>`.
+pub fn parse_process_target(arg: &str) -> Option<(i32, Option<u64>)> {
+    match parse_identity_arg(arg) {
+        Some((pid, start)) => Some((pid, Some(start))),
+        None => arg.trim().parse().ok().map(|pid| (pid, None)),
+    }
+}
+
+/// Signals are never sent through a generic `pkexec /usr/bin/kill <pid>`: that
+/// prompt does not show which process it is for, and the bare PID could be reused
+/// while it is open. Without the packaged helper, only own processes can be signalled.
+const NO_HELPER_FOR_SIGNALS: &str = "Permission denied. Signalling processes of other users needs the packaged root-owned /usr/bin/sentinel-engine and its polkit policy";
+
+/// Kernel start time of a process, for the report (see `proc_start_time`).
+pub fn process_start_time(pid: i32) -> Option<u64> {
+    proc_start_time(pid)
+}
+
 fn freeze_process(pid: i32, expected_start: Option<u64>) -> InterventionResult {
     let pid_str = pid.to_string();
     if pid <= 2 {
@@ -461,23 +506,7 @@ fn freeze_process(pid: i32, expected_start: Option<u64>) -> InterventionResult {
         }
         return res;
     }
-    if legacy_pkexec(&["/usr/bin/kill", "-STOP", "--", &pid_str], None) {
-        capture_forensic_evidence(pid);
-        return InterventionResult::ok(
-            "kernel_freeze",
-            &pid_str,
-            &format!(
-                "Process {} frozen via privileged kernel signal with forensic capture",
-                pid
-            ),
-        );
-    }
-
-    InterventionResult::err(
-        "kernel_freeze",
-        &pid_str,
-        "Permission denied or failure sending SIGSTOP signal",
-    )
+    InterventionResult::err("kernel_freeze", &pid_str, NO_HELPER_FOR_SIGNALS)
 }
 
 /// Terminates a malicious or uncooperative process at kernel level.
@@ -538,19 +567,7 @@ fn terminate_process(pid: i32, expected_start: Option<u64>) -> InterventionResul
     ) {
         return res;
     }
-    if legacy_pkexec(&["/usr/bin/kill", "-KILL", "--", &pid_str], None) {
-        return InterventionResult::ok(
-            "kernel_terminate",
-            &pid_str,
-            &format!("Process {} terminated via privileged kernel signal", pid),
-        );
-    }
-
-    InterventionResult::err(
-        "kernel_terminate",
-        &pid_str,
-        "Permission denied or failure sending termination signals",
-    )
+    InterventionResult::err("kernel_terminate", &pid_str, NO_HELPER_FOR_SIGNALS)
 }
 
 /// Thaws (resumes) a previously frozen process (SIGCONT / 18).
@@ -565,6 +582,10 @@ fn thaw_process(pid: i32, expected_start: Option<u64>) -> InterventionResult {
     }
 
     let handle = ProcessHandle::open(pid);
+    // The root helper must not resume an immune process someone else stopped
+    if let Err(msg) = validate_signal_target(pid, "resume") {
+        return InterventionResult::err("kernel_thaw", &pid_str, &msg);
+    }
     let start = match proc_start_time(pid) {
         Some(start) => start,
         None => {
@@ -600,14 +621,7 @@ fn thaw_process(pid: i32, expected_start: Option<u64>) -> InterventionResult {
     ) {
         return res;
     }
-    if legacy_pkexec(&["/usr/bin/kill", "-CONT", "--", &pid_str], None) {
-        return InterventionResult::ok(
-            "kernel_thaw",
-            &pid_str,
-            &format!("Process {} resumed via signal", pid),
-        );
-    }
-    InterventionResult::err("kernel_thaw", &pid_str, "Failed to send SIGCONT to process")
+    InterventionResult::err("kernel_thaw", &pid_str, NO_HELPER_FOR_SIGNALS)
 }
 
 // ---------------------------------------------------------------------------
@@ -756,11 +770,35 @@ pub fn kernel_reauth_usb(bus_id: &str) -> InterventionResult {
     kernel_set_usb_authorized(bus_id, true)
 }
 
+/// Root hub (`usbN`) or a device whose class is hub (09)
+fn is_usb_hub(bus_id: &str) -> bool {
+    bus_id.starts_with("usb")
+        || read_proc_bounded(
+            &Path::new("/sys/bus/usb/devices")
+                .join(bus_id)
+                .join("bDeviceClass"),
+            16,
+        )
+        .is_ok_and(|c| String::from_utf8_lossy(&c).trim() == "09")
+}
+
 fn kernel_set_usb_authorized(bus_id: &str, authorize: bool) -> InterventionResult {
-    let (action, op, value, verb) = if authorize {
-        ("kernel_reauth_usb", "reauth-usb", b"1\n", "re-authorized")
+    let (action, flag, op, value, verb) = if authorize {
+        (
+            "kernel_reauth_usb",
+            PRIVILEGED_USB_TRUST_FLAG,
+            "reauth-usb",
+            b"1\n",
+            "re-authorized",
+        )
     } else {
-        ("kernel_deauth_usb", "deauth-usb", b"0\n", "de-authorized")
+        (
+            "kernel_deauth_usb",
+            PRIVILEGED_USB_BLOCK_FLAG,
+            "deauth-usb",
+            b"0\n",
+            "de-authorized",
+        )
     };
     let clean_id = bus_id.trim();
 
@@ -775,6 +813,12 @@ fn kernel_set_usb_authorized(bus_id: &str, authorize: bool) -> InterventionResul
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == ':')
     {
         return InterventionResult::err(action, clean_id, "Invalid USB Bus ID format");
+    }
+
+    // Root hubs and hubs are never blocked: the prompt-free block action would
+    // otherwise let any session process cut off every keyboard and mouse at once
+    if !authorize && is_usb_hub(clean_id) {
+        return InterventionResult::err(action, clean_id, "Refusing to de-authorize a USB hub");
     }
 
     let auth_path = format!("/sys/bus/usb/devices/{}/authorized", clean_id);
@@ -808,7 +852,7 @@ fn kernel_set_usb_authorized(bus_id: &str, authorize: bool) -> InterventionResul
     if !path.exists() {
         return InterventionResult::err(action, clean_id, "USB device not found in sysfs");
     }
-    if let Some(res) = escalate_via_helper(PRIVILEGED_INTERVENTION_FLAG, &[op, clean_id]) {
+    if let Some(res) = escalate_via_helper(flag, &[op, clean_id]) {
         return res;
     }
     // tee writes stdin to the validated path without a shell in between
@@ -1070,10 +1114,13 @@ fn get_private_state_dir() -> Result<PathBuf, String> {
         return Err("State storage is disabled in privileged helper mode".to_string());
     }
     let base = match std::env::var("XDG_STATE_HOME") {
-        Ok(state) if !state.is_empty() => PathBuf::from(state),
+        // Same rule as the engine's get_state_dir: relative XDG values are ignored
+        Ok(state) if state.starts_with('/') => PathBuf::from(state),
         _ => {
             let home = std::env::var("HOME")
-                .map_err(|_| "HOME environment variable is not set".to_string())?;
+                .ok()
+                .filter(|h| h.starts_with('/'))
+                .ok_or_else(|| "HOME is not set to an absolute path".to_string())?;
             PathBuf::from(home).join(".local/state")
         }
     };
@@ -1237,8 +1284,8 @@ pub fn run_privileged_operation(flag: &str, op: &str, arg: Option<&str>) -> Inte
             Some((pid, start)) => thaw_process(pid, Some(start)),
             None => InterventionResult::err(&action, arg.unwrap_or(""), IDENTITY_REQUIRED),
         },
-        (PRIVILEGED_INTERVENTION_FLAG, "deauth-usb") => kernel_deauth_usb(arg.unwrap_or("")),
-        (PRIVILEGED_INTERVENTION_FLAG, "reauth-usb") => kernel_reauth_usb(arg.unwrap_or("")),
+        (PRIVILEGED_USB_BLOCK_FLAG, "deauth-usb") => kernel_deauth_usb(arg.unwrap_or("")),
+        (PRIVILEGED_USB_TRUST_FLAG, "reauth-usb") => kernel_reauth_usb(arg.unwrap_or("")),
         (PRIVILEGED_INTERVENTION_FLAG, "sever-socket") => kernel_sever_socket(arg.unwrap_or("")),
         (PRIVILEGED_NETWORK_FLAG, "quarantine") => kernel_quarantine_ip(arg.unwrap_or("")),
         (PRIVILEGED_NETWORK_FLAG, "blackout-apply") => kernel_apply_network_blackout(),
@@ -1250,6 +1297,45 @@ pub fn run_privileged_operation(flag: &str, op: &str, arg: Option<&str>) -> Inte
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_polkit_policy_matches_helper_flags() {
+        let policy = include_str!("../../assets/io.omarchy.sentinel.policy");
+        // One approval must not unlock prompt-free root actions for minutes
+        assert!(!policy.contains("auth_admin_keep"));
+        for flag in [
+            PRIVILEGED_INTERVENTION_FLAG,
+            PRIVILEGED_NETWORK_FLAG,
+            PRIVILEGED_USB_BLOCK_FLAG,
+            PRIVILEGED_USB_TRUST_FLAG,
+        ] {
+            let needle = format!("exec.argv1\">{}</annotate>", flag);
+            assert_eq!(policy.matches(&needle).count(), 1, "{}", flag);
+        }
+        // Only the USB block action may skip the password prompt
+        assert_eq!(
+            policy.matches("<allow_active>yes</allow_active>").count(),
+            1
+        );
+        let block = policy
+            .split("io.omarchy.sentinel.usb-block")
+            .nth(1)
+            .unwrap();
+        assert!(block
+            .split("</action>")
+            .next()
+            .unwrap()
+            .contains("<allow_active>yes"));
+    }
+
+    #[test]
+    fn test_helper_routes_usb_ops_only_through_their_own_action() {
+        // Non-root: rejected before dispatch, but the unknown combinations must not
+        // be accepted under the prompt-free flag either
+        let r = run_privileged_operation(PRIVILEGED_USB_BLOCK_FLAG, "reauth-usb", Some("1-2"));
+        assert!(!r.success);
+        assert!(is_usb_hub("usb1"));
+    }
 
     #[test]
     fn test_pidfd_refuses_to_signal_a_reaped_process() {

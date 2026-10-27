@@ -19,8 +19,10 @@ pub enum Severity {
 }
 
 impl Severity {
+    /// arch-audit prints "High risk", "Medium risk" etc.; only the first word counts
     fn parse(s: &str) -> Self {
-        match s.trim().to_ascii_lowercase().as_str() {
+        let word = s.split_whitespace().next().unwrap_or("");
+        match word.to_ascii_lowercase().as_str() {
             "critical" => Severity::Critical,
             "high" => Severity::High,
             "medium" => Severity::Medium,
@@ -144,6 +146,27 @@ mod tests {
         assert_eq!(adv[3].package, "evilscript");
         assert!(adv[3].fixed.is_none());
         assert_eq!(adv[3].cves, vec!["CVE-2024-1234"]);
+    }
+
+    #[test]
+    fn test_parse_real_arch_audit_output() {
+        // Captured from arch-audit 0.2.0 with ARCH_AUDIT_FORMAT
+        let out = "libxml2\tHigh risk\tdenial of service\t2.14.6-1\tCVE-2025-6021\n\
+                   apr\tMedium risk\tinformation disclosure\t\tCVE-2023-49582\n\
+                   pam\tCritical risk\tprivilege escalation\t1.7.1-1\tCVE-2025-6020\n\
+                   zlib\tLow risk\tdenial of service\t-\tCVE-2023-45853\n";
+        let adv = parse_arch_audit(out);
+        let sev: Vec<Severity> = adv.iter().map(|a| a.severity).collect();
+        assert_eq!(
+            sev,
+            vec![
+                Severity::Critical,
+                Severity::High,
+                Severity::Medium,
+                Severity::Low
+            ]
+        );
+        assert_eq!(adv[0].package, "pam");
     }
 
     #[test]

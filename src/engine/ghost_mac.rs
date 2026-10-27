@@ -24,11 +24,10 @@ pub(crate) fn check_ghost_mac() -> (ModuleStatus, bool) {
         8192,
     ) {
         let text = String::from_utf8_lossy(&out);
-        for line in text.lines() {
-            let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() >= 3 && parts[1] == "802-11-wireless" {
-                conn_name = parts[0].to_string();
-                dev_name = parts[2].to_string();
+        for (name, ty, dev) in text.lines().filter_map(split_nmcli_name_type_device) {
+            if ty == "802-11-wireless" {
+                conn_name = name;
+                dev_name = dev;
 
                 if !dev_name.is_empty()
                     && dev_name
@@ -58,9 +57,22 @@ pub(crate) fn check_ghost_mac() -> (ModuleStatus, bool) {
                     4096,
                 ) {
                     let c_val = String::from_utf8_lossy(&c_out).trim().to_string();
-                    if c_val.contains("random") || c_val.contains("stable-random") {
-                        is_randomized = true;
-                    }
+                    is_randomized |= cloned_mac_is_randomized(&c_val);
+                }
+                // addr_assign_type 1 = kernel-random address. 3 ("set by userspace")
+                // is not used: NetworkManager also reports 3 after writing back the
+                // permanent address.
+                // Only for a device name that passed the check above (MAC was read).
+                if current_mac == "Unknown" {
+                    continue;
+                }
+                if let Ok(t) = read_file_bounded(
+                    &Path::new("/sys/class/net")
+                        .join(&dev_name)
+                        .join("addr_assign_type"),
+                    16,
+                ) {
+                    is_randomized |= t.trim() == "1";
                 }
             }
         }
@@ -123,6 +135,31 @@ pub(crate) fn check_ghost_mac() -> (ModuleStatus, bool) {
 }
 
 /// Runs a short configuration command and reports whether it exited 0
+/// Splits one `nmcli -t -f NAME,TYPE,DEVICE` line. nmcli escapes ':' (and '\\')
+/// inside fields, so an SSID such as "Cafe:Guest" must not be split at its colon.
+fn split_nmcli_name_type_device(line: &str) -> Option<(String, String, String)> {
+    let mut fields = Vec::new();
+    let mut cur = String::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => cur.extend(chars.next()),
+            ':' => fields.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    fields.push(cur);
+    let [name, ty, dev]: [String; 3] = fields.try_into().ok()?;
+    Some((name, ty, dev))
+}
+
+/// `random`, `stable` (a per-network random address) and `stable-ssid` all keep the
+/// hardware address off the air; `permanent`, `preserve` or empty do not.
+fn cloned_mac_is_randomized(value: &str) -> bool {
+    let v = value.rsplit(':').next().unwrap_or("").trim();
+    matches!(v, "random" | "stable" | "stable-ssid")
+}
+
 pub(crate) fn run_ok(program: &str, args: &[&str], timeout: Duration) -> bool {
     matches!(
         run_cmd_bounded_status(program, args, &[], Instant::now() + timeout, 4096),
@@ -168,7 +205,7 @@ pub(crate) fn toggle_ghost_mac() -> Result<bool, String> {
     )
     .map(|o| String::from_utf8_lossy(&o).trim().to_string())
     .unwrap_or_default();
-    let enable = !current_cloned.contains("random");
+    let enable = !cloned_mac_is_randomized(&current_cloned);
     let value = if enable { "random" } else { "permanent" };
 
     if !run_ok(
@@ -205,4 +242,35 @@ pub(crate) fn toggle_ghost_mac() -> Result<bool, String> {
     };
     notify_desktop("Ghost MAC", &body, false);
     Ok(enable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_nmcli_escaped_colon_in_ssid() {
+        assert_eq!(
+            split_nmcli_name_type_device("Cafe\\:Guest:802-11-wireless:wlan0"),
+            Some((
+                "Cafe:Guest".to_string(),
+                "802-11-wireless".to_string(),
+                "wlan0".to_string()
+            ))
+        );
+        assert_eq!(split_nmcli_name_type_device("a:b"), None);
+    }
+
+    #[test]
+    fn test_cloned_mac_modes() {
+        assert!(cloned_mac_is_randomized(
+            "802-11-wireless.cloned-mac-address:stable"
+        ));
+        assert!(cloned_mac_is_randomized("random"));
+        assert!(cloned_mac_is_randomized("stable-ssid"));
+        assert!(!cloned_mac_is_randomized("permanent"));
+        assert!(!cloned_mac_is_randomized(
+            "802-11-wireless.cloned-mac-address:"
+        ));
+    }
 }
