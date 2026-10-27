@@ -35,7 +35,7 @@ pub(crate) const ARCH_AUDIT_BIN: &str = "/usr/bin/arch-audit";
 pub(crate) fn arch_audit_advisories() -> AuditOutcome {
     const TTL_SECS: u64 = 6 * 3600;
     const FAILED_TTL_SECS: u64 = 600;
-    let cache_file = get_state_dir().join("arch_audit_cache.json");
+    let cache_file = get_state_dir().join("arch_audit_cache_v2.json");
     let now = unix_now();
     let installed = Path::new(ARCH_AUDIT_BIN).exists();
     // Advisories are matched against installed versions, so any package change
