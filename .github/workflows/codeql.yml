@@ -24,7 +24,8 @@ jobs:
       - name: Initialize CodeQL
         uses: github/codeql-action/init@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3
         with:
-          languages: actions
+          # Rust is analysed without a build (build-mode none)
+          languages: actions, rust
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3
