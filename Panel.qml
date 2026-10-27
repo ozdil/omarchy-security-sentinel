@@ -43,6 +43,7 @@ Panel {
   property string pluginDescription: "Unified cyber security sentinel for Omarchy Linux: BadUSB hardware guard, kernel integrity auditor, and zero-trust privacy monitor."
   property string pluginAuthor: "Ozan Özdil"
   property string pluginLicense: "MIT"
+  property bool pluginVerified: true
 
   function loadManifest(rawJson) {
     try {
@@ -53,6 +54,7 @@ Panel {
       if (parsed.description) root.pluginDescription = parsed.description
       if (parsed.author) root.pluginAuthor = parsed.author
       if (parsed.license) root.pluginLicense = parsed.license
+      if (parsed.verified !== undefined) root.pluginVerified = Boolean(parsed.verified)
     } catch(e) {}
   }
 
@@ -1118,6 +1120,17 @@ Panel {
             font.pixelSize: Style.font.title
             font.bold: true
             elide: Text.ElideRight
+          }
+
+          // Verified in the Omarchy plugin marketplace (omacom/omarchy-plugin-marketplace#9531)
+          Text {
+            visible: root.pluginVerified
+            Layout.alignment: Qt.AlignVCenter
+            textFormat: Text.PlainText
+            text: "󰄬 verified"
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
           }
 
           Button {

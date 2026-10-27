@@ -15,5 +15,6 @@
   "barWidget": {
     "defaultSection": "right",
     "description": "Cyber security sentinel: BadUSB hardware guard, kernel integrity, and privacy monitor."
-  }
+  },
+  "verified": true
 }
