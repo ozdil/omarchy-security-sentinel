@@ -8,10 +8,11 @@ pub(crate) fn check_dns_leak() -> (ModuleStatus, bool) {
         if let Some(out) = run_cmd_bounded("omarchy-dns", &[], &[], deadline, 4096) {
             String::from_utf8_lossy(&out).trim().to_string()
         } else {
-            "DHCP".to_string()
+            "Unknown".to_string()
         };
 
     let is_dot = current_provider == "Cloudflare" || current_provider == "Google";
+    let is_custom = current_provider == "Custom";
     let status = if is_dot {
         Status::Secure
     } else {
@@ -29,8 +30,19 @@ pub(crate) fn check_dns_leak() -> (ModuleStatus, bool) {
             "Active Resolver: {} DNS ({} / 853)",
             current_provider, resolver_ip
         ));
-        items.push("Protocol: DNS-over-TLS (DoT Encrypted Tunnel)".to_string());
+        // omarchy-dns sets DNSOverTLS=opportunistic: encrypted when the resolver
+        // answers on 853, but it falls back to plaintext instead of failing
+        items.push("Protocol: DNS-over-TLS (opportunistic, systemd-resolved)".to_string());
         items.push("Privacy Status: Zero plaintext query leakage to ISP".to_string());
+    } else if is_custom {
+        items.push("Active Resolver: Custom servers (set with omarchy dns Custom)".to_string());
+        items.push("Protocol: DNS-over-TLS not configured by omarchy-dns".to_string());
+        items.push(
+            "The toggle will not replace a custom resolver; change it with omarchy dns".to_string(),
+        );
+    } else if current_provider == "Unknown" {
+        items
+            .push("omarchy-dns is not available; the resolver could not be determined".to_string());
     } else {
         items.push("Active Resolver: Standard Gateway DHCP DNS".to_string());
         items.push("Protocol: Cleartext UDP (Port 53 Unencrypted)".to_string());
@@ -43,6 +55,10 @@ pub(crate) fn check_dns_leak() -> (ModuleStatus, bool) {
         status,
         summary: if is_dot {
             format!("DoT Active ({})", current_provider)
+        } else if is_custom {
+            "Custom DNS (no DoT)".to_string()
+        } else if current_provider == "Unknown" {
+            "DNS provider unknown".to_string()
         } else {
             "Unencrypted ISP DNS (DHCP)".to_string()
         },
@@ -65,6 +81,12 @@ pub(crate) fn toggle_dns() -> Result<bool, String> {
         .map(|o| String::from_utf8_lossy(&o).trim().to_string())
         .ok_or("omarchy-dns is not available")?;
 
+    // Never overwrite servers the user chose by hand with Cloudflare
+    if current == "Custom" {
+        return Err(
+            "A custom DNS resolver is configured; change it with 'omarchy dns' instead".to_string(),
+        );
+    }
     let enable = !(current == "Cloudflare" || current == "Google");
     let target = if enable { "Cloudflare" } else { "DHCP" };
     if !run_ok("omarchy-dns", &[target], Duration::from_secs(5)) {
