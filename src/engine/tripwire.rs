@@ -4,7 +4,9 @@ use super::*;
 
 pub(crate) fn check_tripwire() -> ModuleStatus {
     // SAFETY: getuid has no preconditions
-    let decoy = PathBuf::from(format!("/tmp/.omarchy_canary.{}.token", unsafe { getuid() }));
+    let decoy = PathBuf::from(format!("/tmp/.omarchy_canary.{}.token", unsafe {
+        getuid()
+    }));
     check_tripwire_in(&get_state_dir(), &decoy)
 }
 
@@ -71,11 +73,11 @@ fn decoy_state(decoy: &Path) -> Result<bool, ()> {
     }
     match fs::symlink_metadata(decoy) {
         // SAFETY: getuid has no preconditions
-        Ok(m) if m.file_type().is_file() && m.uid() == unsafe { getuid() } => Ok(
-            read_secure_state_file(decoy, 128)
+        Ok(m) if m.file_type().is_file() && m.uid() == unsafe { getuid() } => {
+            Ok(read_secure_state_file(decoy, 128)
                 .map(|b| b == DECOY_TOKEN)
-                .unwrap_or(false),
-        ),
+                .unwrap_or(false))
+        }
         _ => Err(()),
     }
 }
@@ -170,7 +172,8 @@ mod tests {
     use super::*;
 
     fn fresh_dir(name: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!("sentinel_tripwire_{}_{}", name, std::process::id()));
+        let dir =
+            env::temp_dir().join(format!("sentinel_tripwire_{}_{}", name, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

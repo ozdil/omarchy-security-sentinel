@@ -159,7 +159,12 @@ mod tests {
         let sev: Vec<Severity> = adv.iter().map(|a| a.severity).collect();
         assert_eq!(
             sev,
-            vec![Severity::Critical, Severity::High, Severity::Medium, Severity::Low]
+            vec![
+                Severity::Critical,
+                Severity::High,
+                Severity::Medium,
+                Severity::Low
+            ]
         );
         assert_eq!(adv[0].package, "pam");
     }
